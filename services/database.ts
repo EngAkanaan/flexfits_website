@@ -69,6 +69,76 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;');
 }
 
+function redactSensitiveText(value: string): string {
+  if (!value) return '';
+  let safe = String(value);
+
+  if (EMAIL_WEBHOOK_SECRET) {
+    safe = safe.split(EMAIL_WEBHOOK_SECRET).join('[redacted]');
+  }
+
+  safe = safe.replace(/(secret=)[^&\s]*/gi, '$1[redacted]');
+  safe = safe.replace(/("secret"\s*:\s*")[^"]*(")/gi, '$1[redacted]$2');
+  return safe;
+}
+
+function classifyWebhookResponse(bodyText: string): { success: boolean; detail: string } {
+  const raw = String(bodyText || '');
+  const trimmed = raw.trim();
+
+  if (!trimmed) {
+    return {
+      success: false,
+      detail: 'Unexpected webhook response: [empty body]',
+    };
+  }
+
+  let parsed: any = null;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    parsed = null;
+  }
+
+  if (parsed && parsed.ok === true) {
+    return {
+      success: true,
+      detail: 'Form-encoded webhook POST succeeded (ok:true).',
+    };
+  }
+
+  if (parsed && parsed.error) {
+    return {
+      success: false,
+      detail: String(parsed.error),
+    };
+  }
+
+  const normalized = trimmed.toLowerCase();
+  const plainSuccessTokens = ['ok', 'success', 'sent', 'email sent'];
+  if (plainSuccessTokens.includes(normalized)) {
+    return {
+      success: true,
+      detail: `Form-encoded webhook POST succeeded (plain-text response: ${normalized}).`,
+    };
+  }
+
+  // Some Apps Script deployments echo form data back as plain text on success.
+  const looksLikeEchoedFormPayload = /(^|&)event=[^&]+(&|$)/i.test(trimmed) && /(^|&)toEmail=[^&]+(&|$)/i.test(trimmed);
+  if (looksLikeEchoedFormPayload) {
+    return {
+      success: true,
+      detail: 'Form-encoded webhook POST succeeded (Apps Script returned echoed form payload).',
+    };
+  }
+
+  const safeSnippet = redactSensitiveText(trimmed).slice(0, 240);
+  return {
+    success: false,
+    detail: `Unexpected webhook response: ${safeSnippet}`,
+  };
+}
+
 function normalizeProductImage(value: any): string {
   const candidate = String(value || '').trim();
   if (!candidate) return DEFAULT_PRODUCT_IMAGE;
@@ -237,19 +307,12 @@ async function sendEmailEvent(payload: {
     const bodyText = await response.text();
 
     if (!response.ok) {
-      throw new Error(`Form webhook responded ${response.status}: ${bodyText}`);
+      throw new Error(`Form webhook responded ${response.status}: ${redactSensitiveText(bodyText).slice(0, 240)}`);
     }
 
-    let parsed: any = null;
-    try {
-      parsed = bodyText ? JSON.parse(bodyText) : null;
-    } catch {
-      parsed = null;
-    }
-
-    if (!parsed || parsed.ok !== true) {
-      const responseError = parsed?.error ? String(parsed.error) : `Unexpected webhook response: ${bodyText || '[empty body]'}`;
-      throw new Error(responseError);
+    const classified = classifyWebhookResponse(bodyText);
+    if (!classified.success) {
+      throw new Error(classified.detail);
     }
 
     pushEmailLog({
@@ -261,10 +324,10 @@ async function sendEmailEvent(payload: {
       orderId: payload.order.id,
       status: 'success',
       stage: 'primary',
-      detail: 'Form-encoded webhook POST succeeded (ok:true).',
+      detail: classified.detail,
     });
   } catch (error) {
-    const formError = error instanceof Error ? error.message : String(error);
+    const formError = redactSensitiveText(error instanceof Error ? error.message : String(error));
 
     try {
       if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
