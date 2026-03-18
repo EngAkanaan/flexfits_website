@@ -267,6 +267,31 @@ async function sendEmailEvent(payload: {
     const formError = error instanceof Error ? error.message : String(error);
 
     try {
+      if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+        const beaconPayload = JSON.stringify(requestPayload);
+        const beaconBlob = new Blob([beaconPayload], { type: 'text/plain;charset=utf-8' });
+        const queued = navigator.sendBeacon(EMAIL_WEBHOOK_URL, beaconBlob);
+
+        if (queued) {
+          pushEmailLog({
+            id: attemptId,
+            ts: new Date().toISOString(),
+            event: payload.event,
+            toEmail: payload.toEmail,
+            subject: payload.subject,
+            orderId: payload.order.id,
+            status: 'fallback-unknown',
+            stage: 'fallback',
+            detail: `Form request failed (${formError}); sendBeacon fallback queued (delivery cannot be verified by browser).`,
+          });
+          return;
+        }
+      }
+    } catch {
+      // Ignore beacon errors and continue to final fetch fallback.
+    }
+
+    try {
       // no-cors is opaque; request may still succeed when strict CORS blocks readable responses.
       await fetch(EMAIL_WEBHOOK_URL, {
         method: 'POST',
