@@ -1,13 +1,39 @@
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { ShoppingBag, User, Search, Filter, Trash2, Plus, LogOut, ChevronRight, CheckCircle, Package, BarChart3, Menu, X, Star, ExternalLink, Edit2, Upload, Phone, MapPin, Truck, Check, Mail, List, Layers, Info } from 'lucide-react';
-import { Category, Product, Order, CartItem, FinancialMetric, FinancialTotals, View } from './types';
+import { Category, Product, ProductGender, Order, CartItem, FinancialMetric, FinancialTotals, View } from './types';
 import { INITIAL_PRODUCTS, ADMIN_USER, ADMIN_PASS, LEBANON_LOCATIONS, SIZE_OPTIONS } from './constants';
 import { getProductRecommendation } from './services/gemini';
 import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals } from './services/database';
 
 const BRAND_LOGO_SRC = '/flex-logo.JPG';
 const DELIVERY_FEE = 4;
+const GENDER_OPTIONS: ProductGender[] = ['Men', 'Women', 'Unisex'];
+
+function viewFromPathname(pathname: string): View {
+  const normalized = String(pathname || '/').toLowerCase();
+  if (normalized === '/admin') return 'admin';
+  if (normalized === '/shop') return 'shop';
+  if (normalized === '/cart' || normalized === '/bag') return 'cart';
+  if (normalized === '/checkout') return 'checkout';
+  return 'home';
+}
+
+function pathnameFromView(view: View): string {
+  if (view === 'admin') return '/admin';
+  if (view === 'shop') return '/shop';
+  if (view === 'cart') return '/bag';
+  if (view === 'checkout') return '/checkout';
+  return '/';
+}
+
+function normalizeGender(value: unknown): ProductGender {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'women' || normalized === 'woman' || normalized === 'female' || normalized === 'ladies') return 'Women';
+  if (normalized === 'men' || normalized === 'man' || normalized === 'male' || normalized === 'gents') return 'Men';
+  if (normalized === 'unisex' || normalized === 'uni-sex') return 'Unisex';
+  return 'Unisex';
+}
 
 const FlexLogo = ({ className = "h-12" }: { className?: string }) => (
   <img
@@ -28,6 +54,22 @@ const App: React.FC = () => {
   const [maxPrice, setMaxPrice] = useState<number>(200);
   const [filterSize, setFilterSize] = useState<string>('All');
   const [filterBrand, setFilterBrand] = useState<string>('All');
+  const [hideSoldOutItems, setHideSoldOutItems] = useState<boolean>(false);
+  const [selectedGenders, setSelectedGenders] = useState<ProductGender[]>([]);
+  const [isMobileFilterOpen, setIsMobileFilterOpen] = useState<boolean>(false);
+  const [quickAddProduct, setQuickAddProduct] = useState<Product | null>(null);
+  const [imageViewerProduct, setImageViewerProduct] = useState<Product | null>(null);
+  const [imageViewerScale, setImageViewerScale] = useState<number>(1);
+  const [imageViewerTranslate, setImageViewerTranslate] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const imageViewerGestureRef = useRef({
+    isPinching: false,
+    pinchStartDistance: 0,
+    pinchStartScale: 1,
+    touchStartX: 0,
+    touchStartY: 0,
+    lastTouchX: 0,
+    lastTouchY: 0,
+  });
   const [isLoading, setIsLoading] = useState(true);
   
   // Load data from database on mount
@@ -66,6 +108,43 @@ const App: React.FC = () => {
     
     loadData();
   }, []);
+
+  useEffect(() => {
+    const syncFromUrl = () => {
+      setView(viewFromPathname(window.location.pathname));
+    };
+
+    syncFromUrl();
+    window.addEventListener('popstate', syncFromUrl);
+    return () => window.removeEventListener('popstate', syncFromUrl);
+  }, []);
+
+  useEffect(() => {
+    const targetPath = pathnameFromView(view);
+    if (window.location.pathname !== targetPath) {
+      window.history.replaceState({}, '', targetPath);
+    }
+  }, [view]);
+
+  useEffect(() => {
+    if (!isMobileFilterOpen && !quickAddProduct && !imageViewerProduct) return;
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setIsMobileFilterOpen(false);
+        setQuickAddProduct(null);
+        closeImageViewer();
+      }
+    };
+
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', onKeyDown);
+
+    return () => {
+      document.body.style.overflow = '';
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [isMobileFilterOpen, quickAddProduct, imageViewerProduct]);
   
   // Sync products to database when they change (for admin operations)
   const syncProductToDatabase = async (product: Product) => {
@@ -109,20 +188,27 @@ const App: React.FC = () => {
 
   const filteredProducts = useMemo(() => {
     return products.filter(p => {
+      const rawLeftStock = Number((p as any).Items_LEFT_in_stock ?? (p as any).items_left_in_stock ?? p.pieces);
+      const leftStock = Number.isFinite(rawLeftStock) ? rawLeftStock : 0;
+      const normalizedStatus = String((p as any).Status ?? p.status ?? '').trim().toLowerCase();
+      const isSoldOut = leftStock <= 0 || normalizedStatus === 'out of stock';
+      const productGender = normalizeGender(p.gender);
+
       const isTshirtOrHoodie = /t-?shirt|hoodie/i.test(p.type);
       const matchesSearch = (p.productName || p.name).toLowerCase().includes(searchQuery.toLowerCase());
       const matchesPrice = p.price <= maxPrice;
       const matchesSize = filterSize === 'All' || (p.sizes || []).some((s) => String(s).toUpperCase() === filterSize.toUpperCase());
       const matchesBrand = filterBrand === 'All' || String(p.brandName || '').toLowerCase() === filterBrand.toLowerCase();
+      const matchesGender = selectedGenders.length === 0 || selectedGenders.includes(productGender);
 
       if (filterCategory === ('ComingSoon' as any)) {
-        return matchesSearch && isTshirtOrHoodie && matchesPrice && matchesSize && matchesBrand;
+        return matchesSearch && isTshirtOrHoodie && matchesPrice && matchesSize && matchesBrand && matchesGender && !(hideSoldOutItems && isSoldOut);
       }
 
       const matchesCategory = filterCategory === 'All' || p.category === filterCategory;
-      return matchesSearch && matchesCategory && matchesPrice && matchesSize && matchesBrand && !isTshirtOrHoodie;
+      return matchesSearch && matchesCategory && matchesPrice && matchesSize && matchesBrand && matchesGender && !isTshirtOrHoodie && !(hideSoldOutItems && isSoldOut);
     });
-  }, [products, searchQuery, filterCategory, maxPrice, filterSize, filterBrand]);
+  }, [products, searchQuery, filterCategory, maxPrice, filterSize, filterBrand, selectedGenders, hideSoldOutItems]);
 
   const cartTotal = cart.reduce((acc, item) => acc + item.price * item.quantity, 0);
   const checkoutTotal = cart.length > 0 ? cartTotal + DELIVERY_FEE : 0;
@@ -150,9 +236,230 @@ const App: React.FC = () => {
     });
   };
 
+  const handleCardAddToCart = (product: Product) => {
+    const normalizedSizes = (product.sizes || []).map((s) => String(s).trim()).filter(Boolean);
+    if (normalizedSizes.length <= 1) {
+      addToCart(product, normalizedSizes[0] || 'Default');
+      return;
+    }
+    setQuickAddProduct(product);
+  };
+
+  const closeImageViewer = () => {
+    setImageViewerProduct(null);
+    setImageViewerScale(1);
+    setImageViewerTranslate({ x: 0, y: 0 });
+    imageViewerGestureRef.current = {
+      isPinching: false,
+      pinchStartDistance: 0,
+      pinchStartScale: 1,
+      touchStartX: 0,
+      touchStartY: 0,
+      lastTouchX: 0,
+      lastTouchY: 0,
+    };
+  };
+
+  const openImageViewer = (product: Product) => {
+    setImageViewerProduct(product);
+    setImageViewerScale(1);
+    setImageViewerTranslate({ x: 0, y: 0 });
+  };
+
+  const clampScale = (value: number) => Math.min(4, Math.max(1, value));
+
+  const handleImageViewerWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setImageViewerScale((prev) => {
+      const nextScale = clampScale(prev - event.deltaY * 0.0022);
+      if (nextScale === 1) setImageViewerTranslate({ x: 0, y: 0 });
+      return nextScale;
+    });
+  };
+
+  const getTouchDistance = (touches: React.TouchList): number => {
+    if (touches.length < 2) return 0;
+    const dx = touches[0].clientX - touches[1].clientX;
+    const dy = touches[0].clientY - touches[1].clientY;
+    return Math.hypot(dx, dy);
+  };
+
+  const handleImageViewerTouchStart = (event: React.TouchEvent<HTMLDivElement>) => {
+    const gesture = imageViewerGestureRef.current;
+    if (event.touches.length >= 2) {
+      gesture.isPinching = true;
+      gesture.pinchStartDistance = getTouchDistance(event.touches);
+      gesture.pinchStartScale = imageViewerScale;
+      return;
+    }
+
+    const firstTouch = event.touches[0];
+    if (!firstTouch) return;
+    gesture.isPinching = false;
+    gesture.touchStartX = firstTouch.clientX;
+    gesture.touchStartY = firstTouch.clientY;
+    gesture.lastTouchX = firstTouch.clientX;
+    gesture.lastTouchY = firstTouch.clientY;
+  };
+
+  const handleImageViewerTouchMove = (event: React.TouchEvent<HTMLDivElement>) => {
+    const gesture = imageViewerGestureRef.current;
+
+    if (event.touches.length >= 2) {
+      event.preventDefault();
+      const distance = getTouchDistance(event.touches);
+      if (!gesture.pinchStartDistance) {
+        gesture.pinchStartDistance = distance;
+        gesture.pinchStartScale = imageViewerScale;
+      }
+
+      const ratio = distance / Math.max(gesture.pinchStartDistance, 1);
+      const nextScale = clampScale(gesture.pinchStartScale * ratio);
+      setImageViewerScale(nextScale);
+      if (nextScale === 1) setImageViewerTranslate({ x: 0, y: 0 });
+      return;
+    }
+
+    const firstTouch = event.touches[0];
+    if (!firstTouch) return;
+
+    const deltaX = firstTouch.clientX - gesture.lastTouchX;
+    const deltaY = firstTouch.clientY - gesture.lastTouchY;
+
+    if (imageViewerScale > 1.02) {
+      event.preventDefault();
+      setImageViewerTranslate((prev) => ({ x: prev.x + deltaX, y: prev.y + deltaY }));
+    }
+
+    gesture.lastTouchX = firstTouch.clientX;
+    gesture.lastTouchY = firstTouch.clientY;
+  };
+
+  const handleImageViewerTouchEnd = (event: React.TouchEvent<HTMLDivElement>) => {
+    const gesture = imageViewerGestureRef.current;
+    if (event.touches.length >= 2) {
+      gesture.pinchStartDistance = getTouchDistance(event.touches);
+      gesture.pinchStartScale = imageViewerScale;
+      return;
+    }
+
+    if (event.touches.length === 1) {
+      gesture.isPinching = false;
+      const firstTouch = event.touches[0];
+      gesture.lastTouchX = firstTouch.clientX;
+      gesture.lastTouchY = firstTouch.clientY;
+      return;
+    }
+
+    const endingTouch = event.changedTouches[0];
+    if (endingTouch && imageViewerScale <= 1.05) {
+      const swipeX = endingTouch.clientX - gesture.touchStartX;
+      const swipeY = endingTouch.clientY - gesture.touchStartY;
+      const isVerticalDismiss = Math.abs(swipeY) > 90 && Math.abs(swipeY) > Math.abs(swipeX) * 1.2;
+      if (isVerticalDismiss) {
+        closeImageViewer();
+        return;
+      }
+    }
+
+    if (imageViewerScale <= 1.02) {
+      setImageViewerScale(1);
+      setImageViewerTranslate({ x: 0, y: 0 });
+    }
+
+    gesture.isPinching = false;
+    gesture.pinchStartDistance = 0;
+  };
+
   const removeFromCart = (id: string, size: string) => {
     setCart(prev => prev.filter(i => !(i.id === id && i.selectedSize === size)));
   };
+
+  const toggleGenderFilter = (genderOption: ProductGender, isEnabled: boolean) => {
+    setSelectedGenders((prev) => {
+      if (isEnabled) {
+        if (prev.includes(genderOption)) return prev;
+        return [...prev, genderOption];
+      }
+      return prev.filter((g) => g !== genderOption);
+    });
+  };
+
+  const renderFilterControls = () => (
+    <>
+      <div className="mb-6">
+        <h3 className="font-black text-[10px] uppercase tracking-[0.35em] mb-4 text-gray-300 italic">Categories</h3>
+        <div className="space-y-2">
+          {['All', ...Object.values(Category)].map(c => (
+            <button key={c} onClick={() => setFilterCategory(c as Category | 'All')} className={`block w-full text-left p-3 rounded-xl text-[10px] transition-all uppercase font-black italic tracking-[0.12em] ${filterCategory === c ? 'bg-black text-white shadow-xl border-2 border-black' : 'hover:bg-gray-50 text-gray-400 border-2 border-transparent'}`}>
+              {c} Selection
+            </button>
+          ))}
+        </div>
+        <button onClick={() => setFilterCategory('ComingSoon')} className="w-full text-left p-3 rounded-xl text-[10px] transition-all uppercase font-black italic tracking-[0.12em] bg-gradient-to-r from-orange-600/20 to-orange-500/20 text-orange-600 border-2 border-orange-600/50 hover:border-orange-600 mt-2 flex items-center justify-center gap-1.5">
+          <span>👕 T-shirts & Hoodies</span>
+          <span className="text-[8px] bg-orange-600 text-white px-1.5 py-0.5 rounded-full">Coming Soon</span>
+        </button>
+      </div>
+      <div className="pt-4 border-t-2 border-gray-50">
+        <h3 className="font-black text-[10px] uppercase tracking-[0.35em] mb-4 text-gray-300 italic">Price Filter</h3>
+        <div className="px-2">
+          <input type="range" min="0" max="200" step="5" value={maxPrice} onChange={(e) => setMaxPrice(Number(e.target.value))} className="w-full h-1.5 bg-gray-100 rounded-lg appearance-none cursor-pointer accent-orange-600" />
+          <div className="flex justify-between mt-4 font-black text-[9px] tracking-wider italic uppercase">
+            <span className="text-gray-300">Min: $0</span>
+            <span className="text-orange-600 text-[11px]">Max: ${maxPrice}</span>
+          </div>
+        </div>
+      </div>
+      <div className="pt-4 border-t-2 border-gray-50 space-y-3">
+        <h3 className="font-black text-[10px] uppercase tracking-[0.35em] text-gray-300 italic">Brands & Sizes</h3>
+        <select value={filterSize} onChange={(e) => setFilterSize(e.target.value)} className="w-full p-2.5 border rounded-xl bg-white text-[9px] font-black uppercase focus:ring-2 focus:ring-orange-500 outline-none">
+          <option value="All">All Sizes</option>
+          {filterOptions.sizes.map((size) => (
+            <option key={size} value={size}>{size}</option>
+          ))}
+        </select>
+        <select value={filterBrand} onChange={(e) => setFilterBrand(e.target.value)} className="w-full p-2.5 border rounded-xl bg-white text-[9px] font-black uppercase focus:ring-2 focus:ring-orange-500 outline-none">
+          <option value="All">All Brands</option>
+          {filterOptions.brands.map((brand) => (
+            <option key={brand} value={brand}>{brand}</option>
+          ))}
+        </select>
+      </div>
+      <div className="pt-4 border-t-2 border-gray-50 space-y-2.5">
+        <h3 className="font-black text-[10px] uppercase tracking-[0.35em] text-gray-300 italic">Gender Filter</h3>
+        <div className="space-y-1.5 p-2.5 border rounded-xl bg-white">
+          {GENDER_OPTIONS.map((genderOption) => (
+            <label key={genderOption} className="flex items-center gap-2.5 text-[9px] font-black uppercase tracking-wider cursor-pointer">
+              <input
+                type="checkbox"
+                checked={selectedGenders.includes(genderOption)}
+                onChange={(e) => toggleGenderFilter(genderOption, e.target.checked)}
+                className="h-3.5 w-3.5 accent-orange-600"
+              />
+              <span>{genderOption}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <div className="pt-4 border-t-2 border-gray-50">
+        <label className="flex items-center gap-2.5 p-2.5 border rounded-xl bg-white text-[9px] font-black uppercase tracking-wider cursor-pointer">
+          <input
+            type="checkbox"
+            checked={hideSoldOutItems}
+            onChange={(e) => setHideSoldOutItems(e.target.checked)}
+            className="h-3.5 w-3.5 accent-orange-600"
+          />
+          <span>Hide Sold Out Items</span>
+        </label>
+      </div>
+      <div className="mt-5 p-3 bg-black rounded-xl text-white shadow-2xl relative overflow-hidden">
+        <div className="absolute top-0 right-0 w-16 h-16 bg-orange-600/20 rounded-full -translate-y-8 translate-x-8 blur-2xl"></div>
+        <p className="text-[8px] font-black uppercase tracking-[0.18em] mb-1.5 text-orange-500 italic relative">Trusted Sneaker Supplier</p>
+        <p className="font-black text-[11px] italic leading-snug relative">Every product is guaranteed 100% original. Authentic or your money back.</p>
+      </div>
+    </>
+  );
 
   const AdminPanel = () => {
     type InventorySection = 'All' | Category | 'ComingSoon';
@@ -305,6 +612,7 @@ const App: React.FC = () => {
         name: `${normalizedBrand} - ${normalizedProduct}`,
         brandName: normalizedBrand,
         productName: normalizedProduct,
+        gender: normalizeGender(fd.get('gender')),
         category: formCategory,
         type: fd.get('type') as string,
         price: Number(fd.get('price')),
@@ -485,6 +793,7 @@ const App: React.FC = () => {
                         <span className="text-[10px] leading-none">{inventorySort?.col === 'category' ? (inventorySort.dir === 'asc' ? '▲' : '▼') : '⇅'}</span>
                       </button>
                     </th>
+                    <th className="p-3">Gender</th>
                     <th className="p-4">Type</th>
                     <th className="p-3">SIZE</th>
                     <th className="p-3">Cost</th>
@@ -508,6 +817,7 @@ const App: React.FC = () => {
                         <td className="p-3 font-semibold text-gray-900">{p.brandName || splitDisplayName(p.name).brand || '-'}</td>
                         <td className="p-3 font-semibold text-gray-900">{p.productName || splitDisplayName(p.name).product || '-'}</td>
                         <td className="p-3 text-gray-700">{p.category}</td>
+                        <td className="p-3 text-gray-700">{normalizeGender(p.gender)}</td>
                         <td className="p-3 text-gray-700">{p.type}</td>
                         <td className="p-3 text-gray-700">{p.sizes.join(', ') || '-'}</td>
                         <td className="p-3 text-gray-700">${p.cost}</td>
@@ -553,7 +863,7 @@ const App: React.FC = () => {
                   })}
                   {inventoryProducts.length === 0 && (
                     <tr>
-                      <td colSpan={15} className="p-6 text-center text-gray-500 font-semibold">
+                      <td colSpan={16} className="p-6 text-center text-gray-500 font-semibold">
                         {inventorySection === 'ComingSoon'
                           ? 'No T-shirt or Hoodie products found yet. Add items with type containing "tshirt", "t-shirt", or "hoodie".'
                           : 'No products in this section.'}
@@ -609,6 +919,14 @@ const App: React.FC = () => {
                       {Object.values(Category).map(c => <option key={c} value={c}>{c}</option>)}
                     </select>
                   </div>
+                  <div>
+                    <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Gender</label>
+                    <select name="gender" defaultValue={editMode?.gender || 'Unisex'} className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none">
+                      {GENDER_OPTIONS.map((g) => <option key={g} value={g}>{g}</option>)}
+                    </select>
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 gap-4">
                   <div>
                     <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Type/Style</label>
                     <input name="type" defaultValue={editMode?.type} placeholder="Casual, Vintage..." className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" required />
@@ -818,9 +1136,9 @@ const App: React.FC = () => {
     };
 
     return (
-      <div className="max-w-3xl mx-auto px-4 py-8 animate-fade-in-up">
+        <div className="max-w-3xl mx-auto px-4 py-8 animate-fade-in-up">
         <div className="text-center mb-8">
-          <h2 className="text-2xl font-black italic tracking-tighter uppercase mb-2">Complete Acquisition</h2>
+          <h2 className="text-xl md:text-2xl font-black italic tracking-tighter uppercase mb-2">Complete Acquisition</h2>
           <p className="text-gray-400 font-bold uppercase text-[9px] tracking-[0.2em]">Direct-to-door Logistics Across Lebanon</p>
         </div>
         <form onSubmit={handleSubmit} className="bg-white p-6 rounded-3xl border shadow-2xl space-y-6 border-gray-100">
@@ -877,7 +1195,7 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          <button type="submit" disabled={isProcessing} className="w-full bg-orange-600 text-white font-black py-3 rounded-xl hover:bg-orange-700 shadow-2xl shadow-orange-600/30 transition-all uppercase tracking-widest text-base flex items-center justify-center gap-2 active:scale-95 disabled:opacity-70">
+          <button type="submit" disabled={isProcessing} className="w-full bg-orange-600 text-white font-black py-2.5 rounded-xl hover:bg-orange-700 shadow-2xl shadow-orange-600/30 transition-all uppercase tracking-widest text-sm md:text-base flex items-center justify-center gap-2 active:scale-95 disabled:opacity-70">
             {isProcessing ? 'Verifying Acquisition...' : 'Place Secure Order'}
           </button>
         </form>
@@ -886,16 +1204,16 @@ const App: React.FC = () => {
   };
 
   const CartView = () => (
-    <div className="max-w-6xl mx-auto px-4 py-12 animate-fade-in-up">
-      <h2 className="text-3xl font-black mb-8 uppercase italic tracking-tighter text-center md:text-left">Selected Gear</h2>
+    <div className="max-w-6xl mx-auto px-4 py-10 animate-fade-in-up">
+      <h2 className="text-2xl font-black mb-8 uppercase italic tracking-tighter text-center md:text-left">Selected Gear</h2>
       {cart.length === 0 ? (
         <div className="text-center py-20 bg-white rounded-3xl border-2 border-dashed border-gray-100 shadow-inner">
           <ShoppingBag size={60} className="text-gray-100 mx-auto mb-6" />
           <p className="text-gray-300 font-black uppercase tracking-[0.3em] text-xs mb-8 italic">Your distribution bag is currently empty</p>
-          <button onClick={() => setView('shop')} className="bg-black text-white px-8 py-3 rounded-full font-black uppercase tracking-[0.2em] hover:bg-orange-600 transition-all shadow-2xl italic text-sm">Explore Collections</button>
+          <button onClick={() => setView('shop')} className="bg-black text-white px-6 py-2.5 rounded-full font-black uppercase tracking-[0.2em] hover:bg-orange-600 transition-all shadow-2xl italic text-sm">Explore Collections</button>
         </div>
       ) : (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-20">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-10 lg:gap-12">
           <div className="lg:col-span-2 space-y-8">
             {cart.map((it, idx) => (
                <div key={idx} className="flex flex-col sm:flex-row gap-8 p-8 bg-white rounded-[4rem] border shadow-sm hover:shadow-2xl transition-all group border-gray-50">
@@ -926,7 +1244,7 @@ const App: React.FC = () => {
                </div>
             ))}
           </div>
-          <div className="bg-black text-white p-12 rounded-[5rem] shadow-3xl h-fit sticky top-28 border-4 border-white/5 overflow-hidden">
+          <div className="bg-black text-white p-8 rounded-3xl shadow-3xl h-fit sticky top-24 border-4 border-white/5 overflow-hidden">
             <div className="absolute top-0 right-0 w-40 h-40 bg-orange-600/10 rounded-full -translate-y-20 translate-x-20 blur-3xl"></div>
             <h3 className="font-black mb-10 uppercase tracking-[0.4em] text-[11px] text-orange-500 italic relative">Acquisition Totals</h3>
             <div className="space-y-6 mb-12 relative">
@@ -945,7 +1263,7 @@ const App: React.FC = () => {
                  </div>
                </div>
             </div>
-            <button onClick={() => setView('checkout')} className="w-full bg-white text-black font-black py-7 rounded-[2.5rem] uppercase tracking-widest hover:bg-orange-600 hover:text-white transition-all shadow-2xl text-lg italic active:scale-95">
+            <button onClick={() => setView('checkout')} className="w-full bg-white text-black font-black py-3.5 rounded-2xl uppercase tracking-widest hover:bg-orange-600 hover:text-white transition-all shadow-2xl text-sm md:text-base italic active:scale-95">
               Secure Checkout
             </button>
             <div className="mt-12 space-y-4 relative">
@@ -989,8 +1307,7 @@ const App: React.FC = () => {
             <div className="space-y-4">
               <h4 className="font-black text-[10px] uppercase tracking-[0.4em] text-gray-600 italic">Storefront</h4>
               <div className="space-y-2">
-                <button onClick={() => {setView('admin'); window.scrollTo(0,0);}} className="block text-xs text-gray-400 hover:text-orange-600 transition-all uppercase font-black italic tracking-tighter hover:translate-x-2">ADAM Terminal</button>
-                <button onClick={() => {setView('cart'); window.scrollTo(0,0);}} className="block text-xs text-gray-400 hover:text-orange-600 transition-all uppercase font-black italic tracking-tighter hover:translate-x-2">Acquisition Bag</button>
+                <button onClick={() => {setView('cart'); window.scrollTo(0,0);}} className="block text-xs text-gray-400 hover:text-orange-600 transition-all uppercase font-black italic tracking-tighter hover:translate-x-2">Bag</button>
                 <button onClick={() => {setFilterCategory('All'); setView('shop'); window.scrollTo(0,0);}} className="block text-xs text-gray-400 hover:text-orange-600 transition-all uppercase font-black italic tracking-tighter hover:translate-x-2">Full Collection</button>
               </div>
             </div>
@@ -1036,25 +1353,25 @@ const App: React.FC = () => {
     <div className="min-h-screen bg-gray-50 selection:bg-orange-500 selection:text-white">
       <nav className="sticky top-0 z-50 bg-white border-b border-gray-200 shadow-sm">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex justify-between items-center h-20">
-            <div className="flex items-center gap-8">
+          <div className="flex justify-between items-center h-16 md:h-[72px]">
+            <div className="flex items-center gap-6">
               <div onClick={() => setView('home')} className="cursor-pointer hover:opacity-80 transition-opacity">
-                <FlexLogo className="h-8 text-black" />
+                <FlexLogo className="h-7 text-black" />
               </div>
-              <div className="hidden md:flex gap-6 font-semibold text-sm uppercase tracking-wide text-gray-600">
+              <div className="hidden md:flex gap-5 font-semibold text-sm uppercase tracking-wide text-gray-600">
                 <button onClick={() => setView('home')} className={view === 'home' ? 'text-orange-600' : ''}>Home</button>
-                <button onClick={() => setView('shop')} className={view === 'shop' ? 'text-orange-600' : ''}>Shop</button>
+                <button onClick={() => { setView('shop'); window.scrollTo(0, 0); }} className={view === 'shop' ? 'text-orange-600' : ''}>Shop</button>
               </div>
             </div>
             <div className="flex items-center gap-4">
-              <div className="hidden md:flex items-center bg-gray-100 rounded-full px-4 py-2">
-                <Search size={16} className="text-gray-400" />
+              <div className="hidden md:flex items-center bg-gray-100 rounded-full px-3 py-1.5">
+                <Search size={14} className="text-gray-400" />
                 <input
-                  type="text" placeholder="Search curated goods..." className="bg-transparent border-none focus:ring-0 text-sm ml-2 w-32 md:w-48"
+                  type="text" placeholder="Search curated goods..." className="bg-transparent border-none focus:ring-0 text-sm ml-2 w-32 md:w-44"
                   value={searchQuery} onChange={(e) => { setSearchQuery(e.target.value); setView('shop'); }}
                 />
               </div>
-              <button onClick={() => setView('cart')} className="relative p-2 text-gray-600 hover:text-orange-600 transition-colors">
+              <button onClick={() => setView('cart')} aria-label="Open bag" className="relative p-2 text-gray-600 hover:text-orange-600 transition-colors">
                 <ShoppingBag size={22} />
                 {cart.length > 0 && (
                   <span className="absolute top-0 right-0 bg-orange-600 text-white text-[10px] px-1.5 rounded-full font-bold">
@@ -1062,7 +1379,6 @@ const App: React.FC = () => {
                   </span>
                 )}
               </button>
-              <button onClick={() => setView('admin')} className={`p-2 transition-colors ${isAdmin ? 'text-orange-600' : 'text-gray-400 hover:text-gray-600'}`}><User size={22} /></button>
             </div>
           </div>
         </div>
@@ -1113,57 +1429,30 @@ const App: React.FC = () => {
         )}
         
         {view === 'shop' && (
-          <div className="max-w-7xl mx-auto px-4 py-12 flex flex-col md:flex-row gap-8 md:gap-12">
-            <div className="md:w-80 flex-shrink-0 space-y-8">
-               <div className="bg-white p-6 rounded-3xl border-2 border-gray-50 shadow-2xl sticky top-28 max-h-[calc(100vh-8rem)] overflow-y-auto pr-2">
-                  <div className="mb-12">
-                    <h3 className="font-black text-xs uppercase tracking-[0.5em] mb-10 text-gray-300 italic">Classifications</h3>
-                    <div className="space-y-4">
-                      {['All', ...Object.values(Category)].map(c => (
-                        <button key={c} onClick={() => setFilterCategory(c as Category | 'All')} className={`block w-full text-left p-5 rounded-[1.5rem] text-[11px] transition-all uppercase font-black italic tracking-wider ${filterCategory === c ? 'bg-black text-white shadow-2xl scale-105 border-2 border-black' : 'hover:bg-gray-50 text-gray-400 border-2 border-transparent'}`}>
-                          {c} Selection
-                        </button>
-                      ))}
-                    </div>
-                    <button onClick={() => setFilterCategory('ComingSoon')} className="w-full text-left p-5 rounded-[1.5rem] text-[11px] transition-all uppercase font-black italic tracking-wider bg-gradient-to-r from-orange-600/20 to-orange-500/20 text-orange-600 border-2 border-orange-600/50 hover:border-orange-600 mt-4 flex items-center justify-center gap-2">
-                      <span>👕 T-shirts & Hoodies</span>
-                      <span className="text-[9px] bg-orange-600 text-white px-2 py-1 rounded-full">Coming Soon</span>
-                    </button>
-                  </div>
-                  <div className="pt-12 border-t-2 border-gray-50">
-                    <h3 className="font-black text-xs uppercase tracking-[0.5em] mb-10 text-gray-300 italic">Price Cap</h3>
-                    <div className="px-2">
-                       <input type="range" min="0" max="200" step="5" value={maxPrice} onChange={(e) => setMaxPrice(Number(e.target.value))} className="w-full h-2 bg-gray-100 rounded-lg appearance-none cursor-pointer accent-orange-600" />
-                       <div className="flex justify-between mt-8 font-black text-[10px] tracking-widest italic uppercase">
-                          <span className="text-gray-300">Min: $0</span>
-                          <span className="text-orange-600 text-sm">Max: ${maxPrice}</span>
-                       </div>
-                    </div>
-                  </div>
-                  <div className="pt-8 border-t-2 border-gray-50 space-y-4">
-                    <h3 className="font-black text-xs uppercase tracking-[0.5em] text-gray-300 italic">Extra Filters</h3>
-                    <select value={filterSize} onChange={(e) => setFilterSize(e.target.value)} className="w-full p-3 border rounded-xl bg-white text-[10px] font-black uppercase focus:ring-2 focus:ring-orange-500 outline-none">
-                      <option value="All">All Sizes</option>
-                      {filterOptions.sizes.map((size) => (
-                        <option key={size} value={size}>{size}</option>
-                      ))}
-                    </select>
-                    <select value={filterBrand} onChange={(e) => setFilterBrand(e.target.value)} className="w-full p-3 border rounded-xl bg-white text-[10px] font-black uppercase focus:ring-2 focus:ring-orange-500 outline-none">
-                      <option value="All">All Brands</option>
-                      {filterOptions.brands.map((brand) => (
-                        <option key={brand} value={brand}>{brand}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="mt-8 p-4 bg-black rounded-xl text-white shadow-2xl relative overflow-hidden">
-                    <div className="absolute top-0 right-0 w-16 h-16 bg-orange-600/20 rounded-full -translate-y-8 translate-x-8 blur-2xl"></div>
-                    <p className="text-[9px] font-black uppercase tracking-[0.2em] mb-2 text-orange-500 italic relative">Authorized Retail</p>
-                    <p className="font-black text-xs italic leading-snug relative">Every product is guaranteed 100% original. Authentic or your money back.</p>
-                  </div>
-               </div>
+          <div className="max-w-[1680px] w-full mx-auto px-2 sm:px-4 lg:px-6 xl:px-8 py-8 md:py-12 overflow-x-hidden">
+            <div className="md:hidden mb-6">
+              <button
+                onClick={() => setIsMobileFilterOpen(true)}
+                className="w-full bg-white border-2 border-gray-100 rounded-2xl px-4 py-3 flex items-center justify-between shadow-sm"
+              >
+                <span className="flex items-center gap-2 text-[11px] font-black uppercase tracking-wider text-gray-700 italic">
+                  <Filter size={16} className="text-orange-600" />
+                  Classification
+                </span>
+                <span className="text-[10px] font-black uppercase text-orange-600 tracking-widest">
+                  {selectedGenders.length + (filterBrand !== 'All' ? 1 : 0) + (filterSize !== 'All' ? 1 : 0) + (hideSoldOutItems ? 1 : 0)} Active
+                </span>
+              </button>
             </div>
-            
-            <div className="flex-1 space-y-8">
+
+            <div className="flex flex-col md:flex-row gap-6 md:gap-6 lg:gap-8">
+              <div className="hidden md:block md:w-64 lg:w-72 xl:w-[290px] flex-shrink-0 xl:-ml-2">
+                <div className="bg-white p-5 rounded-3xl border-2 border-gray-50 shadow-2xl sticky top-20">
+                  {renderFilterControls()}
+                </div>
+              </div>
+
+              <div className="flex-1 space-y-8 min-w-0">
               {filterCategory === 'ComingSoon' ? (
                 <div className="min-h-[60vh] flex items-center justify-center">
                   <div className="text-center px-8 py-24 bg-white rounded-3xl border-2 border-dashed border-orange-600 shadow-xl">
@@ -1181,19 +1470,24 @@ const App: React.FC = () => {
                      <span className="w-8 h-1 bg-orange-600 rounded-full"></span>
                      <span className="text-[10px] font-black uppercase tracking-[0.4em] text-orange-600 italic">Verified Inventory</span>
                    </div>
-                   <h2 className="text-2xl md:text-3xl font-black uppercase tracking-tighter italic text-black leading-none">{filterCategory}</h2>
+                   <h2 className="text-xl md:text-2xl font-black uppercase tracking-tighter italic text-black leading-none">{filterCategory}</h2>
                  </div>
                  <div className="bg-white border-2 border-gray-50 px-4 py-2 rounded-2xl shadow-sm">
                    <p className="text-gray-300 font-black uppercase text-[10px] tracking-[0.3em]">{filteredProducts.length} Assets Found</p>
                  </div>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-4 lg:gap-4 xl:gap-5">
                 {filteredProducts.map(p => {
                   const isOutOfStock = p.pieces <= 0 || p.status === 'Temporary Not Available' || p.status === 'Temporarily unavailable' || p.status === 'Out of Stock';
                   return (
-                    <div key={p.id} className={`group bg-white p-4 rounded-2xl border-2 border-gray-50 shadow-sm hover:shadow-3xl transition-all duration-700 flex flex-col h-full relative overflow-hidden ${isOutOfStock ? 'opacity-80' : ''}`}>
-                      <div className="relative aspect-[4/5] rounded-xl overflow-hidden mb-4 bg-gray-50 border border-gray-100 flex-shrink-0">
+                    <div key={p.id} className={`group bg-white p-3 sm:p-4 rounded-2xl border-2 border-gray-50 shadow-sm hover:shadow-3xl transition-all duration-700 flex flex-col h-full relative overflow-hidden min-w-0 ${isOutOfStock ? 'opacity-80' : ''}`}>
+                       <div className="relative aspect-[4/5] rounded-xl overflow-hidden mb-4 bg-gray-50 border border-gray-100 flex-shrink-0">
+                         <button
+                          onClick={() => openImageViewer(p)}
+                          aria-label={`View ${p.productName || p.name} image`}
+                          className="absolute inset-0 z-10"
+                         />
                          <img src={p.image} className={`w-full h-full object-cover group-hover:scale-110 transition-transform duration-1000 ${isOutOfStock ? 'grayscale blur-sm' : ''}`} alt={p.name} />
                          <div className="absolute top-2 left-2 bg-white/95 backdrop-blur-md text-[8px] font-black px-2 py-1 rounded-full uppercase text-orange-600 shadow-xl border border-orange-100 tracking-[0.1em] italic">Original {p.type}</div>
                          {isOutOfStock && (
@@ -1223,13 +1517,24 @@ const App: React.FC = () => {
                            </span>
                          </div>
 
-                         <div className="mt-auto pt-4 border-t border-gray-50">
-                            <p className="text-[9px] font-black uppercase text-gray-300 mb-2 tracking-widest italic ml-1">Available Variants</p>
+                         <div className="mt-auto pt-3 border-t border-gray-50">
+                            <div className="mb-2 flex items-center justify-between gap-2">
+                              <p className="text-[9px] font-black uppercase text-gray-300 tracking-widest italic ml-1">Available Variants</p>
+                              <button
+                                onClick={() => handleCardAddToCart(p)}
+                                disabled={isOutOfStock}
+                                aria-label={`Add ${p.productName || p.name} to bag`}
+                                className="inline-flex items-center gap-1.5 bg-orange-600 text-white px-2.5 py-1.5 rounded-lg text-[9px] font-black uppercase tracking-wider hover:bg-orange-700 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                              >
+                                <ShoppingBag size={12} />
+                                Add to Cart
+                              </button>
+                            </div>
                             <div className="flex flex-wrap gap-2">
                                {p.sizes.map(s => (
-                                 <button key={s} onClick={() => addToCart(p, s)} disabled={isOutOfStock} className="w-10 h-10 border-2 border-gray-100 rounded-lg flex items-center justify-center text-[9px] font-black transition-all hover:bg-black hover:text-white hover:border-black active:scale-90 disabled:opacity-30 uppercase italic">
+                                 <span key={s} className={`w-10 h-10 border-2 border-gray-100 rounded-lg flex items-center justify-center text-[9px] font-black uppercase italic select-none ${isOutOfStock ? 'opacity-30' : 'text-gray-500 bg-white'}`}>
                                    {s}
-                                 </button>
+                                 </span>
                                ))}
                             </div>
                          </div>
@@ -1246,7 +1551,104 @@ const App: React.FC = () => {
               </div>
                 </>
               )}
+              </div>
             </div>
+
+            {isMobileFilterOpen && (
+              <div className="fixed inset-0 z-[70] md:hidden">
+                <button
+                  aria-label="Close filters"
+                  onClick={() => setIsMobileFilterOpen(false)}
+                  className="absolute inset-0 bg-black/40 backdrop-blur-[1px]"
+                />
+                <div className="absolute inset-x-0 bottom-0 bg-white rounded-t-3xl border-t border-gray-100 shadow-2xl max-h-[85vh] overflow-y-auto">
+                  <div className="sticky top-0 bg-white border-b border-gray-100 px-4 py-3 flex items-center justify-between">
+                    <h3 className="font-black text-xs uppercase tracking-[0.4em] text-gray-500 italic">Classification</h3>
+                    <button
+                      onClick={() => setIsMobileFilterOpen(false)}
+                      className="text-[11px] font-black uppercase tracking-wider text-orange-600"
+                    >
+                      Done
+                    </button>
+                  </div>
+                  <div className="p-4">
+                    {renderFilterControls()}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {quickAddProduct && (
+              <div className="fixed inset-0 z-[80] flex items-end sm:items-center justify-center p-3 sm:p-4">
+                <button
+                  aria-label="Close size picker"
+                  onClick={() => setQuickAddProduct(null)}
+                  className="absolute inset-0 bg-black/45 backdrop-blur-[1px]"
+                />
+                <div className="relative w-full max-w-sm bg-white rounded-2xl border border-gray-100 shadow-2xl p-4 sm:p-5">
+                  <h3 className="text-sm font-black uppercase tracking-wider text-gray-700 mb-1">Choose Size</h3>
+                  <p className="text-xs text-gray-500 mb-4">{quickAddProduct.productName || quickAddProduct.name}</p>
+                  <div className="grid grid-cols-4 gap-2 mb-4">
+                    {(quickAddProduct.sizes || []).map((sizeValue) => (
+                      <button
+                        key={sizeValue}
+                        onClick={() => {
+                          addToCart(quickAddProduct, sizeValue);
+                          setQuickAddProduct(null);
+                        }}
+                        className="h-10 rounded-lg border-2 border-gray-100 text-[10px] font-black uppercase hover:bg-black hover:text-white hover:border-black transition-all"
+                      >
+                        {sizeValue}
+                      </button>
+                    ))}
+                  </div>
+                  <button
+                    onClick={() => setQuickAddProduct(null)}
+                    className="w-full h-10 rounded-xl border border-gray-200 text-[11px] font-black uppercase tracking-wider text-gray-600 hover:bg-gray-50 transition-colors"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {imageViewerProduct && (
+              <div className="fixed inset-0 z-[90] bg-black/90 backdrop-blur-sm">
+                <button
+                  aria-label="Close image viewer"
+                  onClick={closeImageViewer}
+                  className="absolute inset-0"
+                />
+                <button
+                  aria-label="Close"
+                  onClick={closeImageViewer}
+                  className="absolute top-3 right-3 z-[92] w-10 h-10 rounded-full bg-white/10 border border-white/20 text-white flex items-center justify-center hover:bg-white/20 transition-colors"
+                >
+                  <X size={18} />
+                </button>
+
+                <div className="absolute top-3 left-3 z-[92] bg-white/10 border border-white/20 text-white rounded-full px-3 py-1.5 text-[10px] font-black uppercase tracking-[0.14em]">
+                  Pinch or wheel to zoom
+                </div>
+
+                <div
+                  onClick={(event) => event.stopPropagation()}
+                  onWheel={handleImageViewerWheel}
+                  onTouchStart={handleImageViewerTouchStart}
+                  onTouchMove={handleImageViewerTouchMove}
+                  onTouchEnd={handleImageViewerTouchEnd}
+                  className="absolute inset-0 z-[91] flex items-center justify-center p-4 sm:p-8 touch-none"
+                >
+                  <img
+                    src={imageViewerProduct.image}
+                    alt={imageViewerProduct.productName || imageViewerProduct.name}
+                    draggable={false}
+                    style={{ transform: `translate(${imageViewerTranslate.x}px, ${imageViewerTranslate.y}px) scale(${imageViewerScale})` }}
+                    className="max-w-full max-h-full object-contain transition-transform duration-100 select-none"
+                  />
+                </div>
+              </div>
+            )}
           </div>
         )}
 

@@ -2,7 +2,7 @@
 // This will replace localStorage with real database calls
 
 import { supabase } from './supabase';
-import { Product, Order, FinancialMetric, FinancialTotals } from '../types';
+import { Product, ProductGender, Order, FinancialMetric, FinancialTotals } from '../types';
 
 const ADMIN_NOTIFICATION_EMAIL = 'flexfitslebanon@gmail.com';
 const EMAIL_WEBHOOK_URL = String(import.meta.env.VITE_EMAIL_WEBHOOK_URL || '').trim();
@@ -27,7 +27,7 @@ type EmailLogStatus = 'success' | 'failed' | 'fallback-unknown';
 type EmailDeliveryLog = {
   id: string;
   ts: string;
-  event: 'order_created_admin' | 'order_dispatched_customer';
+  event: 'order_created_admin' | 'order_received_customer' | 'order_dispatched_customer';
   toEmail: string;
   subject: string;
   orderId: string;
@@ -146,6 +146,39 @@ function normalizeProductImage(value: any): string {
   return candidate;
 }
 
+function normalizeGender(value: any): ProductGender {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'women' || normalized === 'woman' || normalized === 'female' || normalized === 'ladies') return 'Women';
+  if (normalized === 'men' || normalized === 'man' || normalized === 'male' || normalized === 'gents') return 'Men';
+  if (normalized === 'unisex' || normalized === 'uni-sex') return 'Unisex';
+  return 'Unisex';
+}
+
+function inferGenderFromRow(row: any): ProductGender {
+  const explicit = row.Gender ?? row.gender ?? row.Product_Gender ?? row.product_gender;
+  if (String(explicit || '').trim()) return normalizeGender(explicit);
+
+  const hintText = [
+    row.Name_of_Product,
+    row.Name_Product,
+    row.name_of_product,
+    row.Name_of_Item,
+    row.name_of_item,
+    row.Type,
+    row.type,
+    row.Description,
+    row.description,
+  ]
+    .map((v) => String(v || '').trim().toLowerCase())
+    .filter(Boolean)
+    .join(' ');
+
+  if (/(\bwomen\b|\bwoman\b|\bfemale\b|\bladies\b)/i.test(hintText)) return 'Women';
+  if (/(\bmen\b|\bman\b|\bmale\b|\bgents\b)/i.test(hintText)) return 'Men';
+  if (/\bunisex\b/i.test(hintText)) return 'Unisex';
+  return 'Unisex';
+}
+
 function buildOrderEmailHtml(
   order: Order,
   items: EmailOrderItem[],
@@ -249,7 +282,7 @@ async function getItemsWithProductImages(orderItems: Array<{ productId: string; 
 }
 
 async function sendEmailEvent(payload: {
-  event: 'order_created_admin' | 'order_dispatched_customer';
+  event: 'order_created_admin' | 'order_received_customer' | 'order_dispatched_customer';
   toEmail: string;
   subject: string;
   html: string;
@@ -431,6 +464,27 @@ async function notifyCustomerOrderDispatched(order: Order): Promise<void> {
   });
 }
 
+async function notifyCustomerOrderReceived(order: Order): Promise<void> {
+  if (!order.customerEmail) return;
+
+  const items = await getItemsWithProductImages(order.items || []);
+  const html = buildOrderEmailHtml(
+    order,
+    items,
+    'Order Received - Processing Started',
+    'We received your order and started preparing it. You will receive another email once your order is accepted and dispatched.'
+  );
+
+  await sendEmailEvent({
+    event: 'order_received_customer',
+    toEmail: order.customerEmail,
+    subject: `We received your Flex Fits order ${order.id}`,
+    html,
+    order,
+    items,
+  });
+}
+
 // ==================== PRODUCTS ====================
 
 function toNumberOrNull(value: any): number | null {
@@ -465,6 +519,7 @@ export async function getProducts(): Promise<Product[]> {
       id: p.Product_ID || p.id,
       brandName: p.Name_of_Brand || p.name_of_brand || '',
       productName: p.Name_of_Product || p.Name_Product || p.name_of_product || p.Name_of_Item || p.name_of_item || '',
+      gender: inferGenderFromRow(p),
       name: [
         p.Name_of_Brand || p.name_of_brand || '',
         p.Name_of_Product || p.Name_Product || p.name_of_product || p.Name_of_Item || p.name_of_item || ''
@@ -515,26 +570,43 @@ export async function saveProduct(product: Product): Promise<void> {
   }
 
   try {
-    const { error } = await supabase
-      .from('products')
-      .upsert({
-        Product_ID: product.id,
-        Name_of_Brand: product.brandName || product.name,
-        Name_of_Product: product.productName || product.name,
-        Category: product.category,
-        Type: product.type,
-        Price: product.price,
-        Cost: product.cost,
-        Stock: product.initialStock,
-        Items_LEFT_in_stock: product.pieces,
-        Items_Sold: product.sold,
-        SIZE: product.sizes.join(','),
-        Status: product.status || 'Active',
-        Pictures: product.image,
-        Description: product.description,
-      }, {
-        onConflict: 'Product_ID'
-      });
+    const basePayload: any = {
+      Product_ID: product.id,
+      Name_of_Brand: product.brandName || product.name,
+      Name_of_Product: product.productName || product.name,
+      Category: product.category,
+      Type: product.type,
+      Price: product.price,
+      Cost: product.cost,
+      Stock: product.initialStock,
+      Items_LEFT_in_stock: product.pieces,
+      Items_Sold: product.sold,
+      SIZE: product.sizes.join(','),
+      Status: product.status || 'Active',
+      Pictures: product.image,
+      Description: product.description,
+    };
+
+    const executeUpsert = async (payload: any) => {
+      return supabase
+        .from('products')
+        .upsert(payload, {
+          onConflict: 'Product_ID'
+        });
+    };
+
+    const requestedGender = normalizeGender(product.gender);
+    let { error } = await executeUpsert({ ...basePayload, Gender: requestedGender });
+
+    if (error) {
+      const errText = `${error.message || ''} ${error.details || ''} ${error.hint || ''}`.toLowerCase();
+      const hasMissingGenderColumn = errText.includes('gender') && (errText.includes('column') || errText.includes('schema cache') || error.code === 'PGRST204');
+
+      if (hasMissingGenderColumn) {
+        const retry = await executeUpsert(basePayload);
+        error = retry.error;
+      }
+    }
 
     if (error) {
       console.error('Supabase saveProduct error details:', {
@@ -693,6 +765,7 @@ export async function saveOrder(order: Order): Promise<void> {
     orders.unshift(order);
     localStorage.setItem('flex_orders', JSON.stringify(orders));
     await notifyAdminOrderCreated(order);
+    await notifyCustomerOrderReceived(order);
     return;
   }
 
@@ -737,6 +810,7 @@ export async function saveOrder(order: Order): Promise<void> {
     }
 
     await notifyAdminOrderCreated(order);
+    await notifyCustomerOrderReceived(order);
   } catch (error) {
     console.error('Error saving order:', error);
     throw error;
