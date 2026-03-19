@@ -305,8 +305,14 @@ const App: React.FC = () => {
   const handleImageViewerTouchMove = (event: React.TouchEvent<HTMLDivElement>) => {
     const gesture = imageViewerGestureRef.current;
 
+    const stopDefaultIfPossible = () => {
+      if (event.cancelable) {
+        event.preventDefault();
+      }
+    };
+
     if (event.touches.length >= 2) {
-      event.preventDefault();
+      stopDefaultIfPossible();
       const distance = getTouchDistance(event.touches);
       if (!gesture.pinchStartDistance) {
         gesture.pinchStartDistance = distance;
@@ -327,7 +333,7 @@ const App: React.FC = () => {
     const deltaY = firstTouch.clientY - gesture.lastTouchY;
 
     if (imageViewerScale > 1.02) {
-      event.preventDefault();
+      stopDefaultIfPossible();
       setImageViewerTranslate((prev) => ({ x: prev.x + deltaX, y: prev.y + deltaY }));
     }
 
