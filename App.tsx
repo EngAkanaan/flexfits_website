@@ -1872,7 +1872,7 @@ const App: React.FC = () => {
                           className="absolute inset-0 z-10"
                          />
                          <img src={p.image} className={`w-full h-full object-cover group-hover:scale-110 transition-transform duration-1000 ${isOutOfStock ? 'grayscale blur-sm' : ''}`} alt={p.name} />
-                         <div className="absolute top-2 left-2 bg-white/95 backdrop-blur-md text-[8px] font-black px-2 py-1 rounded-full uppercase text-orange-600 shadow-xl border border-orange-100 tracking-[0.1em] italic">Original {p.type}</div>
+                         <div className="absolute top-2 left-2 bg-white/95 backdrop-blur-md text-[8px] font-black px-2 py-1 rounded-full uppercase text-orange-600 shadow-xl border border-orange-100 tracking-[0.1em] italic">{p.type}</div>
                          {isOutOfStock && (
                             <div className="absolute inset-0 bg-black/70 flex items-center justify-center p-4 text-center backdrop-blur-sm">
                              <span className="bg-red-600 text-white font-black text-xs uppercase tracking-[0.3em] px-4 py-2 rounded-full shadow-2xl animate-pulse italic">Sold Out</span>
