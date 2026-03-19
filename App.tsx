@@ -1596,8 +1596,8 @@ const App: React.FC = () => {
           <div className="lg:col-span-2 space-y-8">
             {cart.map((it, idx) => (
                <div key={idx} className="flex flex-col sm:flex-row gap-8 p-8 bg-white rounded-[4rem] border shadow-sm hover:shadow-2xl transition-all group border-gray-50">
-                 <div className="w-full sm:w-48 h-64 bg-gray-50 rounded-[2.5rem] overflow-hidden shadow-inner flex-shrink-0">
-                    <img src={it.image} className="w-full h-full object-cover transition-transform duration-700 group-hover:scale-110" alt={it.name} />
+                 <div className="w-full sm:w-48 h-64 bg-white rounded-[2.5rem] overflow-hidden shadow-inner flex-shrink-0">
+                    <img src={it.image} className="w-full h-full object-contain p-2 transition-transform duration-700 group-hover:scale-[1.03]" alt={it.name} />
                  </div>
                  <div className="flex-1 flex flex-col justify-between py-4">
                    <div className="flex justify-between items-start">
