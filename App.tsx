@@ -1865,13 +1865,13 @@ const App: React.FC = () => {
                   const isOutOfStock = p.pieces <= 0 || p.status === 'Temporary Not Available' || p.status === 'Temporarily unavailable' || p.status === 'Out of Stock';
                   return (
                     <div key={p.id} className={`group bg-white p-3 sm:p-4 rounded-2xl border-2 border-gray-50 shadow-sm hover:shadow-3xl transition-all duration-700 flex flex-col h-full relative overflow-hidden min-w-0 ${isOutOfStock ? 'opacity-80' : ''}`}>
-                       <div className="relative aspect-[4/5] rounded-xl overflow-hidden mb-4 bg-gray-50 border border-gray-100 flex-shrink-0">
+                       <div className="relative aspect-[4/5] rounded-xl overflow-hidden mb-4 bg-white border border-gray-100 flex-shrink-0">
                          <button
                           onClick={() => openImageViewer(p)}
                           aria-label={`View ${p.productName || p.name} image`}
                           className="absolute inset-0 z-10"
                          />
-                         <img src={p.image} className={`w-full h-full object-cover group-hover:scale-110 transition-transform duration-1000 ${isOutOfStock ? 'grayscale blur-sm' : ''}`} alt={p.name} />
+                         <img src={p.image} className={`w-full h-full object-contain p-2 group-hover:scale-[1.03] transition-transform duration-700 ${isOutOfStock ? 'grayscale' : ''}`} alt={p.name} />
                          <div className="absolute top-2 left-2 bg-white/95 backdrop-blur-md text-[8px] font-black px-2 py-1 rounded-full uppercase text-orange-600 shadow-xl border border-orange-100 tracking-[0.1em] italic">{p.type}</div>
                          {isOutOfStock && (
                             <div className="absolute inset-0 bg-black/70 flex items-center justify-center p-4 text-center backdrop-blur-sm">
