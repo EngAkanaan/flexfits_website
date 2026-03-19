@@ -5,11 +5,14 @@ export enum Category {
   UNDERWEAR = 'Underwear'
 }
 
+export type ProductGender = 'Men' | 'Women' | 'Unisex';
+
 export interface Product {
   id: string;
   name: string;
   brandName: string;
   productName: string;
+  gender: ProductGender;
   category: Category;
   type: string;
   price: number;

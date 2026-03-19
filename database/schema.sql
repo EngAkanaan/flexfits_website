@@ -8,6 +8,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE TABLE products (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
+  gender TEXT NOT NULL DEFAULT 'Unisex' CHECK (gender IN ('Men', 'Women', 'Unisex')),
   category TEXT NOT NULL CHECK (category IN ('Shoes', 'Tshirts', 'Socks', 'Hoodies')),
   type TEXT NOT NULL,
   price DECIMAL(10, 2) NOT NULL,
@@ -219,6 +220,25 @@ EXECUTE FUNCTION apply_order_dispatch_stock_change();
 
 ALTER TABLE products ADD COLUMN IF NOT EXISTS "Product_ID" TEXT;
 ALTER TABLE products ADD COLUMN IF NOT EXISTS "Name_of_Product" TEXT;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS "Gender" TEXT;
+
+-- Backfill and constrain product gender values for existing rows.
+UPDATE products
+SET "Gender" = 'Unisex'
+WHERE COALESCE(TRIM("Gender"), '') = '';
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'products_gender_check'
+  ) THEN
+    ALTER TABLE products
+      ADD CONSTRAINT products_gender_check CHECK ("Gender" IN ('Men', 'Women', 'Unisex'));
+  END IF;
+END
+$$;
 
 -- If Name_of_Product is empty, backfill from existing product name.
 UPDATE products
