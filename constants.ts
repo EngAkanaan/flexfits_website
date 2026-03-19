@@ -1,6 +1,13 @@
 
 import { Category, Product } from './types';
 
+const SHOE_BASE_SIZES = Array.from({ length: 16 }, (_, i) => 35 + i);
+const SHOE_SIZE_VARIANTS = ['', '(1/3)', '(1/2)', '(2/3)'];
+
+const SHOE_SIZE_OPTIONS = SHOE_BASE_SIZES.flatMap((size) =>
+  SHOE_SIZE_VARIANTS.map((variant) => `${size}${variant}`)
+);
+
 export const LEBANON_LOCATIONS: Record<string, Record<string, string[]>> = {
   "North Lebanon": {
     "Akkar": ["Halba", "Bebnine", "Qoubaiyat", "Andaket", "Bireh", "Fnaideq", "Miniara", "Mishmish", "Rahbeh", "Tal Abbas El Gharbi", "Tal Abbas El Sharqi"],
@@ -43,7 +50,7 @@ export const LEBANON_LOCATIONS: Record<string, Record<string, string[]>> = {
 };
 
 export const SIZE_OPTIONS = {
-  [Category.SHOES]: Array.from({ length: 31 }, (_, i) => (35 + i * 0.5).toString()),
+  [Category.SHOES]: SHOE_SIZE_OPTIONS,
   [Category.SOCKS]: ['35-40', '36-41', '40-45', '41-46', 'One Size'],
   [Category.UNDERWEAR]: ['XS', 'S', 'M', 'L', 'XL', 'XXL']
 };

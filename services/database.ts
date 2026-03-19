@@ -2,7 +2,7 @@
 // This will replace localStorage with real database calls
 
 import { supabase } from './supabase';
-import { Product, ProductGender, Order, FinancialMetric, FinancialTotals } from '../types';
+import { Product, ProductGender, Order, FinancialMetric, FinancialTotals, StockReservation } from '../types';
 
 const ADMIN_NOTIFICATION_EMAIL = 'flexfitslebanon@gmail.com';
 const EMAIL_WEBHOOK_URL = String(import.meta.env.VITE_EMAIL_WEBHOOK_URL || '').trim();
@@ -12,6 +12,9 @@ const SITE_URL = String(
   (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000')
 ).trim();
 const DEFAULT_PRODUCT_IMAGE = '/flex-logo-bbg.JPG';
+const RESERVATION_TTL_SECONDS = 10 * 60;
+const RESERVATION_SESSION_STORAGE_KEY = 'flex_reservation_session_id';
+const LOCAL_RESERVATION_STORAGE_KEY = 'flex_stock_reservations_local';
 
 type EmailOrderItem = {
   productId: string;
@@ -485,6 +488,297 @@ async function notifyCustomerOrderReceived(order: Order): Promise<void> {
   });
 }
 
+function randomSessionToken(): string {
+  return `sess-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+export function getReservationSessionId(): string {
+  try {
+    const existing = String(localStorage.getItem(RESERVATION_SESSION_STORAGE_KEY) || '').trim();
+    if (existing) return existing;
+    const created = randomSessionToken();
+    localStorage.setItem(RESERVATION_SESSION_STORAGE_KEY, created);
+    return created;
+  } catch {
+    return randomSessionToken();
+  }
+}
+
+function readLocalReservations(): StockReservation[] {
+  try {
+    const raw = localStorage.getItem(LOCAL_RESERVATION_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalReservations(rows: StockReservation[]): void {
+  try {
+    localStorage.setItem(LOCAL_RESERVATION_STORAGE_KEY, JSON.stringify(rows));
+  } catch {
+    // Ignore localStorage failures silently.
+  }
+}
+
+export async function cleanupExpiredReservations(): Promise<number> {
+  if (!supabase) {
+    const nowMs = Date.now();
+    const reservations = readLocalReservations();
+    let released = 0;
+    const updated = reservations.map((row) => {
+      if (row.status === 'active' && new Date(row.expiresAt).getTime() <= nowMs) {
+        released += 1;
+        return { ...row, status: 'released', releasedAt: new Date().toISOString() } as any;
+      }
+      return row;
+    });
+    writeLocalReservations(updated);
+    return released;
+  }
+
+  try {
+    const { data, error } = await supabase.rpc('cleanup_expired_stock_reservations');
+    if (error) throw error;
+    return Math.max(0, Number(data || 0));
+  } catch (error) {
+    console.warn('Unable to cleanup expired reservations:', error);
+    return 0;
+  }
+}
+
+export async function getSessionActiveReservations(sessionId: string = getReservationSessionId()): Promise<StockReservation[]> {
+  if (!supabase) {
+    const nowMs = Date.now();
+    const reservations = readLocalReservations();
+    return reservations.filter((row) => row.sessionId === sessionId && row.status === 'active' && new Date(row.expiresAt).getTime() > nowMs);
+  }
+
+  await cleanupExpiredReservations();
+  const { data, error } = await supabase
+    .from('stock_reservations')
+    .select('*')
+    .eq('session_id', sessionId)
+    .eq('status', 'active')
+    .gt('expires_at', new Date().toISOString());
+
+  if (error) throw error;
+
+  return (data || []).map((row: any) => ({
+    id: String(row.id),
+    productId: String(row.product_id || ''),
+    size: String(row.size || ''),
+    quantity: Math.max(0, Number(row.quantity || 0)),
+    sessionId: String(row.session_id || ''),
+    status: String(row.status || 'active') as StockReservation['status'],
+    reservedAt: String(row.reserved_at || row.created_at || ''),
+    expiresAt: String(row.expires_at || ''),
+    orderId: row.order_id ? String(row.order_id) : null,
+  }));
+}
+
+export async function reserveCartLine(payload: {
+  productId: string;
+  size: string;
+  quantity: number;
+  existingReservationId?: string;
+  sessionId?: string;
+}): Promise<{ ok: boolean; message: string; reservationId?: string; expiresAt?: string; availableAfter?: number }> {
+  const sessionId = payload.sessionId || getReservationSessionId();
+  const quantity = Math.max(1, Number(payload.quantity || 1));
+
+  if (!supabase) {
+    const now = new Date();
+    const expires = new Date(now.getTime() + RESERVATION_TTL_SECONDS * 1000);
+    const reservations = readLocalReservations();
+    const existingIndex = payload.existingReservationId
+      ? reservations.findIndex((row) => row.id === payload.existingReservationId && row.sessionId === sessionId && row.status === 'active')
+      : -1;
+
+    const activeForProduct = reservations
+      .filter((row) => row.productId === payload.productId && row.status === 'active' && new Date(row.expiresAt).getTime() > now.getTime())
+      .reduce((sum, row) => sum + Math.max(0, Number(row.quantity || 0)), 0);
+
+    const savedProducts = localStorage.getItem('flex_products');
+    const products = savedProducts ? JSON.parse(savedProducts) : [];
+    const product = (products || []).find((p: Product) => p.id === payload.productId);
+    const baseStock = Math.max(0, Number((product as any)?.pieces || 0));
+    const currentExistingQty = existingIndex >= 0 ? Math.max(0, Number(reservations[existingIndex].quantity || 0)) : 0;
+    const reservedOthers = Math.max(0, activeForProduct - currentExistingQty);
+    if (baseStock - reservedOthers < quantity) {
+      return { ok: false, message: 'Reserved by another shopper. Please reduce quantity.', availableAfter: Math.max(0, baseStock - reservedOthers) };
+    }
+
+    if (existingIndex >= 0) {
+      reservations[existingIndex] = {
+        ...reservations[existingIndex],
+        quantity,
+        size: payload.size,
+        reservedAt: now.toISOString(),
+        expiresAt: expires.toISOString(),
+        status: 'active',
+      };
+      writeLocalReservations(reservations);
+      return {
+        ok: true,
+        message: 'Reserved successfully.',
+        reservationId: reservations[existingIndex].id,
+        expiresAt: reservations[existingIndex].expiresAt,
+        availableAfter: Math.max(0, baseStock - reservedOthers - quantity),
+      };
+    }
+
+    const localReservation: StockReservation = {
+      id: `local-res-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      productId: payload.productId,
+      size: payload.size,
+      quantity,
+      sessionId,
+      status: 'active',
+      reservedAt: now.toISOString(),
+      expiresAt: expires.toISOString(),
+      orderId: null,
+    };
+    reservations.unshift(localReservation);
+    writeLocalReservations(reservations);
+    return {
+      ok: true,
+      message: 'Reserved successfully.',
+      reservationId: localReservation.id,
+      expiresAt: localReservation.expiresAt,
+      availableAfter: Math.max(0, baseStock - reservedOthers - quantity),
+    };
+  }
+
+  const { data, error } = await supabase.rpc('reserve_product_stock_fcfs', {
+    p_session_id: sessionId,
+    p_product_id: payload.productId,
+    p_size: payload.size,
+    p_quantity: quantity,
+    p_ttl_seconds: RESERVATION_TTL_SECONDS,
+    p_existing_reservation_id: payload.existingReservationId || null,
+  });
+
+  if (error) {
+    console.error('reserve_product_stock_fcfs error:', error);
+    return { ok: false, message: 'Unable to reserve stock right now. Please retry.' };
+  }
+
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row) return { ok: false, message: 'No reservation result received.' };
+
+  return {
+    ok: Boolean(row.ok),
+    message: String(row.message || (row.ok ? 'Reserved successfully.' : 'Reservation failed.')),
+    reservationId: row.reservation_id ? String(row.reservation_id) : undefined,
+    expiresAt: row.expires_at ? String(row.expires_at) : undefined,
+    availableAfter: row.available_after !== undefined && row.available_after !== null ? Math.max(0, Number(row.available_after)) : undefined,
+  };
+}
+
+export async function releaseCartLineReservation(reservationId?: string, sessionId: string = getReservationSessionId()): Promise<boolean> {
+  if (!reservationId) return false;
+
+  if (!supabase) {
+    const nowIso = new Date().toISOString();
+    const rows = readLocalReservations();
+    const next = rows.map((row) => {
+      if (row.id === reservationId && row.sessionId === sessionId && row.status === 'active') {
+        return { ...row, status: 'released', releasedAt: nowIso } as any;
+      }
+      return row;
+    });
+    writeLocalReservations(next);
+    return true;
+  }
+
+  const { data, error } = await supabase.rpc('release_stock_reservation', {
+    p_session_id: sessionId,
+    p_reservation_id: reservationId,
+  });
+
+  if (error) {
+    console.warn('release_stock_reservation error:', error);
+    return false;
+  }
+
+  return Boolean(data);
+}
+
+export async function extendExpiredReservation(reservationId: string, sessionId: string = getReservationSessionId(), extendSeconds = 120): Promise<{ ok: boolean; message: string; expiresAt?: string }> {
+  if (!supabase) {
+    const now = Date.now();
+    const rows = readLocalReservations();
+    const index = rows.findIndex((row) => row.id === reservationId && row.sessionId === sessionId && row.status === 'active');
+    if (index < 0) return { ok: false, message: 'Reservation cannot be extended.' };
+    const currentExp = new Date(rows[index].expiresAt).getTime();
+    if (currentExp > now || currentExp < now - 120000) {
+      return { ok: false, message: 'Reservation cannot be extended.' };
+    }
+    const exp = new Date(now + Math.max(30, extendSeconds) * 1000).toISOString();
+    rows[index] = { ...rows[index], expiresAt: exp };
+    writeLocalReservations(rows);
+    return { ok: true, message: 'Reservation extended.', expiresAt: exp };
+  }
+
+  const { data, error } = await supabase.rpc('extend_stock_reservation', {
+    p_session_id: sessionId,
+    p_reservation_id: reservationId,
+    p_extend_seconds: extendSeconds,
+  });
+
+  if (error) {
+    console.warn('extend_stock_reservation error:', error);
+    return { ok: false, message: 'Reservation cannot be extended.' };
+  }
+
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row) return { ok: false, message: 'Reservation cannot be extended.' };
+  return {
+    ok: Boolean(row.ok),
+    message: String(row.message || ''),
+    expiresAt: row.expires_at ? String(row.expires_at) : undefined,
+  };
+}
+
+export async function commitCheckoutReservations(orderId: string, reservationIds: string[], sessionId: string = getReservationSessionId()): Promise<void> {
+  const ids = reservationIds.map((v) => String(v || '').trim()).filter(Boolean);
+  if (ids.length === 0) {
+    throw new Error('Some items in your cart have expired.');
+  }
+
+  if (!supabase) {
+    const nowIso = new Date().toISOString();
+    const rows = readLocalReservations();
+    const updated = rows.map((row) => {
+      if (ids.includes(row.id) && row.sessionId === sessionId && row.status === 'active' && new Date(row.expiresAt).getTime() > Date.now()) {
+        return { ...row, status: 'confirmed', orderId, confirmedAt: nowIso } as any;
+      }
+      return row;
+    });
+    writeLocalReservations(updated);
+    return;
+  }
+
+  const { data, error } = await supabase.rpc('commit_checkout_reservations', {
+    p_session_id: sessionId,
+    p_order_id: orderId,
+    p_reservation_ids: ids,
+  });
+
+  if (error) {
+    console.error('commit_checkout_reservations error:', error);
+    throw new Error('Some items in your cart have expired.');
+  }
+
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row || !row.ok) {
+    throw new Error(String(row?.message || 'Some items in your cart have expired.'));
+  }
+}
+
 // ==================== PRODUCTS ====================
 
 function toNumberOrNull(value: any): number | null {
@@ -542,6 +836,29 @@ export async function getProducts(): Promise<Product[]> {
       delete product._soldRaw;
       return product as Product;
     });
+
+    try {
+      const { data: reservationRows } = await supabase
+        .from('stock_reservations')
+        .select('product_id,quantity')
+        .eq('status', 'active')
+        .gt('expires_at', new Date().toISOString());
+
+      const reservedByProduct = new Map<string, number>();
+      for (const row of reservationRows || []) {
+        const productId = String((row as any).product_id || '').trim();
+        const qty = Math.max(0, Number((row as any).quantity || 0));
+        if (!productId || qty <= 0) continue;
+        reservedByProduct.set(productId, (reservedByProduct.get(productId) || 0) + qty);
+      }
+
+      for (const product of transformed) {
+        const reserved = Math.max(0, reservedByProduct.get(String(product.id || '').trim()) || 0);
+        product.pieces = Math.max(0, Number(product.pieces || 0) - reserved);
+      }
+    } catch {
+      // Keep product list available even if reservation table is not migrated yet.
+    }
 
     // Keep fallback cache aligned with database to avoid stale rollback on refresh.
     localStorage.setItem('flex_products', JSON.stringify(transformed));
@@ -809,6 +1126,19 @@ export async function saveOrder(order: Order): Promise<void> {
       if (itemsError) throw itemsError;
     }
 
+    const reservationIds = (order.items || [])
+      .map((item) => String((item as any).reservationId || '').trim())
+      .filter(Boolean);
+
+    if (reservationIds.length > 0) {
+      try {
+        await commitCheckoutReservations(order.id, reservationIds);
+      } catch (reservationError) {
+        await supabase.from('orders').delete().eq('id', order.id);
+        throw reservationError;
+      }
+    }
+
     await notifyAdminOrderCreated(order);
     await notifyCustomerOrderReceived(order);
   } catch (error) {
@@ -875,8 +1205,59 @@ export async function updateOrderStatus(
     if (!existingOrder) throw new Error(`Order ${orderId} was not found.`);
     if (existingOrder.status === status) return;
 
-    // Apply inventory updates only when admin dispatches/approves (pending -> shipped).
+    // Apply inventory updates only when admin dispatches/approves (pending -> shipped)
+    // and only for legacy orders that were not already committed at checkout.
     if (existingOrder.status === 'pending' && status === 'shipped') {
+      const { data: confirmedReservationRows, error: confirmedReservationError } = await supabase
+        .from('stock_reservations')
+        .select('id')
+        .eq('order_id', orderId)
+        .eq('status', 'confirmed')
+        .limit(1);
+
+      if (confirmedReservationError) {
+        throw confirmedReservationError;
+      }
+
+      const hasCommittedAtCheckout = Array.isArray(confirmedReservationRows) && confirmedReservationRows.length > 0;
+      if (hasCommittedAtCheckout) {
+        const { error: orderUpdateError } = await supabase
+          .from('orders')
+          .update({ status })
+          .eq('id', orderId);
+
+        if (orderUpdateError) throw orderUpdateError;
+
+        const { data: itemRowsForMail } = await supabase
+          .from('order_items')
+          .select('product_id,product_name,size,quantity,price')
+          .eq('order_id', orderId);
+
+        const dispatchOrder: Order = {
+          id: String((existingOrder as any).id),
+          customerName: String((existingOrder as any).customer_name || ''),
+          customerEmail: String((existingOrder as any).customer_email || ''),
+          customerPhone: String((existingOrder as any).customer_phone || ''),
+          governorate: String((existingOrder as any).governorate || ''),
+          district: String((existingOrder as any).district || ''),
+          village: String((existingOrder as any).village || ''),
+          addressDetails: String((existingOrder as any).address_details || ''),
+          items: (itemRowsForMail || []).map((row: any) => ({
+            productId: String(row.product_id || ''),
+            productName: String(row.product_name || row.product_id || ''),
+            quantity: Math.max(0, Number(row.quantity || 0)),
+            size: String(row.size || ''),
+            price: Math.max(0, Number(row.price || 0)),
+          })),
+          total: Math.max(0, Number((existingOrder as any).total || 0)),
+          status: 'shipped',
+          date: String((existingOrder as any).date || new Date().toISOString()),
+        };
+
+        await notifyCustomerOrderDispatched(dispatchOrder);
+        return;
+      }
+
       const { data: itemRows, error: itemsFetchError } = await supabase
         .from('order_items')
         .select('product_id,product_name,size,quantity,price')

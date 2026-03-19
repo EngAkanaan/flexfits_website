@@ -428,3 +428,384 @@ EXECUTE FUNCTION trg_refresh_product_financial_metrics();
 -- One-time backfill for all currently sold items.
 SELECT refresh_product_financial_metrics();
 
+-- ==================== FCFS STOCK RESERVATIONS ====================
+-- First-come, first-served temporary stock holds.
+-- Availability = current product stock - active (non-expired) reservations.
+
+CREATE TABLE IF NOT EXISTS stock_reservations (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  product_id TEXT NOT NULL,
+  size TEXT NOT NULL,
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  session_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'confirmed', 'released')),
+  reserved_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  confirmed_at TIMESTAMP WITH TIME ZONE,
+  released_at TIMESTAMP WITH TIME ZONE,
+  order_id TEXT,
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_stock_reservations_product ON stock_reservations(product_id);
+CREATE INDEX IF NOT EXISTS idx_stock_reservations_product_active ON stock_reservations(product_id, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_stock_reservations_session_active ON stock_reservations(session_id, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_stock_reservations_expires ON stock_reservations(expires_at);
+
+ALTER TABLE stock_reservations ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Stock reservations are viewable by everyone" ON stock_reservations;
+DROP POLICY IF EXISTS "Stock reservations are insertable by everyone" ON stock_reservations;
+DROP POLICY IF EXISTS "Stock reservations are updatable by everyone" ON stock_reservations;
+DROP POLICY IF EXISTS "Stock reservations are deletable by everyone" ON stock_reservations;
+
+CREATE POLICY "Stock reservations are viewable by everyone"
+  ON stock_reservations FOR SELECT
+  USING (true);
+
+CREATE POLICY "Stock reservations are insertable by everyone"
+  ON stock_reservations FOR INSERT
+  WITH CHECK (true);
+
+CREATE POLICY "Stock reservations are updatable by everyone"
+  ON stock_reservations FOR UPDATE
+  USING (true);
+
+CREATE POLICY "Stock reservations are deletable by everyone"
+  ON stock_reservations FOR DELETE
+  USING (true);
+
+DROP TRIGGER IF EXISTS update_stock_reservations_updated_at ON stock_reservations;
+CREATE TRIGGER update_stock_reservations_updated_at
+  BEFORE UPDATE ON stock_reservations
+  FOR EACH ROW
+  EXECUTE FUNCTION update_updated_at_column();
+
+CREATE OR REPLACE FUNCTION reserve_product_stock_fcfs(
+  p_session_id TEXT,
+  p_product_id TEXT,
+  p_size TEXT,
+  p_quantity INTEGER,
+  p_ttl_seconds INTEGER DEFAULT 600,
+  p_existing_reservation_id UUID DEFAULT NULL
+)
+RETURNS TABLE (
+  ok BOOLEAN,
+  message TEXT,
+  reservation_id UUID,
+  expires_at TIMESTAMP WITH TIME ZONE,
+  available_after INTEGER
+) AS $$
+DECLARE
+  v_row JSONB;
+  v_ctid TID;
+  v_total_stock INTEGER;
+  v_existing_qty INTEGER := 0;
+  v_reserved_others INTEGER := 0;
+  v_target_qty INTEGER;
+  v_now TIMESTAMP WITH TIME ZONE := NOW();
+  v_exp TIMESTAMP WITH TIME ZONE;
+  v_reservation_id UUID;
+BEGIN
+  IF COALESCE(TRIM(p_session_id), '') = '' THEN
+    RETURN QUERY SELECT false, 'Reservation session is required.', NULL::UUID, NULL::TIMESTAMPTZ, 0;
+    RETURN;
+  END IF;
+
+  IF COALESCE(TRIM(p_product_id), '') = '' OR COALESCE(TRIM(p_size), '') = '' THEN
+    RETURN QUERY SELECT false, 'Product and size are required.', NULL::UUID, NULL::TIMESTAMPTZ, 0;
+    RETURN;
+  END IF;
+
+  IF COALESCE(p_quantity, 0) <= 0 THEN
+    RETURN QUERY SELECT false, 'Reservation quantity must be positive.', NULL::UUID, NULL::TIMESTAMPTZ, 0;
+    RETURN;
+  END IF;
+
+  -- Mark expired active rows as released before availability math.
+  UPDATE stock_reservations sr
+  SET status = 'released', released_at = COALESCE(sr.released_at, v_now)
+  WHERE sr.status = 'active' AND sr.expires_at <= v_now;
+
+  SELECT p.ctid, to_jsonb(p)
+  INTO v_ctid, v_row
+  FROM products p
+  WHERE COALESCE(NULLIF(to_jsonb(p)->>'Product_ID', ''), NULLIF(to_jsonb(p)->>'id', '')) = p_product_id
+  LIMIT 1
+  FOR UPDATE;
+
+  IF v_row IS NULL THEN
+    RETURN QUERY SELECT false, 'Product not found.', NULL::UUID, NULL::TIMESTAMPTZ, 0;
+    RETURN;
+  END IF;
+
+  v_total_stock := GREATEST(
+    0,
+    COALESCE(
+      NULLIF(v_row->>'Items_LEFT_in_stock', '')::INTEGER,
+      NULLIF(v_row->>'pieces', '')::INTEGER,
+      NULLIF(v_row->>'Stock', '')::INTEGER,
+      0
+    )
+  );
+
+  IF p_existing_reservation_id IS NOT NULL THEN
+    SELECT COALESCE(quantity, 0)
+    INTO v_existing_qty
+    FROM stock_reservations sr
+    WHERE sr.id = p_existing_reservation_id
+      AND sr.session_id = p_session_id
+      AND sr.product_id = p_product_id
+      AND LOWER(COALESCE(sr.size, '')) = LOWER(p_size)
+      AND sr.status = 'active'
+      AND sr.expires_at > v_now
+    FOR UPDATE;
+  END IF;
+
+  SELECT COALESCE(SUM(quantity), 0)
+  INTO v_reserved_others
+  FROM stock_reservations sr
+  WHERE sr.product_id = p_product_id
+    AND sr.status = 'active'
+    AND sr.expires_at > v_now
+    AND (p_existing_reservation_id IS NULL OR sr.id <> p_existing_reservation_id);
+
+  v_target_qty := CASE WHEN p_existing_reservation_id IS NULL THEN p_quantity ELSE v_existing_qty + p_quantity END;
+
+  IF v_total_stock - v_reserved_others < v_target_qty THEN
+    RETURN QUERY SELECT false, 'Reserved by another shopper. Please reduce quantity.', NULL::UUID, NULL::TIMESTAMPTZ, GREATEST(0, v_total_stock - v_reserved_others);
+    RETURN;
+  END IF;
+
+  v_exp := v_now + (GREATEST(60, COALESCE(p_ttl_seconds, 600)) || ' seconds')::INTERVAL;
+
+  IF p_existing_reservation_id IS NULL THEN
+    INSERT INTO stock_reservations (
+      product_id, size, quantity, session_id, status, reserved_at, expires_at
+    ) VALUES (
+      p_product_id, p_size, p_quantity, p_session_id, 'active', v_now, v_exp
+    )
+    RETURNING id INTO v_reservation_id;
+  ELSE
+    UPDATE stock_reservations sr
+    SET
+      quantity = v_target_qty,
+      reserved_at = v_now,
+      expires_at = v_exp,
+      status = 'active',
+      released_at = NULL,
+      confirmed_at = NULL,
+      order_id = NULL
+    WHERE sr.id = p_existing_reservation_id
+      AND sr.session_id = p_session_id
+      AND sr.status = 'active'
+    RETURNING id INTO v_reservation_id;
+
+    IF v_reservation_id IS NULL THEN
+      RETURN QUERY SELECT false, 'Existing reservation is no longer valid.', NULL::UUID, NULL::TIMESTAMPTZ, GREATEST(0, v_total_stock - v_reserved_others);
+      RETURN;
+    END IF;
+  END IF;
+
+  RETURN QUERY
+  SELECT true, 'Reserved successfully.', v_reservation_id, v_exp, GREATEST(0, v_total_stock - v_reserved_others - v_target_qty);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION release_stock_reservation(
+  p_session_id TEXT,
+  p_reservation_id UUID
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+  v_now TIMESTAMP WITH TIME ZONE := NOW();
+BEGIN
+  UPDATE stock_reservations
+  SET status = 'released', released_at = COALESCE(released_at, v_now)
+  WHERE id = p_reservation_id
+    AND session_id = p_session_id
+    AND status = 'active';
+
+  RETURN FOUND;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION extend_stock_reservation(
+  p_session_id TEXT,
+  p_reservation_id UUID,
+  p_extend_seconds INTEGER DEFAULT 120
+)
+RETURNS TABLE(
+  ok BOOLEAN,
+  message TEXT,
+  expires_at TIMESTAMP WITH TIME ZONE
+) AS $$
+DECLARE
+  v_now TIMESTAMP WITH TIME ZONE := NOW();
+  v_new_exp TIMESTAMP WITH TIME ZONE;
+BEGIN
+  v_new_exp := v_now + (GREATEST(30, COALESCE(p_extend_seconds, 120)) || ' seconds')::INTERVAL;
+
+  UPDATE stock_reservations sr
+  SET expires_at = v_new_exp
+  WHERE sr.id = p_reservation_id
+    AND sr.session_id = p_session_id
+    AND sr.status = 'active'
+    AND sr.expires_at <= v_now
+    AND sr.expires_at >= v_now - INTERVAL '120 seconds';
+
+  IF FOUND THEN
+    RETURN QUERY SELECT true, 'Reservation extended.', v_new_exp;
+  ELSE
+    RETURN QUERY SELECT false, 'Reservation cannot be extended.', NULL::TIMESTAMPTZ;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cleanup_expired_stock_reservations()
+RETURNS INTEGER AS $$
+DECLARE
+  v_now TIMESTAMP WITH TIME ZONE := NOW();
+  v_count INTEGER;
+BEGIN
+  UPDATE stock_reservations sr
+  SET status = 'released', released_at = COALESCE(sr.released_at, v_now)
+  WHERE sr.status = 'active' AND sr.expires_at <= v_now;
+
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  RETURN COALESCE(v_count, 0);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION commit_checkout_reservations(
+  p_session_id TEXT,
+  p_order_id TEXT,
+  p_reservation_ids UUID[]
+)
+RETURNS TABLE(ok BOOLEAN, message TEXT, committed_count INTEGER) AS $$
+DECLARE
+  v_now TIMESTAMP WITH TIME ZONE := NOW();
+  v_res RECORD;
+  v_row JSONB;
+  v_ctid TID;
+  v_left INTEGER;
+  v_sold INTEGER;
+  v_next_left INTEGER;
+  v_next_sold INTEGER;
+  v_committed INTEGER := 0;
+  v_set_clause TEXT;
+BEGIN
+  IF COALESCE(TRIM(p_session_id), '') = '' THEN
+    RETURN QUERY SELECT false, 'Session id is required.', 0;
+    RETURN;
+  END IF;
+
+  IF p_reservation_ids IS NULL OR array_length(p_reservation_ids, 1) IS NULL THEN
+    RETURN QUERY SELECT false, 'No reservation ids provided.', 0;
+    RETURN;
+  END IF;
+
+  UPDATE stock_reservations sr
+  SET status = 'released', released_at = COALESCE(sr.released_at, v_now)
+  WHERE sr.status = 'active' AND sr.expires_at <= v_now;
+
+  FOR v_res IN
+    SELECT *
+    FROM stock_reservations sr
+    WHERE sr.id = ANY(p_reservation_ids)
+      AND sr.session_id = p_session_id
+      AND sr.status = 'active'
+      AND sr.expires_at > v_now
+    FOR UPDATE
+  LOOP
+    SELECT p.ctid, to_jsonb(p)
+    INTO v_ctid, v_row
+    FROM products p
+    WHERE COALESCE(NULLIF(to_jsonb(p)->>'Product_ID', ''), NULLIF(to_jsonb(p)->>'id', '')) = v_res.product_id
+    LIMIT 1
+    FOR UPDATE;
+
+    IF v_row IS NULL THEN
+      RETURN QUERY SELECT false, 'Reserved product not found during checkout.', v_committed;
+      RETURN;
+    END IF;
+
+    v_left := GREATEST(0, COALESCE(NULLIF(v_row->>'Items_LEFT_in_stock', '')::INTEGER, NULLIF(v_row->>'pieces', '')::INTEGER, NULLIF(v_row->>'Stock', '')::INTEGER, 0));
+    v_sold := GREATEST(0, COALESCE(NULLIF(v_row->>'Items_Sold', '')::INTEGER, NULLIF(v_row->>'sold', '')::INTEGER, 0));
+
+    IF v_left < v_res.quantity THEN
+      RETURN QUERY SELECT false, 'Some items in your cart have expired.', v_committed;
+      RETURN;
+    END IF;
+
+    v_next_left := GREATEST(0, v_left - v_res.quantity);
+    v_next_sold := GREATEST(0, v_sold + v_res.quantity);
+
+    v_set_clause := '';
+    IF v_row ? 'Items_LEFT_in_stock' THEN
+      v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || '"Items_LEFT_in_stock" = ' || v_next_left;
+    END IF;
+    IF v_row ? 'pieces' THEN
+      v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || 'pieces = ' || v_next_left;
+    END IF;
+    IF v_row ? 'Stock' THEN
+      v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || '"Stock" = ' || v_next_left;
+    END IF;
+    IF v_row ? 'Items_Sold' THEN
+      v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || '"Items_Sold" = ' || v_next_sold;
+    END IF;
+    IF v_row ? 'sold' THEN
+      v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || 'sold = ' || v_next_sold;
+    END IF;
+    IF v_row ? 'Status' THEN
+      v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || '"Status" = ' || quote_literal(CASE WHEN v_next_left = 0 THEN 'Temporarily unavailable' ELSE 'In Stock' END);
+    END IF;
+    IF v_row ? 'status' THEN
+      v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || 'status = ' || quote_literal(CASE WHEN v_next_left = 0 THEN 'Temporarily unavailable' ELSE 'In Stock' END);
+    END IF;
+
+    IF COALESCE(v_set_clause, '') = '' THEN
+      RETURN QUERY SELECT false, 'Product stock columns are missing.', v_committed;
+      RETURN;
+    END IF;
+
+    EXECUTE 'UPDATE products SET ' || v_set_clause || ' WHERE ctid = $1' USING v_ctid;
+
+    UPDATE stock_reservations
+    SET status = 'confirmed', confirmed_at = v_now, order_id = p_order_id
+    WHERE id = v_res.id;
+
+    v_committed := v_committed + 1;
+  END LOOP;
+
+  IF v_committed <> array_length(p_reservation_ids, 1) THEN
+    RETURN QUERY SELECT false, 'Some items in your cart have expired.', v_committed;
+    RETURN;
+  END IF;
+
+  RETURN QUERY SELECT true, 'Checkout stock committed.', v_committed;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Optional scheduler for reservation cleanup (every minute).
+-- This block is safe on projects where pg_cron is unavailable.
+DO $$
+BEGIN
+  CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+  PERFORM cron.unschedule(jobid)
+  FROM cron.job
+  WHERE jobname = 'cleanup-expired-stock-reservations';
+
+  PERFORM cron.schedule(
+    'cleanup-expired-stock-reservations',
+    '* * * * *',
+    'SELECT cleanup_expired_stock_reservations();'
+  );
+EXCEPTION
+  WHEN OTHERS THEN
+    RAISE NOTICE 'pg_cron setup skipped: %', SQLERRM;
+END;
+$$;
+

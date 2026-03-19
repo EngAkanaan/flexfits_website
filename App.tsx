@@ -4,11 +4,25 @@ import { ShoppingBag, User, Search, Filter, Trash2, Plus, LogOut, ChevronRight, 
 import { Category, Product, ProductGender, Order, CartItem, FinancialMetric, FinancialTotals, View } from './types';
 import { INITIAL_PRODUCTS, ADMIN_USER, ADMIN_PASS, LEBANON_LOCATIONS, SIZE_OPTIONS } from './constants';
 import { getProductRecommendation } from './services/gemini';
-import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals } from './services/database';
+import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals, reserveCartLine, releaseCartLineReservation, cleanupExpiredReservations, extendExpiredReservation } from './services/database';
 
 const BRAND_LOGO_SRC = '/flex-logo.JPG';
 const DELIVERY_FEE = 4;
 const GENDER_OPTIONS: ProductGender[] = ['Men', 'Women', 'Unisex'];
+const NUMERIC_SIZE_FILTER_OPTIONS = Array.from({ length: 16 }, (_, i) => String(35 + i));
+const CLOTHING_SIZE_FILTER_OPTIONS = ['S', 'M', 'L', 'XL'];
+const CART_STORAGE_KEY = 'flex_cart';
+
+function getInitialCartState(): CartItem[] {
+  try {
+    const saved = localStorage.getItem(CART_STORAGE_KEY);
+    if (!saved) return [];
+    const parsed = JSON.parse(saved);
+    return Array.isArray(parsed) ? (parsed as CartItem[]) : [];
+  } catch {
+    return [];
+  }
+}
 
 function viewFromPathname(pathname: string): View {
   const normalized = String(pathname || '/').toLowerCase();
@@ -35,6 +49,66 @@ function normalizeGender(value: unknown): ProductGender {
   return 'Unisex';
 }
 
+function parseRangeSize(value: string): { min: number; max: number } | null {
+  const match = String(value || '').trim().match(/^(\d{1,3})\s*-\s*(\d{1,3})$/);
+  if (!match) return null;
+  const min = Number(match[1]);
+  const max = Number(match[2]);
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
+  return { min: Math.min(min, max), max: Math.max(min, max) };
+}
+
+function extractBaseNumericSize(value: string): number | null {
+  const match = String(value || '').trim().match(/^(\d{1,3})/);
+  if (!match) return null;
+  const base = Number(match[1]);
+  return Number.isFinite(base) ? base : null;
+}
+
+function isClothingSizeToken(value: string): boolean {
+  const normalized = String(value || '').trim().toUpperCase();
+  return CLOTHING_SIZE_FILTER_OPTIONS.includes(normalized);
+}
+
+function productMatchesSelectedSizes(productSizes: string[], selectedSizes: string[]): boolean {
+  if (!selectedSizes.length) return true;
+
+  const normalizedProductSizes = (productSizes || []).map((s) => String(s || '').trim()).filter(Boolean);
+  if (!normalizedProductSizes.length) return false;
+
+  for (const selectedRaw of selectedSizes) {
+    const selected = String(selectedRaw || '').trim().toUpperCase();
+    if (!selected) continue;
+
+    if (isClothingSizeToken(selected)) {
+      const hasClothingMatch = normalizedProductSizes.some((sizeToken) => String(sizeToken).trim().toUpperCase() === selected);
+      if (hasClothingMatch) return true;
+      continue;
+    }
+
+    const selectedNumeric = Number(selected);
+    if (!Number.isFinite(selectedNumeric)) {
+      const exactStringMatch = normalizedProductSizes.some((sizeToken) => String(sizeToken).trim().toUpperCase() === selected);
+      if (exactStringMatch) return true;
+      continue;
+    }
+
+    for (const productSizeToken of normalizedProductSizes) {
+      const range = parseRangeSize(productSizeToken);
+      if (range && selectedNumeric >= range.min && selectedNumeric <= range.max) {
+        return true;
+      }
+
+      const baseSize = extractBaseNumericSize(productSizeToken);
+      if (baseSize !== null && baseSize === selectedNumeric) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 const FlexLogo = ({ className = "h-12" }: { className?: string }) => (
   <img
     src={BRAND_LOGO_SRC}
@@ -44,20 +118,24 @@ const FlexLogo = ({ className = "h-12" }: { className?: string }) => (
 );
 
 const App: React.FC = () => {
+  const currentYear = new Date().getFullYear();
   const [view, setView] = useState<View>('home');
   const [products, setProducts] = useState<Product[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
-  const [cart, setCart] = useState<CartItem[]>([]);
+  const [cart, setCart] = useState<CartItem[]>(() => getInitialCartState());
   const [isAdmin, setIsAdmin] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [filterCategory, setFilterCategory] = useState<Category | 'All'>('All');
   const [maxPrice, setMaxPrice] = useState<number>(200);
-  const [filterSize, setFilterSize] = useState<string>('All');
+  const [selectedSizeFilters, setSelectedSizeFilters] = useState<string[]>([]);
   const [filterBrand, setFilterBrand] = useState<string>('All');
   const [hideSoldOutItems, setHideSoldOutItems] = useState<boolean>(false);
   const [selectedGenders, setSelectedGenders] = useState<ProductGender[]>([]);
+  const [isSizeFilterExpanded, setIsSizeFilterExpanded] = useState<boolean>(false);
+  const [isGenderFilterExpanded, setIsGenderFilterExpanded] = useState<boolean>(false);
   const [isMobileFilterOpen, setIsMobileFilterOpen] = useState<boolean>(false);
   const [quickAddProduct, setQuickAddProduct] = useState<Product | null>(null);
+  const [cartNotice, setCartNotice] = useState<string>('');
   const [imageViewerProduct, setImageViewerProduct] = useState<Product | null>(null);
   const [imageViewerScale, setImageViewerScale] = useState<number>(1);
   const [imageViewerTranslate, setImageViewerTranslate] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -110,6 +188,48 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    try {
+      localStorage.setItem(CART_STORAGE_KEY, JSON.stringify(cart));
+    } catch {
+      // Ignore storage issues to avoid interrupting cart flow.
+    }
+  }, [cart]);
+
+  useEffect(() => {
+    if (cartNotice.trim() === '') return;
+    const timeout = window.setTimeout(() => setCartNotice(''), 4800);
+    return () => window.clearTimeout(timeout);
+  }, [cartNotice]);
+
+  useEffect(() => {
+    if (products.length === 0 || cart.length === 0) return;
+
+    const productById = new Map(products.map((product) => [product.id, product]));
+    setCart((prev) => {
+      let changed = false;
+      const next = prev
+        .map((line) => {
+          const latest = productById.get(line.id);
+          if (!latest) {
+            changed = true;
+            return null;
+          }
+          return {
+            ...latest,
+            quantity: line.quantity,
+            selectedSize: line.selectedSize,
+            reservationId: line.reservationId,
+            reservedAt: line.reservedAt,
+            expiresAt: line.expiresAt,
+          } as CartItem;
+        })
+        .filter(Boolean) as CartItem[];
+
+      return changed ? next : prev;
+    });
+  }, [products]);
+
+  useEffect(() => {
     const syncFromUrl = () => {
       setView(viewFromPathname(window.location.pathname));
     };
@@ -145,6 +265,60 @@ const App: React.FC = () => {
       window.removeEventListener('keydown', onKeyDown);
     };
   }, [isMobileFilterOpen, quickAddProduct, imageViewerProduct]);
+
+  useEffect(() => {
+    if (cart.length === 0) return;
+
+    let isCancelled = false;
+
+    const removeExpiredLines = async () => {
+      const nowMs = Date.now();
+      const expired = cart.filter((item) => {
+        const exp = item.expiresAt ? new Date(item.expiresAt).getTime() : 0;
+        return exp > 0 && exp <= nowMs;
+      });
+
+      if (expired.length === 0) return;
+
+      const expiredKeys = new Set(expired.map((item) => `${item.id}::${item.selectedSize}::${item.reservationId || ''}`));
+
+      setCart((prev) => prev.filter((item) => !expiredKeys.has(`${item.id}::${item.selectedSize}::${item.reservationId || ''}`)));
+      setCartNotice(`${expired.length} item${expired.length > 1 ? 's were' : ' was'} removed due to timeout.`);
+
+      for (const item of expired) {
+        await releaseCartLineReservation(item.reservationId);
+      }
+      await cleanupExpiredReservations();
+
+      if (!isCancelled) {
+        const refreshedProducts = await getProducts();
+        setProducts(refreshedProducts);
+      }
+    };
+
+    void removeExpiredLines();
+
+    const nextExpiryMs = cart
+      .map((item) => (item.expiresAt ? new Date(item.expiresAt).getTime() : 0))
+      .filter((value) => value > 0)
+      .sort((a, b) => a - b)[0];
+
+    if (!nextExpiryMs) {
+      return () => {
+        isCancelled = true;
+      };
+    }
+
+    const timeoutMs = Math.max(200, nextExpiryMs - Date.now() + 40);
+    const timeout = window.setTimeout(() => {
+      void removeExpiredLines();
+    }, timeoutMs);
+
+    return () => {
+      isCancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [cart]);
   
   // Sync products to database when they change (for admin operations)
   const syncProductToDatabase = async (product: Product) => {
@@ -168,20 +342,14 @@ const App: React.FC = () => {
   };
 
   const filterOptions = useMemo(() => {
-    const sizes = new Set<string>();
     const brands = new Set<string>();
 
     for (const p of products) {
-      for (const s of p.sizes || []) {
-        const normalized = String(s).trim();
-        if (normalized) sizes.add(normalized);
-      }
       const brand = String(p.brandName || '').trim();
       if (brand) brands.add(brand);
     }
 
     return {
-      sizes: Array.from(sizes).sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })),
       brands: Array.from(brands).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })),
     };
   }, [products]);
@@ -197,7 +365,7 @@ const App: React.FC = () => {
       const isTshirtOrHoodie = /t-?shirt|hoodie/i.test(p.type);
       const matchesSearch = (p.productName || p.name).toLowerCase().includes(searchQuery.toLowerCase());
       const matchesPrice = p.price <= maxPrice;
-      const matchesSize = filterSize === 'All' || (p.sizes || []).some((s) => String(s).toUpperCase() === filterSize.toUpperCase());
+      const matchesSize = productMatchesSelectedSizes(p.sizes || [], selectedSizeFilters);
       const matchesBrand = filterBrand === 'All' || String(p.brandName || '').toLowerCase() === filterBrand.toLowerCase();
       const matchesGender = selectedGenders.length === 0 || selectedGenders.includes(productGender);
 
@@ -208,38 +376,80 @@ const App: React.FC = () => {
       const matchesCategory = filterCategory === 'All' || p.category === filterCategory;
       return matchesSearch && matchesCategory && matchesPrice && matchesSize && matchesBrand && matchesGender && !isTshirtOrHoodie && !(hideSoldOutItems && isSoldOut);
     });
-  }, [products, searchQuery, filterCategory, maxPrice, filterSize, filterBrand, selectedGenders, hideSoldOutItems]);
+  }, [products, searchQuery, filterCategory, maxPrice, selectedSizeFilters, filterBrand, selectedGenders, hideSoldOutItems]);
 
   const cartTotal = cart.reduce((acc, item) => acc + item.price * item.quantity, 0);
   const checkoutTotal = cart.length > 0 ? cartTotal + DELIVERY_FEE : 0;
 
-  const addToCart = (product: Product, size: string) => {
+  const addToCart = async (product: Product, size: string): Promise<boolean> => {
     const liveProduct = products.find(p => p.id === product.id);
     if (!liveProduct || liveProduct.pieces <= 0) {
       alert("This item is currently out of stock!");
-      return;
+      return false;
     }
 
-    const inCartQty = cart
-      .filter(item => item.id === product.id && item.selectedSize === size)
-      .reduce((acc, item) => acc + item.quantity, 0);
+    const existing = cart.find(i => i.id === product.id && i.selectedSize === size);
+    const nextQuantity = existing ? existing.quantity + 1 : 1;
 
-    if (inCartQty >= liveProduct.pieces) {
-      alert(`Sorry, you've added the maximum available stock for this item.`);
-      return;
-    }
-
-    setCart(prev => {
-      const existing = prev.find(i => i.id === product.id && i.selectedSize === size);
-      if (existing) return prev.map(i => i.id === product.id && i.selectedSize === size ? { ...i, quantity: i.quantity + 1 } : i);
-      return [...prev, { ...product, quantity: 1, selectedSize: size }];
+    let reservation = await reserveCartLine({
+      productId: product.id,
+      size,
+      quantity: nextQuantity,
+      existingReservationId: existing?.reservationId,
     });
+
+    if ((!reservation.ok || !reservation.reservationId) && existing?.reservationId) {
+      // If previous reservation id is stale, retry as fresh reservation for this line quantity.
+      reservation = await reserveCartLine({
+        productId: product.id,
+        size,
+        quantity: nextQuantity,
+      });
+    }
+
+    if (!reservation.ok || !reservation.reservationId || !reservation.expiresAt) {
+      alert(reservation.message || "Sorry, this item is currently reserved by another shopper.");
+      return false;
+    }
+
+    setCartNotice('');
+    setCart(prev => {
+      const existingIndex = prev.findIndex(i => i.id === product.id && i.selectedSize === size);
+      if (existingIndex >= 0) {
+        const updated = [...prev];
+        updated[existingIndex] = {
+          ...updated[existingIndex],
+          quantity: nextQuantity,
+          reservationId: reservation.reservationId,
+          reservedAt: new Date().toISOString(),
+          expiresAt: reservation.expiresAt,
+        };
+        return updated;
+      }
+      return [...prev, {
+        ...product,
+        quantity: 1,
+        selectedSize: size,
+        reservationId: reservation.reservationId,
+        reservedAt: new Date().toISOString(),
+        expiresAt: reservation.expiresAt,
+      }];
+    });
+
+    setProducts(prev => prev.map((p) => {
+      if (p.id !== product.id) return p;
+      if (reservation.availableAfter !== undefined) {
+        return { ...p, pieces: Math.max(0, Number(reservation.availableAfter || 0)) };
+      }
+      return { ...p, pieces: Math.max(0, Number(p.pieces || 0) - 1) };
+    }));
+    return true;
   };
 
   const handleCardAddToCart = (product: Product) => {
     const normalizedSizes = (product.sizes || []).map((s) => String(s).trim()).filter(Boolean);
     if (normalizedSizes.length <= 1) {
-      addToCart(product, normalizedSizes[0] || 'Default');
+      void addToCart(product, normalizedSizes[0] || 'Default');
       return;
     }
     setQuickAddProduct(product);
@@ -377,8 +587,25 @@ const App: React.FC = () => {
     gesture.pinchStartDistance = 0;
   };
 
-  const removeFromCart = (id: string, size: string) => {
+  const removeFromCart = async (id: string, size: string) => {
+    const line = cart.find((item) => item.id === id && item.selectedSize === size);
+    await releaseCartLineReservation(line?.reservationId);
     setCart(prev => prev.filter(i => !(i.id === id && i.selectedSize === size)));
+    const refreshedProducts = await getProducts();
+    setProducts(refreshedProducts);
+  };
+
+  const getRemainingMs = (item: CartItem, nowMs: number): number => {
+    const expMs = item.expiresAt ? new Date(item.expiresAt).getTime() : 0;
+    if (!expMs) return 0;
+    return Math.max(0, expMs - nowMs);
+  };
+
+  const formatRemaining = (ms: number): string => {
+    const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+    const min = Math.floor(totalSeconds / 60).toString().padStart(2, '0');
+    const sec = Math.floor(totalSeconds % 60).toString().padStart(2, '0');
+    return `${min}:${sec}`;
   };
 
   const toggleGenderFilter = (genderOption: ProductGender, isEnabled: boolean) => {
@@ -391,8 +618,24 @@ const App: React.FC = () => {
     });
   };
 
+  const toggleSizeFilter = (sizeOption: string, isEnabled: boolean) => {
+    const normalized = String(sizeOption || '').trim().toUpperCase();
+    if (!normalized) return;
+    setSelectedSizeFilters((prev) => {
+      if (isEnabled) {
+        if (prev.includes(normalized)) return prev;
+        return [...prev, normalized];
+      }
+      return prev.filter((entry) => entry !== normalized);
+    });
+  };
+
   const renderFilterControls = () => (
     <>
+      <div className="mb-4 p-3 bg-orange-50 border border-orange-100 rounded-xl">
+        <p className="text-[9px] font-black uppercase tracking-[0.18em] mb-1 text-orange-600 italic">Trusted Sneaker Supplier</p>
+        <p className="text-[10px] font-semibold leading-snug text-gray-700">Every product is guaranteed 100% original. Authentic or your money back.</p>
+      </div>
       <div className="mb-6">
         <h3 className="font-black text-[10px] uppercase tracking-[0.35em] mb-4 text-gray-300 italic">Categories</h3>
         <div className="space-y-2">
@@ -417,14 +660,57 @@ const App: React.FC = () => {
           </div>
         </div>
       </div>
+      <div className="pt-4 border-t-2 border-gray-50 space-y-2">
+        <button type="button" onClick={() => setIsSizeFilterExpanded((prev) => !prev)} className="w-full flex items-center justify-between">
+          <h3 className="font-black text-[10px] uppercase tracking-[0.35em] text-gray-300 italic">Size Filter</h3>
+          <span className="flex items-center gap-2">
+            {selectedSizeFilters.length > 0 && (
+              <span className="text-[8px] font-black uppercase px-1.5 py-0.5 rounded bg-orange-100 text-orange-700">
+                {selectedSizeFilters.length}
+              </span>
+            )}
+            <ChevronRight size={14} className={`text-gray-400 transition-transform ${isSizeFilterExpanded ? 'rotate-90' : ''}`} />
+          </span>
+        </button>
+        {isSizeFilterExpanded && (
+          <div className="p-2.5 border rounded-xl bg-white space-y-3">
+            <div>
+              <p className="text-[9px] font-black uppercase tracking-wider text-gray-400 mb-2">Numeric Sizes</p>
+              <div className="grid grid-cols-4 gap-1.5">
+                {NUMERIC_SIZE_FILTER_OPTIONS.map((sizeOption) => (
+                  <label key={sizeOption} className="flex items-center gap-1.5 text-[9px] font-black uppercase tracking-wider cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={selectedSizeFilters.includes(sizeOption)}
+                      onChange={(e) => toggleSizeFilter(sizeOption, e.target.checked)}
+                      className="h-3.5 w-3.5 accent-orange-600"
+                    />
+                    <span>{sizeOption}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="pt-2 border-t border-gray-100">
+              <p className="text-[9px] font-black uppercase tracking-wider text-gray-400 mb-2">Clothing Sizes</p>
+              <div className="grid grid-cols-4 gap-1.5">
+                {CLOTHING_SIZE_FILTER_OPTIONS.map((sizeOption) => (
+                  <label key={sizeOption} className="flex items-center gap-1.5 text-[9px] font-black uppercase tracking-wider cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={selectedSizeFilters.includes(sizeOption)}
+                      onChange={(e) => toggleSizeFilter(sizeOption, e.target.checked)}
+                      className="h-3.5 w-3.5 accent-orange-600"
+                    />
+                    <span>{sizeOption}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
       <div className="pt-4 border-t-2 border-gray-50 space-y-3">
-        <h3 className="font-black text-[10px] uppercase tracking-[0.35em] text-gray-300 italic">Brands & Sizes</h3>
-        <select value={filterSize} onChange={(e) => setFilterSize(e.target.value)} className="w-full p-2.5 border rounded-xl bg-white text-[9px] font-black uppercase focus:ring-2 focus:ring-orange-500 outline-none">
-          <option value="All">All Sizes</option>
-          {filterOptions.sizes.map((size) => (
-            <option key={size} value={size}>{size}</option>
-          ))}
-        </select>
+        <h3 className="font-black text-[10px] uppercase tracking-[0.35em] text-gray-300 italic">Brands</h3>
         <select value={filterBrand} onChange={(e) => setFilterBrand(e.target.value)} className="w-full p-2.5 border rounded-xl bg-white text-[9px] font-black uppercase focus:ring-2 focus:ring-orange-500 outline-none">
           <option value="All">All Brands</option>
           {filterOptions.brands.map((brand) => (
@@ -432,21 +718,33 @@ const App: React.FC = () => {
           ))}
         </select>
       </div>
-      <div className="pt-4 border-t-2 border-gray-50 space-y-2.5">
-        <h3 className="font-black text-[10px] uppercase tracking-[0.35em] text-gray-300 italic">Gender Filter</h3>
-        <div className="space-y-1.5 p-2.5 border rounded-xl bg-white">
-          {GENDER_OPTIONS.map((genderOption) => (
-            <label key={genderOption} className="flex items-center gap-2.5 text-[9px] font-black uppercase tracking-wider cursor-pointer">
-              <input
-                type="checkbox"
-                checked={selectedGenders.includes(genderOption)}
-                onChange={(e) => toggleGenderFilter(genderOption, e.target.checked)}
-                className="h-3.5 w-3.5 accent-orange-600"
-              />
-              <span>{genderOption}</span>
-            </label>
-          ))}
-        </div>
+      <div className="pt-4 border-t-2 border-gray-50 space-y-2">
+        <button type="button" onClick={() => setIsGenderFilterExpanded((prev) => !prev)} className="w-full flex items-center justify-between">
+          <h3 className="font-black text-[10px] uppercase tracking-[0.35em] text-gray-300 italic">Gender Filter</h3>
+          <span className="flex items-center gap-2">
+            {selectedGenders.length > 0 && (
+              <span className="text-[8px] font-black uppercase px-1.5 py-0.5 rounded bg-orange-100 text-orange-700">
+                {selectedGenders.length}
+              </span>
+            )}
+            <ChevronRight size={14} className={`text-gray-400 transition-transform ${isGenderFilterExpanded ? 'rotate-90' : ''}`} />
+          </span>
+        </button>
+        {isGenderFilterExpanded && (
+          <div className="space-y-1.5 p-2.5 border rounded-xl bg-white">
+            {GENDER_OPTIONS.map((genderOption) => (
+              <label key={genderOption} className="flex items-center gap-2.5 text-[9px] font-black uppercase tracking-wider cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={selectedGenders.includes(genderOption)}
+                  onChange={(e) => toggleGenderFilter(genderOption, e.target.checked)}
+                  className="h-3.5 w-3.5 accent-orange-600"
+                />
+                <span>{genderOption}</span>
+              </label>
+            ))}
+          </div>
+        )}
       </div>
       <div className="pt-4 border-t-2 border-gray-50">
         <label className="flex items-center gap-2.5 p-2.5 border rounded-xl bg-white text-[9px] font-black uppercase tracking-wider cursor-pointer">
@@ -458,11 +756,6 @@ const App: React.FC = () => {
           />
           <span>Hide Sold Out Items</span>
         </label>
-      </div>
-      <div className="mt-5 p-3 bg-black rounded-xl text-white shadow-2xl relative overflow-hidden">
-        <div className="absolute top-0 right-0 w-16 h-16 bg-orange-600/20 rounded-full -translate-y-8 translate-x-8 blur-2xl"></div>
-        <p className="text-[8px] font-black uppercase tracking-[0.18em] mb-1.5 text-orange-500 italic relative">Trusted Sneaker Supplier</p>
-        <p className="font-black text-[11px] italic leading-snug relative">Every product is guaranteed 100% original. Authentic or your money back.</p>
       </div>
     </>
   );
@@ -483,6 +776,7 @@ const App: React.FC = () => {
     const [financialMetrics, setFinancialMetrics] = useState<FinancialMetric[]>([]);
     const [financialTotals, setFinancialTotals] = useState<FinancialTotals | null>(null);
     const fileRef = useRef<HTMLInputElement>(null);
+    const isShoesCategory = formCategory === Category.SHOES;
 
     const cycleSort = (col: 'id' | 'productName' | 'category') => {
       setInventorySort(prev =>
@@ -958,14 +1252,38 @@ const App: React.FC = () => {
                 </div>
                 <div>
                   <label className="text-[10px] font-black uppercase text-gray-400 ml-1 block mb-2">Variant Selection ({formCategory})</label>
-                  <div className="grid grid-cols-4 gap-1 h-32 overflow-y-auto p-2 bg-gray-50 border rounded-2xl shadow-inner">
-                    {SIZE_OPTIONS[formCategory].map(size => (
-                      <label key={size} className={`flex items-center justify-center p-2 border rounded-xl text-[9px] cursor-pointer transition-all font-black select-none ${selectedSizes.includes(size) ? 'bg-orange-600 text-white border-orange-600' : 'bg-white border-gray-100 text-gray-500 hover:border-orange-500'}`}>
+                  <div className="mb-2 flex items-center justify-between">
+                    <p className="text-[10px] font-bold uppercase text-gray-500 tracking-wider">{SIZE_OPTIONS[formCategory].length} Checkboxes</p>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setSelectedSizes([...SIZE_OPTIONS[formCategory]])}
+                        className="px-2.5 py-1 text-[9px] font-black uppercase rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-100"
+                      >
+                        Select All
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedSizes([])}
+                        className="px-2.5 py-1 text-[9px] font-black uppercase rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-100"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  </div>
+                  <div className={`grid ${isShoesCategory ? 'grid-cols-4 md:grid-cols-6' : 'grid-cols-4'} gap-1.5 max-h-64 overflow-y-auto p-2 bg-gray-50 border rounded-2xl shadow-inner`}>
+                    {SIZE_OPTIONS[formCategory].map((size) => (
+                      <label key={size} className={`flex items-center justify-center p-2 border rounded-xl text-[9px] cursor-pointer transition-all font-black select-none min-h-9 ${selectedSizes.includes(size) ? 'bg-orange-600 text-white border-orange-600' : 'bg-white border-gray-100 text-gray-500 hover:border-orange-500'}`}>
                         <input type="checkbox" checked={selectedSizes.includes(size)} onChange={() => toggleSize(size)} className="hidden" />
                         {size}
                       </label>
                     ))}
                   </div>
+                  {isShoesCategory && (
+                    <p className="mt-2 text-[10px] text-gray-500 font-semibold">
+                      Shoe matrix includes 35 to 50 with variants: base, (1/3), (1/2), (2/3).
+                    </p>
+                  )}
                 </div>
                 <div>
                   <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Status</label>
@@ -1093,8 +1411,46 @@ const App: React.FC = () => {
     const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
       e.preventDefault();
       setIsProcessing(true);
+
+      const checkoutItems = [...cart];
+
+      if (checkoutItems.length === 0) {
+        setIsProcessing(false);
+        alert('Your cart is empty.');
+        return;
+      }
+
+      for (const item of checkoutItems) {
+        const expMs = item.expiresAt ? new Date(item.expiresAt).getTime() : 0;
+        if (expMs > Date.now()) continue;
+
+        if (!item.reservationId) {
+          setCart(prev => prev.filter((it) => !(it.id === item.id && it.selectedSize === item.selectedSize)));
+          setCartNotice('Some items in your cart have expired.');
+          alert('Some items in your cart have expired');
+          setIsProcessing(false);
+          return;
+        }
+
+        const extension = await extendExpiredReservation(item.reservationId, undefined, 120);
+        if (!extension.ok || !extension.expiresAt) {
+          await releaseCartLineReservation(item.reservationId);
+          setCart(prev => prev.filter((it) => !(it.id === item.id && it.selectedSize === item.selectedSize)));
+          setCartNotice('Some items in your cart have expired.');
+          alert('Some items in your cart have expired');
+          setIsProcessing(false);
+          return;
+        }
+
+        item.expiresAt = extension.expiresAt;
+      }
+
+      setCart((prev) => prev.map((item) => {
+        const refreshed = checkoutItems.find((line) => line.id === item.id && line.selectedSize === item.selectedSize);
+        return refreshed ? { ...item, expiresAt: refreshed.expiresAt } : item;
+      }));
       
-      for (const item of cart) {
+      for (const item of checkoutItems) {
         const prod = products.find(p => p.id === item.id);
         if (!prod || prod.pieces < item.quantity) {
           alert(`Notice: Availability for "${item.productName || item.name}" has updated. Current stock: ${prod?.pieces || 0}.`);
@@ -1113,7 +1469,7 @@ const App: React.FC = () => {
         district: dist,
         village: vill,
         addressDetails: fd.get('address') as string,
-        items: cart.map(i => ({ productId: i.id, productName: i.productName || i.name, quantity: i.quantity, size: i.selectedSize, price: i.price })),
+        items: checkoutItems.map(i => ({ productId: i.id, productName: i.productName || i.name, quantity: i.quantity, size: i.selectedSize, price: i.price, reservationId: i.reservationId })),
         total: checkoutTotal,
         status: 'pending',
         date: new Date().toISOString()
@@ -1137,7 +1493,8 @@ const App: React.FC = () => {
       } catch (error) {
         console.error('Error processing order:', error);
         setIsProcessing(false);
-        alert('Failed to process order. Please check your connection and try again.');
+        const message = error instanceof Error ? error.message : 'Failed to process order. Please check your connection and try again.';
+        alert(message);
       }
     };
 
@@ -1209,9 +1566,25 @@ const App: React.FC = () => {
     );
   };
 
-  const CartView = () => (
+  const CartView = () => {
+    const [nowMs, setNowMs] = useState<number>(Date.now());
+
+    useEffect(() => {
+      if (cart.length === 0) return;
+      const interval = window.setInterval(() => {
+        setNowMs(Date.now());
+      }, 1000);
+      return () => window.clearInterval(interval);
+    }, [cart.length]);
+
+    return (
     <div className="max-w-6xl mx-auto px-4 py-10 animate-fade-in-up">
       <h2 className="text-2xl font-black mb-8 uppercase italic tracking-tighter text-center md:text-left">Selected Gear</h2>
+      {cartNotice && (
+        <div className="mb-4 rounded-xl border border-orange-200 bg-orange-50 text-orange-700 px-4 py-3 text-xs font-black uppercase tracking-wider">
+          {cartNotice}
+        </div>
+      )}
       {cart.length === 0 ? (
         <div className="text-center py-20 bg-white rounded-3xl border-2 border-dashed border-gray-100 shadow-inner">
           <ShoppingBag size={60} className="text-gray-100 mx-auto mb-6" />
@@ -1235,13 +1608,16 @@ const App: React.FC = () => {
                          <span className="text-[10px] font-black uppercase text-gray-400 tracking-widest px-3 py-1 bg-gray-50 rounded-full border border-gray-100">{it.category}</span>
                        </div>
                      </div>
-                     <button onClick={() => removeFromCart(it.id, it.selectedSize)} className="p-3 bg-gray-50 text-gray-200 hover:text-red-500 hover:bg-red-50 rounded-2xl transition-all">
+                    <button onClick={() => void removeFromCart(it.id, it.selectedSize)} className="p-3 bg-gray-50 text-gray-200 hover:text-red-500 hover:bg-red-50 rounded-2xl transition-all">
                         <Trash2 size={24} />
                      </button>
                    </div>
                    <div className="flex flex-wrap items-center gap-4">
                       <span className="text-[10px] font-black bg-black text-white px-5 py-2 rounded-2xl uppercase tracking-widest italic border border-black shadow-lg">Size: {it.selectedSize}</span>
                       <span className="text-[10px] font-black bg-white text-gray-900 px-5 py-2 rounded-2xl uppercase tracking-widest italic border-2 border-gray-100">Qty: {it.quantity}</span>
+                     <span className={`text-[10px] font-black px-5 py-2 rounded-2xl uppercase tracking-widest italic border-2 ${getRemainingMs(it, nowMs) > 0 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-red-50 text-red-700 border-red-200'}`}>
+                      {getRemainingMs(it, nowMs) > 0 ? `${formatRemaining(getRemainingMs(it, nowMs))} remaining` : 'Expired'}
+                     </span>
                    </div>
                    <div className="flex justify-end pt-6 border-t border-gray-50 mt-8">
                      <span className="font-black text-4xl text-black italic tracking-tighter">${(it.price * it.quantity).toFixed(2)}</span>
@@ -1280,7 +1656,8 @@ const App: React.FC = () => {
         </div>
       )}
     </div>
-  );
+    );
+  };
 
   const Footer = () => (
     <footer className="bg-black text-white pt-12 pb-6 mt-16 border-t-2 border-orange-600 overflow-hidden">
@@ -1334,7 +1711,7 @@ const App: React.FC = () => {
           </div>
         </div>
         <div className="pt-8 border-t border-white/5 text-[9px] font-black text-gray-800 uppercase tracking-[0.4em] flex flex-col md:flex-row justify-between items-center gap-4">
-           <p>© 2024 FLEX FITS | PURELY ORIGINAL GEAR</p>
+            <p>© {currentYear} FLEX FITS | PURELY ORIGINAL GEAR</p>
            <div className="flex gap-6">
              <span className="flex items-center gap-2"><CheckCircle size={12} className="text-orange-900" /> AUTHENTIC ONLY</span>
              <span className="flex items-center gap-2"><CheckCircle size={12} className="text-orange-900" /> PREMIUM SELECTION</span>
@@ -1446,14 +1823,14 @@ const App: React.FC = () => {
                   Classification
                 </span>
                 <span className="text-[10px] font-black uppercase text-orange-600 tracking-widest">
-                  {selectedGenders.length + (filterBrand !== 'All' ? 1 : 0) + (filterSize !== 'All' ? 1 : 0) + (hideSoldOutItems ? 1 : 0)} Active
+                  {selectedGenders.length + (filterBrand !== 'All' ? 1 : 0) + selectedSizeFilters.length + (hideSoldOutItems ? 1 : 0)} Active
                 </span>
               </button>
             </div>
 
             <div className="flex flex-col md:flex-row gap-6 md:gap-6 lg:gap-8">
-              <div className="hidden md:block md:w-64 lg:w-72 xl:w-[290px] flex-shrink-0 xl:-ml-2">
-                <div className="bg-white p-5 rounded-3xl border-2 border-gray-50 shadow-2xl sticky top-20">
+              <div className="hidden md:block md:w-52 lg:w-56 xl:w-[230px] flex-shrink-0 xl:-ml-1">
+                <div className="bg-white p-4 rounded-2xl border-2 border-gray-50 shadow-xl sticky top-20">
                   {renderFilterControls()}
                 </div>
               </div>
@@ -1598,9 +1975,9 @@ const App: React.FC = () => {
                     {(quickAddProduct.sizes || []).map((sizeValue) => (
                       <button
                         key={sizeValue}
-                        onClick={() => {
-                          addToCart(quickAddProduct, sizeValue);
-                          setQuickAddProduct(null);
+                        onClick={async () => {
+                          const added = await addToCart(quickAddProduct, sizeValue);
+                          if (added) setQuickAddProduct(null);
                         }}
                         className="h-10 rounded-lg border-2 border-gray-100 text-[10px] font-black uppercase hover:bg-black hover:text-white hover:border-black transition-all"
                       >

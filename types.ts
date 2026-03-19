@@ -36,7 +36,7 @@ export interface Order {
   district: string;
   village: string;
   addressDetails: string;
-  items: { productId: string; productName: string; quantity: number; size: string; price: number }[];
+  items: { productId: string; productName: string; quantity: number; size: string; price: number; reservationId?: string }[];
   total: number;
   status: 'pending' | 'shipped' | 'delivered' | 'cancelled';
   date: string;
@@ -45,6 +45,21 @@ export interface Order {
 export interface CartItem extends Product {
   quantity: number;
   selectedSize: string;
+  reservationId?: string;
+  reservedAt?: string;
+  expiresAt?: string;
+}
+
+export interface StockReservation {
+  id: string;
+  productId: string;
+  size: string;
+  quantity: number;
+  sessionId: string;
+  status: 'active' | 'confirmed' | 'released';
+  reservedAt: string;
+  expiresAt: string;
+  orderId?: string | null;
 }
 
 export interface FinancialMetric {
