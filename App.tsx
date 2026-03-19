@@ -1449,15 +1449,6 @@ const App: React.FC = () => {
         const refreshed = checkoutItems.find((line) => line.id === item.id && line.selectedSize === item.selectedSize);
         return refreshed ? { ...item, expiresAt: refreshed.expiresAt } : item;
       }));
-      
-      for (const item of checkoutItems) {
-        const prod = products.find(p => p.id === item.id);
-        if (!prod || prod.pieces < item.quantity) {
-          alert(`Notice: Availability for "${item.productName || item.name}" has updated. Current stock: ${prod?.pieces || 0}.`);
-          setIsProcessing(false);
-          return;
-        }
-      }
 
       const fd = new FormData(e.currentTarget);
       const order: Order = {
