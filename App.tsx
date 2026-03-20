@@ -1333,11 +1333,13 @@ const App: React.FC = () => {
                     <p className="flex items-center gap-2 bg-gray-50 p-3 rounded-2xl border text-[10px] font-black uppercase text-gray-500 sm:col-span-3"><MapPin size={14} className="text-orange-600" /> {o.governorate}, {o.district}, {o.village} — {o.addressDetails}</p>
                   </div>
                   <div className="space-y-3">
-                    {o.items.map((it, idx) => (
+                    {o.items.map((it, idx) => {
+                      const orderItemImage = products.find((p) => p.id === it.productId)?.image || (it as any).image || BRAND_LOGO_SRC;
+                      return (
                       <div key={idx} className="flex justify-between items-center text-xs bg-gray-50 p-4 rounded-2xl border border-gray-100">
                         <div className="flex items-center gap-4">
                           <div className="w-10 h-10 rounded-xl border bg-white overflow-hidden flex items-center justify-center">
-                            <img src={BRAND_LOGO_SRC} alt="Flex Fits" className="w-full h-full object-contain p-1" />
+                            <img src={orderItemImage} alt={it.productName} className="w-full h-full object-contain p-1" />
                           </div>
                           <div>
                             <p className="font-black uppercase italic tracking-tighter text-black">{it.productName}</p>
@@ -1347,7 +1349,7 @@ const App: React.FC = () => {
                         </div>
                         <span className="text-orange-600 font-black italic text-base">x{it.quantity}</span>
                       </div>
-                    ))}
+                    )})}
                   </div>
                 </div>
                 <div className="flex flex-col items-end justify-between md:min-w-[180px] bg-black text-white p-4 rounded-2xl shadow-2xl">
@@ -1753,6 +1755,18 @@ const App: React.FC = () => {
                   </span>
                 )}
               </button>
+            </div>
+          </div>
+          <div className="md:hidden pb-3">
+            <div className="flex items-center bg-gray-100 rounded-full px-3 py-2">
+              <Search size={14} className="text-gray-400" />
+              <input
+                type="text"
+                placeholder="Search curated goods..."
+                className="bg-transparent border-none focus:ring-0 text-sm ml-2 w-full"
+                value={searchQuery}
+                onChange={(e) => { setSearchQuery(e.target.value); setView('shop'); }}
+              />
             </div>
           </div>
         </div>
