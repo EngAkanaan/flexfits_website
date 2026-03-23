@@ -6,10 +6,17 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
+coverage
 
 node_modules
 dist
 dist-ssr
+.cache
+tmp
+temp
+*.tmp
+*.temp
+*.bak
 *.local
 .env
 .env.*
@@ -25,3 +32,5 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+.vercel
