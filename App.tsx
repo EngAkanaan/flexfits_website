@@ -1230,6 +1230,13 @@ const App: React.FC = () => {
                   <div>
                     <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Type/Style</label>
                     <input name="type" defaultValue={editMode?.type} placeholder="Casual, Vintage..." className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" required />
+                    <label className="text-[10px] font-black uppercase text-gray-400 ml-1 mt-4 block">Color(s)</label>
+                    <input
+                      name="color"
+                      defaultValue={editMode?.color || ''}
+                      placeholder="e.g. gray, black, white"
+                      className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none mt-1"
+                    />
                   </div>
                 </div>
                 <div>

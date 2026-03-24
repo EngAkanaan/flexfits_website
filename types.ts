@@ -25,6 +25,7 @@ export interface Product {
   image: string;
   isAuthentic: boolean;
   status?: string;      // Product status (Active, Discontinued, etc.)
+  color?: string;       // Comma-separated colors (e.g., "gray, black, white")
 }
 
 export interface Order {
