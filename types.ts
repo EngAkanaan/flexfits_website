@@ -25,7 +25,10 @@ export interface Product {
   image: string;
   isAuthentic: boolean;
   status?: string;      // Product status (Active, Discontinued, etc.)
-  color?: string;       // Comma-separated colors (e.g., "gray, black, white")
+  /** Canonical list (lowercase tokens), synced with Supabase `colors` text[] */
+  colors?: string[];
+  /** Legacy comma-separated string; prefer `colors` */
+  color?: string;
 }
 
 export interface Order {

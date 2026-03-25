@@ -4,7 +4,7 @@ import { ShoppingBag, User, Search, Filter, Trash2, Plus, LogOut, ChevronRight, 
 import { Category, Product, ProductGender, Order, CartItem, FinancialMetric, FinancialTotals, View } from './types';
 import { INITIAL_PRODUCTS, ADMIN_USER, ADMIN_PASS, LEBANON_LOCATIONS, SIZE_OPTIONS } from './constants';
 import { getProductRecommendation } from './services/gemini';
-import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals, reserveCartLine, releaseCartLineReservation, cleanupExpiredReservations, extendExpiredReservation } from './services/database';
+import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals, reserveCartLine, releaseCartLineReservation, cleanupExpiredReservations, extendExpiredReservation, patchProductStockLevels, getProductColorTokens } from './services/database';
 
 const BRAND_LOGO_SRC = '/flex-logo.JPG';
 const DELIVERY_FEE = 4;
@@ -12,6 +12,142 @@ const GENDER_OPTIONS: ProductGender[] = ['Men', 'Women', 'Unisex'];
 const NUMERIC_SIZE_FILTER_OPTIONS = Array.from({ length: 16 }, (_, i) => String(35 + i));
 const CLOTHING_SIZE_FILTER_OPTIONS = ['S', 'M', 'L', 'XL'];
 const CART_STORAGE_KEY = 'flex_cart';
+
+function ColorTagInput({
+  value,
+  onChange,
+  suggestions,
+}: {
+  value: string[];
+  onChange: (next: string[]) => void;
+  suggestions: string[];
+}) {
+  const [draft, setDraft] = useState('');
+  const addToken = (raw: string) => {
+    const t = String(raw || '')
+      .trim()
+      .toLowerCase();
+    if (!t || value.includes(t)) {
+      setDraft('');
+      return;
+    }
+    onChange([...value, t]);
+    setDraft('');
+  };
+  const filteredSuggestions = suggestions.filter(
+    (s) =>
+      s.includes(draft.trim().toLowerCase()) &&
+      !value.includes(s) &&
+      s.trim()
+  ).slice(0, 12);
+
+  return (
+    <div className="space-y-2 mt-1">
+      <div className="flex flex-wrap gap-1.5 min-h-[36px] p-2 bg-gray-50 border rounded-2xl">
+        {value.map((c) => (
+          <span
+            key={c}
+            className="inline-flex items-center gap-1 pl-2 pr-1 py-0.5 rounded-full bg-orange-100 text-orange-800 text-[11px] font-bold uppercase"
+          >
+            {c}
+            <button
+              type="button"
+              className="p-0.5 rounded-full hover:bg-orange-200 text-orange-900"
+              onClick={() => onChange(value.filter((x) => x !== c))}
+              aria-label={`Remove ${c}`}
+            >
+              <X size={12} />
+            </button>
+          </span>
+        ))}
+        <input
+          className="flex-1 min-w-[120px] bg-transparent border-none outline-none text-sm font-bold placeholder:text-gray-400"
+          placeholder="Type color, Enter to add"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              addToken(draft);
+            }
+          }}
+          list="flexfits-color-suggestions"
+        />
+      </div>
+      {filteredSuggestions.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {filteredSuggestions.map((s) => (
+            <button
+              key={s}
+              type="button"
+              onClick={() => addToken(s)}
+              className="text-[10px] font-black uppercase px-2 py-0.5 rounded-full border border-gray-200 text-gray-600 hover:border-orange-400 hover:text-orange-700"
+            >
+              + {s}
+            </button>
+          ))}
+        </div>
+      )}
+      <datalist id="flexfits-color-suggestions">
+        {suggestions.map((s) => (
+          <option key={s} value={s} />
+        ))}
+      </datalist>
+    </div>
+  );
+}
+
+function InventoryStockEditor({
+  productId,
+  displayPieces,
+  onSaved,
+}: {
+  productId: string;
+  displayPieces: number;
+  onSaved: () => Promise<void> | void;
+}) {
+  const [val, setVal] = useState(String(displayPieces));
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setVal(String(displayPieces));
+  }, [productId, displayPieces]);
+
+  const save = async () => {
+    const n = Math.max(0, parseInt(val, 10) || 0);
+    setBusy(true);
+    try {
+      await patchProductStockLevels(productId, n);
+      await onSaved();
+    } catch (e) {
+      console.error(e);
+      alert('Failed to update stock. Check Supabase column Items_LEFT_in_stock and RLS.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-1 justify-end flex-wrap">
+      <input
+        type="number"
+        min={0}
+        disabled={busy}
+        className="w-16 px-1.5 py-1 border rounded text-right font-bold text-orange-600 text-[11px]"
+        value={val}
+        onChange={(e) => setVal(e.target.value)}
+      />
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => void save()}
+        className="text-[9px] font-black uppercase px-2 py-1 bg-gray-900 text-white rounded-md hover:bg-orange-600 disabled:opacity-50"
+      >
+        Set
+      </button>
+    </div>
+  );
+}
 
 function getInitialCartState(): CartItem[] {
   try {
@@ -119,7 +255,9 @@ const FlexLogo = ({ className = "h-12" }: { className?: string }) => (
 
 const App: React.FC = () => {
   const currentYear = new Date().getFullYear();
-  const [view, setView] = useState<View>('home');
+  const [view, setView] = useState<View>(() =>
+    typeof window !== 'undefined' ? viewFromPathname(window.location.pathname) : 'home'
+  );
   const [products, setProducts] = useState<Product[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
   const [cart, setCart] = useState<CartItem[]>(() => getInitialCartState());
@@ -129,6 +267,7 @@ const App: React.FC = () => {
   const [maxPrice, setMaxPrice] = useState<number>(200);
   const [selectedSizeFilters, setSelectedSizeFilters] = useState<string[]>([]);
   const [filterBrand, setFilterBrand] = useState<string>('All');
+  const [selectedColorFilters, setSelectedColorFilters] = useState<string[]>([]);
   const [hideSoldOutItems, setHideSoldOutItems] = useState<boolean>(false);
   const [selectedGenders, setSelectedGenders] = useState<ProductGender[]>([]);
   const [isSizeFilterExpanded, setIsSizeFilterExpanded] = useState<boolean>(false);
@@ -215,7 +354,7 @@ const App: React.FC = () => {
             return null;
           }
           return {
-            ...latest,
+            ...(latest as Product),
             quantity: line.quantity,
             selectedSize: line.selectedSize,
             reservationId: line.reservationId,
@@ -343,18 +482,24 @@ const App: React.FC = () => {
 
   const filterOptions = useMemo(() => {
     const brands = new Set<string>();
+    const colors = new Set<string>();
 
     for (const p of products) {
       const brand = String(p.brandName || '').trim();
       if (brand) brands.add(brand);
+      for (const c of getProductColorTokens(p)) {
+        colors.add(c);
+      }
     }
 
     return {
       brands: Array.from(brands).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })),
+      colors: Array.from(colors).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })),
     };
   }, [products]);
 
   const filteredProducts = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
     return products.filter(p => {
       const rawLeftStock = Number((p as any).Items_LEFT_in_stock ?? (p as any).items_left_in_stock ?? p.pieces);
       const leftStock = Number.isFinite(rawLeftStock) ? rawLeftStock : 0;
@@ -363,20 +508,27 @@ const App: React.FC = () => {
       const productGender = normalizeGender(p.gender);
 
       const isTshirtOrHoodie = /t-?shirt|hoodie/i.test(p.type);
-      const matchesSearch = (p.productName || p.name).toLowerCase().includes(searchQuery.toLowerCase());
+      const colorTokens = getProductColorTokens(p);
+      const matchesSearch =
+        !q ||
+        (p.productName || p.name).toLowerCase().includes(q) ||
+        colorTokens.some((c) => c.includes(q));
       const matchesPrice = p.price <= maxPrice;
       const matchesSize = productMatchesSelectedSizes(p.sizes || [], selectedSizeFilters);
       const matchesBrand = filterBrand === 'All' || String(p.brandName || '').toLowerCase() === filterBrand.toLowerCase();
       const matchesGender = selectedGenders.length === 0 || selectedGenders.includes(productGender);
+      const matchesColors =
+        selectedColorFilters.length === 0 ||
+        selectedColorFilters.some((c) => colorTokens.includes(c));
 
       if (filterCategory === ('ComingSoon' as any)) {
-        return matchesSearch && isTshirtOrHoodie && matchesPrice && matchesSize && matchesBrand && matchesGender && !(hideSoldOutItems && isSoldOut);
+        return matchesSearch && matchesColors && isTshirtOrHoodie && matchesPrice && matchesSize && matchesBrand && matchesGender && !(hideSoldOutItems && isSoldOut);
       }
 
       const matchesCategory = filterCategory === 'All' || p.category === filterCategory;
-      return matchesSearch && matchesCategory && matchesPrice && matchesSize && matchesBrand && matchesGender && !isTshirtOrHoodie && !(hideSoldOutItems && isSoldOut);
+      return matchesSearch && matchesColors && matchesCategory && matchesPrice && matchesSize && matchesBrand && matchesGender && !isTshirtOrHoodie && !(hideSoldOutItems && isSoldOut);
     });
-  }, [products, searchQuery, filterCategory, maxPrice, selectedSizeFilters, filterBrand, selectedGenders, hideSoldOutItems]);
+  }, [products, searchQuery, filterCategory, maxPrice, selectedSizeFilters, filterBrand, selectedGenders, selectedColorFilters, hideSoldOutItems]);
 
   const cartTotal = cart.reduce((acc, item) => acc + item.price * item.quantity, 0);
   const checkoutTotal = cart.length > 0 ? cartTotal + DELIVERY_FEE : 0;
@@ -630,6 +782,18 @@ const App: React.FC = () => {
     });
   };
 
+  const toggleColorFilter = (token: string, isEnabled: boolean) => {
+    const normalized = String(token || '').trim().toLowerCase();
+    if (!normalized) return;
+    setSelectedColorFilters((prev) => {
+      if (isEnabled) {
+        if (prev.includes(normalized)) return prev;
+        return [...prev, normalized];
+      }
+      return prev.filter((c) => c !== normalized);
+    });
+  };
+
   const renderFilterControls = () => (
     <>
       <div className="mb-4 p-3 bg-orange-50 border border-orange-100 rounded-xl">
@@ -719,6 +883,41 @@ const App: React.FC = () => {
         </select>
       </div>
       <div className="pt-4 border-t-2 border-gray-50 space-y-2">
+        <div className="flex items-center justify-between">
+          <h3 className="font-black text-[10px] uppercase tracking-[0.35em] text-gray-300 italic">Colors</h3>
+          {selectedColorFilters.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setSelectedColorFilters([])}
+              className="text-[9px] font-black uppercase text-orange-600 hover:underline"
+            >
+              Clear
+            </button>
+          )}
+        </div>
+        <p className="text-[9px] text-gray-400 font-semibold">Tap colors (from your catalog)</p>
+        <div className="flex flex-wrap gap-1.5 max-h-40 overflow-y-auto p-1">
+          {filterOptions.colors.length === 0 ? (
+            <span className="text-[9px] text-gray-400 italic">No colors yet — add products with colors in admin.</span>
+          ) : (
+            filterOptions.colors.map((c) => (
+              <button
+                key={c}
+                type="button"
+                onClick={() => toggleColorFilter(c, !selectedColorFilters.includes(c))}
+                className={`text-[9px] font-black uppercase px-2 py-1 rounded-full border transition-all ${
+                  selectedColorFilters.includes(c)
+                    ? 'bg-orange-600 text-white border-orange-600'
+                    : 'bg-white text-gray-600 border-gray-200 hover:border-orange-400'
+                }`}
+              >
+                {c}
+              </button>
+            ))
+          )}
+        </div>
+      </div>
+      <div className="pt-4 border-t-2 border-gray-50 space-y-2">
         <button type="button" onClick={() => setIsGenderFilterExpanded((prev) => !prev)} className="w-full flex items-center justify-between">
           <h3 className="font-black text-[10px] uppercase tracking-[0.35em] text-gray-300 italic">Gender Filter</h3>
           <span className="flex items-center gap-2">
@@ -771,6 +970,7 @@ const App: React.FC = () => {
     const [selectedSizes, setSelectedSizes] = useState<string[]>([]);
     const [brandName, setBrandName] = useState('');
     const [productName, setProductName] = useState('');
+    const [formColors, setFormColors] = useState<string[]>([]);
     const [inventorySection, setInventorySection] = useState<InventorySection>('All');
     const [inventorySort, setInventorySort] = useState<{ col: 'id' | 'productName' | 'category'; dir: 'asc' | 'desc' } | null>(null);
     const [financialMetrics, setFinancialMetrics] = useState<FinancialMetric[]>([]);
@@ -809,6 +1009,14 @@ const App: React.FC = () => {
       return `FF-${Math.min(9999, maxExisting + 1)}`;
     };
 
+    const adminColorSuggestions = useMemo(() => {
+      const s = new Set<string>();
+      for (const p of products) {
+        for (const c of getProductColorTokens(p)) s.add(c);
+      }
+      return Array.from(s).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+    }, [products]);
+
     useEffect(() => {
       if (editMode) {
         setFormCategory(editMode.category);
@@ -816,11 +1024,13 @@ const App: React.FC = () => {
         const parsed = splitDisplayName(editMode.name);
         setBrandName(editMode.brandName || parsed.brand);
         setProductName(editMode.productName || parsed.product);
+        setFormColors(getProductColorTokens(editMode));
         setActiveTab('add');
       } else {
         setSelectedSizes([]);
         setBrandName('');
         setProductName('');
+        setFormColors([]);
       }
     }, [editMode]);
 
@@ -907,6 +1117,10 @@ const App: React.FC = () => {
       const pieces = Number(fd.get('pieces'));
       const productId = editMode?.id || generateNextProductId();
       
+      const colorTokens: string[] = Array.from(
+        new Set(formColors.map((c) => String(c).trim().toLowerCase()).filter(Boolean))
+      );
+
       const newP: Product = {
         id: productId,
         name: `${normalizedBrand} - ${normalizedProduct}`,
@@ -924,7 +1138,9 @@ const App: React.FC = () => {
         description: fd.get('description') as string,
         image: uploadedImg || (fd.get('image') as string) || (editMode?.image || ''),
         isAuthentic: true,
-        status: (fd.get('status') as string) || 'Active'
+        status: (fd.get('status') as string) || 'Active',
+        colors: colorTokens,
+        color: colorTokens.length ? colorTokens.join(', ') : undefined,
       };
       
       try {
@@ -937,6 +1153,7 @@ const App: React.FC = () => {
         setBrandName('');
         setProductName('');
         setActiveTab('inventory');
+        setFormColors([]);
         formEl.reset();
       } catch (error: any) {
         console.error('Error saving product:', error);
@@ -1096,10 +1313,11 @@ const App: React.FC = () => {
                     <th className="p-3">Gender</th>
                     <th className="p-4">Type</th>
                     <th className="p-3">SIZE</th>
+                    <th className="p-3">Colors</th>
                     <th className="p-3">Cost</th>
                     <th className="p-3">Price</th>
                     <th className="p-3">Stock</th>
-                    <th className="p-3">Items_LEFT_in_stock</th>
+                    <th className="p-3">Items left (set)</th>
                     <th className="p-3">Items_Sold</th>
                     <th className="p-3">Status</th>
                     <th className="p-3">Pictures</th>
@@ -1111,6 +1329,7 @@ const App: React.FC = () => {
                   {inventoryProducts.map(p => {
                     const stockStatus = p.pieces <= 0 ? 'Out of Stock' : p.pieces < 10 ? 'Low Stock' : 'Healthy';
                     const normalizedStatus = (p.status === 'Temporary Not Available' || p.status === 'Temporarily unavailable') ? 'Out of Stock' : (p.status || stockStatus);
+                    const rowColors = getProductColorTokens(p);
                     return (
                       <tr key={p.id} className="hover:bg-gray-50 transition-colors">
                         <td className="p-3 font-bold text-gray-700">{p.id}</td>
@@ -1120,10 +1339,32 @@ const App: React.FC = () => {
                         <td className="p-3 text-gray-700">{normalizeGender(p.gender)}</td>
                         <td className="p-3 text-gray-700">{p.type}</td>
                         <td className="p-3 text-gray-700">{p.sizes.join(', ') || '-'}</td>
+                        <td className="p-3">
+                          <div className="flex flex-wrap gap-1 max-w-[140px]">
+                            {rowColors.length ? (
+                              rowColors.map((c) => (
+                                <span key={c} className="inline-block bg-orange-50 text-orange-800 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase">
+                                  {c}
+                                </span>
+                              ))
+                            ) : (
+                              <span className="text-gray-400 text-[10px]">—</span>
+                            )}
+                          </div>
+                        </td>
                         <td className="p-3 text-gray-700">${p.cost}</td>
                         <td className="p-3 font-bold text-gray-900">${p.price}</td>
                         <td className="p-3 text-gray-700">{p.initialStock}</td>
-                        <td className="p-3 font-bold text-orange-600">{p.pieces}</td>
+                        <td className="p-3 font-bold text-orange-600">
+                          <InventoryStockEditor
+                            productId={p.id}
+                            displayPieces={p.pieces}
+                            onSaved={async () => {
+                              const refreshedProducts = await getProducts();
+                              setProducts(refreshedProducts);
+                            }}
+                          />
+                        </td>
                         <td className="p-3 text-blue-600 font-bold">{p.sold}</td>
                         <td className="p-3">
                           <span className={`px-2 py-1 rounded text-[10px] font-bold uppercase ${normalizedStatus === 'Out of Stock' ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>
@@ -1163,7 +1404,7 @@ const App: React.FC = () => {
                   })}
                   {inventoryProducts.length === 0 && (
                     <tr>
-                      <td colSpan={16} className="p-6 text-center text-gray-500 font-semibold">
+                      <td colSpan={17} className="p-6 text-center text-gray-500 font-semibold">
                         {inventorySection === 'ComingSoon'
                           ? 'No T-shirt or Hoodie products found yet. Add items with type containing "tshirt", "t-shirt", or "hoodie".'
                           : 'No products in this section.'}
@@ -1230,12 +1471,11 @@ const App: React.FC = () => {
                   <div>
                     <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Type/Style</label>
                     <input name="type" defaultValue={editMode?.type} placeholder="Casual, Vintage..." className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" required />
-                    <label className="text-[10px] font-black uppercase text-gray-400 ml-1 mt-4 block">Color(s)</label>
-                    <input
-                      name="color"
-                      defaultValue={editMode?.color || ''}
-                      placeholder="e.g. gray, black, white"
-                      className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none mt-1"
+                    <label className="text-[10px] font-black uppercase text-gray-400 ml-1 mt-4 block">Colors (tags)</label>
+                    <ColorTagInput
+                      value={formColors}
+                      onChange={setFormColors}
+                      suggestions={adminColorSuggestions}
                     />
                   </div>
                 </div>
@@ -1835,7 +2075,7 @@ const App: React.FC = () => {
                   Classification
                 </span>
                 <span className="text-[10px] font-black uppercase text-orange-600 tracking-widest">
-                  {selectedGenders.length + (filterBrand !== 'All' ? 1 : 0) + selectedSizeFilters.length + (hideSoldOutItems ? 1 : 0)} Active
+                  {selectedGenders.length + (filterBrand !== 'All' ? 1 : 0) + selectedSizeFilters.length + selectedColorFilters.length + (hideSoldOutItems ? 1 : 0)} Active
                 </span>
               </button>
             </div>
@@ -1875,6 +2115,7 @@ const App: React.FC = () => {
               <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-4 lg:gap-4 xl:gap-5">
                 {filteredProducts.map(p => {
                   const isOutOfStock = p.pieces <= 0 || p.status === 'Temporary Not Available' || p.status === 'Temporarily unavailable' || p.status === 'Out of Stock';
+                  const cardColors = getProductColorTokens(p);
                   return (
                     <div key={p.id} className={`group bg-white p-3 sm:p-4 rounded-2xl border-2 border-gray-50 shadow-sm hover:shadow-3xl transition-all duration-700 flex flex-col h-full relative overflow-hidden min-w-0 ${isOutOfStock ? 'opacity-80' : ''}`}>
                        <div className="relative aspect-[4/5] rounded-xl overflow-hidden mb-4 bg-white border border-gray-100 flex-shrink-0">
@@ -1896,8 +2137,19 @@ const App: React.FC = () => {
                       </div>
                       <div className="px-2 pb-2 flex-grow flex flex-col">
                          <h4 className="font-black text-lg uppercase italic tracking-tighter group-hover:text-orange-600 transition-colors mb-1 text-black leading-none">{p.productName || p.name}</h4>
-                         <p className="text-[9px] text-gray-300 font-black uppercase tracking-[0.3em] mb-3 italic">{p.category}</p>
-                         
+                         <p className="text-[9px] text-gray-300 font-black uppercase tracking-[0.3em] mb-2 italic">{p.category}</p>
+                         {cardColors.length > 0 && (
+                           <div className="flex flex-wrap gap-1 mb-3">
+                             {cardColors.map((c) => (
+                               <span
+                                 key={c}
+                                 className="text-[8px] font-black uppercase px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 border border-gray-200"
+                               >
+                                 {c}
+                               </span>
+                             ))}
+                           </div>
+                         )}
                          {/* Description Section */}
                          {p.description && (
                            <div className="mb-3 bg-gray-50 p-3 rounded-xl border border-gray-100">

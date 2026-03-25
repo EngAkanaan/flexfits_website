@@ -789,6 +789,83 @@ function toNumberOrNull(value: any): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+/** Normalize colors from DB row (text[], legacy text, or comma-separated). */
+export function normalizeColorsFromRow(p: any): string[] {
+  const tokens: string[] = [];
+  const push = (s: string) => {
+    const t = String(s || '').trim().toLowerCase();
+    if (t) tokens.push(t);
+  };
+  const rawArr = p.colors ?? p.Colors;
+  if (Array.isArray(rawArr)) {
+    for (const c of rawArr) push(String(c));
+  }
+  const legacy = p.color ?? p.Color;
+  if (typeof legacy === 'string' && legacy.trim()) {
+    for (const part of legacy.split(',')) push(part);
+  }
+  return Array.from(new Set(tokens));
+}
+
+/** Tokens for filters / UI (works for Product from API or legacy `color` string). */
+export function getProductColorTokens(product: Product): string[] {
+  return normalizeColorsFromRow(product as any);
+}
+
+function mapProductRowToAppProduct(p: any): Product {
+  const colors = normalizeColorsFromRow(p);
+  return {
+    id: p.Product_ID || p.id,
+    brandName: p.Name_of_Brand || p.name_of_brand || '',
+    productName: p.Name_of_Product || p.Name_Product || p.name_of_product || p.Name_of_Item || p.name_of_item || '',
+    gender: inferGenderFromRow(p),
+    name: [
+      p.Name_of_Brand || p.name_of_brand || '',
+      p.Name_of_Product || p.Name_Product || p.name_of_product || p.Name_of_Item || p.name_of_item || ''
+    ].filter(Boolean).join(' - ') || p.name || '',
+    category: p.Category || p.category,
+    type: p.Type || p.type,
+    price: toNumberOrNull(p.Price ?? p.price) ?? 0,
+    cost: toNumberOrNull(p.Cost ?? p.cost) ?? 0,
+    initialStock: Math.max(0, toNumberOrNull(p.Stock ?? p.stock ?? p.initial_stock) ?? 0),
+    pieces: Math.max(0, toNumberOrNull(p.Items_LEFT_in_stock ?? p.items_left_in_stock ?? p.pieces) ?? toNumberOrNull(p.Stock ?? p.stock ?? p.initial_stock) ?? 0),
+    sold: Math.max(0, toNumberOrNull(p.Items_Sold ?? p.items_sold ?? p.sold) ?? 0),
+    sizes: (p.SIZE ? String(p.SIZE).split(',').map((s: string) => s.trim()).filter(Boolean) : []) || p.sizes || [],
+    description: p.Description || p.description || '',
+    image: normalizeProductImage(p.Pictures || p.pictures || p.picture || p.image),
+    isAuthentic: p.is_authentic ?? true,
+    status: p.Status || p.status,
+    colors,
+    color: colors.length ? colors.join(', ') : undefined,
+  };
+}
+
+async function subtractActiveReservationsFromProducts(products: Product[]): Promise<void> {
+  if (!supabase || products.length === 0) return;
+  try {
+    const { data: reservationRows } = await supabase
+      .from('stock_reservations')
+      .select('product_id,quantity')
+      .eq('status', 'active')
+      .gt('expires_at', new Date().toISOString());
+
+    const reservedByProduct = new Map<string, number>();
+    for (const row of reservationRows || []) {
+      const productId = String((row as any).product_id || '').trim();
+      const qty = Math.max(0, Number((row as any).quantity || 0));
+      if (!productId || qty <= 0) continue;
+      reservedByProduct.set(productId, (reservedByProduct.get(productId) || 0) + qty);
+    }
+
+    for (const product of products) {
+      const reserved = Math.max(0, reservedByProduct.get(String(product.id || '').trim()) || 0);
+      product.pieces = Math.max(0, Number(product.pieces || 0) - reserved);
+    }
+  } catch {
+    // Keep product list available even if reservation table is not migrated yet.
+  }
+}
+
 export async function getProducts(): Promise<Product[]> {
   if (!supabase) {
     // Fallback to localStorage if Supabase not configured
@@ -803,62 +880,9 @@ export async function getProducts(): Promise<Product[]> {
 
     if (error) throw error;
 
-    // Transform database format to app format
-    const transformed = (data || []).map((p: any) => ({
-      // Support both quoted-uppercase and lower/snake-case columns.
-      // pieces falls back to Stock to avoid false "Depleted" badges when left-stock is empty in imported CSV rows.
-      _piecesRaw: toNumberOrNull(p.Items_LEFT_in_stock ?? p.items_left_in_stock ?? p.pieces),
-      _stockRaw: toNumberOrNull(p.Stock ?? p.stock ?? p.initial_stock),
-      _soldRaw: toNumberOrNull(p.Items_Sold ?? p.items_sold ?? p.sold),
-      id: p.Product_ID || p.id,
-      brandName: p.Name_of_Brand || p.name_of_brand || '',
-      productName: p.Name_of_Product || p.Name_Product || p.name_of_product || p.Name_of_Item || p.name_of_item || '',
-      gender: inferGenderFromRow(p),
-      name: [
-        p.Name_of_Brand || p.name_of_brand || '',
-        p.Name_of_Product || p.Name_Product || p.name_of_product || p.Name_of_Item || p.name_of_item || ''
-      ].filter(Boolean).join(' - ') || p.name || '',
-      category: p.Category || p.category,
-      type: p.Type || p.type,
-      price: toNumberOrNull(p.Price ?? p.price) ?? 0,
-      cost: toNumberOrNull(p.Cost ?? p.cost) ?? 0,
-      initialStock: Math.max(0, toNumberOrNull(p.Stock ?? p.stock ?? p.initial_stock) ?? 0),
-      pieces: Math.max(0, toNumberOrNull(p.Items_LEFT_in_stock ?? p.items_left_in_stock ?? p.pieces) ?? toNumberOrNull(p.Stock ?? p.stock ?? p.initial_stock) ?? 0),
-      sold: Math.max(0, toNumberOrNull(p.Items_Sold ?? p.items_sold ?? p.sold) ?? 0),
-      sizes: (p.SIZE ? String(p.SIZE).split(',').map((s: string) => s.trim()).filter(Boolean) : []) || p.sizes || [],
-      description: p.Description || p.description || '',
-      image: normalizeProductImage(p.Pictures || p.pictures || p.picture || p.image),
-      isAuthentic: p.is_authentic ?? true,
-      status: p.Status || p.status,
-    })).map((product: any) => {
-      delete product._piecesRaw;
-      delete product._stockRaw;
-      delete product._soldRaw;
-      return product as Product;
-    });
+    const transformed = (data || []).map((p: any) => mapProductRowToAppProduct(p));
 
-    try {
-      const { data: reservationRows } = await supabase
-        .from('stock_reservations')
-        .select('product_id,quantity')
-        .eq('status', 'active')
-        .gt('expires_at', new Date().toISOString());
-
-      const reservedByProduct = new Map<string, number>();
-      for (const row of reservationRows || []) {
-        const productId = String((row as any).product_id || '').trim();
-        const qty = Math.max(0, Number((row as any).quantity || 0));
-        if (!productId || qty <= 0) continue;
-        reservedByProduct.set(productId, (reservedByProduct.get(productId) || 0) + qty);
-      }
-
-      for (const product of transformed) {
-        const reserved = Math.max(0, reservedByProduct.get(String(product.id || '').trim()) || 0);
-        product.pieces = Math.max(0, Number(product.pieces || 0) - reserved);
-      }
-    } catch {
-      // Keep product list available even if reservation table is not migrated yet.
-    }
+    await subtractActiveReservationsFromProducts(transformed);
 
     // Keep fallback cache aligned with database to avoid stale rollback on refresh.
     localStorage.setItem('flex_products', JSON.stringify(transformed));
@@ -887,6 +911,14 @@ export async function saveProduct(product: Product): Promise<void> {
   }
 
   try {
+    let colors: string[] = [];
+    if (Array.isArray(product.colors) && product.colors.length > 0) {
+      colors = Array.from(
+        new Set(product.colors.map((c: string) => String(c).trim().toLowerCase()).filter(Boolean))
+      );
+    } else if (typeof product.color === 'string' && product.color.trim()) {
+      colors = product.color.split(',').map((c: string) => c.trim().toLowerCase()).filter(Boolean);
+    }
     const basePayload: any = {
       Product_ID: product.id,
       Name_of_Brand: product.brandName || product.name,
@@ -902,8 +934,8 @@ export async function saveProduct(product: Product): Promise<void> {
       Status: product.status || 'Active',
       Pictures: product.image,
       Description: product.description,
+      colors,
     };
-
     const executeUpsert = async (payload: any) => {
       return supabase
         .from('products')
@@ -938,6 +970,74 @@ export async function saveProduct(product: Product): Promise<void> {
     console.error('Error saving product (full):', error);
     throw error;
   }
+}
+
+/** Products whose `colors` array overlaps any of the selected tokens (OR). Uses PostgREST `ov`. */
+export async function filterProductsByColors(selectedColors: string[]): Promise<Product[]> {
+  const normalized = Array.from(
+    new Set(selectedColors.map((c) => String(c).trim().toLowerCase()).filter(Boolean))
+  );
+  if (!supabase) {
+    const all = await getProducts();
+    return all.filter((p) => {
+      const list = normalizeColorsFromRow(p);
+      return normalized.length > 0 && normalized.some((c) => list.includes(c));
+    });
+  }
+  if (!normalized.length) return getProducts();
+
+  const { data, error } = await supabase
+    .from('products')
+    .select('*')
+    .overlaps('colors', normalized);
+
+  if (error) throw error;
+
+  const transformed = (data || []).map((p: any) => mapProductRowToAppProduct(p));
+  await subtractActiveReservationsFromProducts(transformed);
+  return transformed;
+}
+
+/**
+ * Admin: set sellable quantity shown to customers (`nextDisplayedPieces` matches `getProducts()` pieces
+ * after reservation subtraction). Persists `Items_LEFT_in_stock` = displayed + active reservation qty.
+ */
+export async function patchProductStockLevels(productId: string, nextDisplayedPieces: number): Promise<void> {
+  const clamped = Math.max(0, Math.floor(Number(nextDisplayedPieces)));
+  if (!supabase) {
+    const saved = localStorage.getItem('flex_products');
+    const products: Product[] = saved ? JSON.parse(saved) : [];
+    const i = products.findIndex((p) => p.id === productId);
+    if (i >= 0) {
+      products[i] = { ...products[i], pieces: clamped };
+      localStorage.setItem('flex_products', JSON.stringify(products));
+    }
+    return;
+  }
+
+  let reservedOthers = 0;
+  try {
+    const { data: reservationRows } = await supabase
+      .from('stock_reservations')
+      .select('quantity')
+      .eq('product_id', productId)
+      .eq('status', 'active')
+      .gt('expires_at', new Date().toISOString());
+    for (const row of reservationRows || []) {
+      reservedOthers += Math.max(0, Number((row as any).quantity || 0));
+    }
+  } catch {
+    reservedOthers = 0;
+  }
+
+  const dbLeft = clamped + reservedOthers;
+
+  const { error } = await supabase
+    .from('products')
+    .update({ Items_LEFT_in_stock: dbLeft })
+    .eq('Product_ID', productId);
+
+  if (error) throw error;
 }
 
 export async function deleteProduct(productId: string): Promise<void> {
