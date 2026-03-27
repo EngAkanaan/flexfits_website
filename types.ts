@@ -8,7 +8,7 @@ export enum Category {
 export type ProductGender = 'Men' | 'Women' | 'Unisex';
 
 export interface Product {
-  id: string;
+  Product_ID: string;
   name: string;
   brandName: string;
   productName: string;

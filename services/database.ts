@@ -603,7 +603,7 @@ export async function reserveCartLine(payload: {
 
     const savedProducts = localStorage.getItem('flex_products');
     const products = savedProducts ? JSON.parse(savedProducts) : [];
-    const product = (products || []).find((p: Product) => p.id === payload.productId);
+    const product = (products || []).find((p: Product) => p.Product_ID === payload.productId);
     const baseStock = Math.max(0, Number((product as any)?.pieces || 0));
     const currentExistingQty = existingIndex >= 0 ? Math.max(0, Number(reservations[existingIndex].quantity || 0)) : 0;
     const reservedOthers = Math.max(0, activeForProduct - currentExistingQty);
@@ -800,7 +800,7 @@ export function normalizeColorsFromRow(p: any): string[] {
   if (Array.isArray(rawArr)) {
     for (const c of rawArr) push(String(c));
   }
-  const legacy = p.color ?? p.Color;
+  const legacy = p.color ?? p.Color ?? p.Colour ?? p.colour;
   if (typeof legacy === 'string' && legacy.trim()) {
     for (const part of legacy.split(',')) push(part);
   }
@@ -815,7 +815,7 @@ export function getProductColorTokens(product: Product): string[] {
 function mapProductRowToAppProduct(p: any): Product {
   const colors = normalizeColorsFromRow(p);
   return {
-    id: p.Product_ID || p.id,
+    Product_ID: p.Product_ID,
     brandName: p.Name_of_Brand || p.name_of_brand || '',
     productName: p.Name_of_Product || p.Name_Product || p.name_of_product || p.Name_of_Item || p.name_of_item || '',
     gender: inferGenderFromRow(p),
@@ -858,7 +858,7 @@ async function subtractActiveReservationsFromProducts(products: Product[]): Prom
     }
 
     for (const product of products) {
-      const reserved = Math.max(0, reservedByProduct.get(String(product.id || '').trim()) || 0);
+      const reserved = Math.max(0, reservedByProduct.get(String(product.Product_ID || '').trim()) || 0);
       product.pieces = Math.max(0, Number(product.pieces || 0) - reserved);
     }
   } catch {
@@ -900,7 +900,7 @@ export async function saveProduct(product: Product): Promise<void> {
     // Fallback to localStorage
     const saved = localStorage.getItem('flex_products');
     const products = saved ? JSON.parse(saved) : [];
-    const existing = products.findIndex((p: Product) => p.id === product.id);
+    const existing = products.findIndex((p: Product) => p.Product_ID === product.Product_ID);
     if (existing >= 0) {
       products[existing] = product;
     } else {
@@ -911,6 +911,8 @@ export async function saveProduct(product: Product): Promise<void> {
   }
 
   try {
+    // Debug: Log the product payload before any DB operation
+    console.log('[saveProduct] Attempting to save product:', JSON.stringify(product, null, 2));
     let colors: string[] = [];
     if (Array.isArray(product.colors) && product.colors.length > 0) {
       colors = Array.from(
@@ -919,60 +921,390 @@ export async function saveProduct(product: Product): Promise<void> {
     } else if (typeof product.color === 'string' && product.color.trim()) {
       colors = product.color.split(',').map((c: string) => c.trim().toLowerCase()).filter(Boolean);
     }
-    const basePayload: any = {
-      Product_ID: product.id,
+    // Debug: Log normalized colors
+    console.log('[saveProduct] Normalized colors:', colors);
+
+    // Do not send `colors` in upsert: mixed case / cache issues can fail the whole row.
+    // Persist colors in a follow-up PATCH (tries array + legacy text column names).
+    const productId = String(product.Product_ID || '').trim();
+    if (!productId) {
+      console.error('[saveProduct] Product_ID is missing or empty. Aborting save.');
+      throw new Error('Product_ID is required to save a product.');
+    }
+
+    // Validate stock and items_sold
+    const stock = Math.floor(Number(product.initialStock));
+    const itemsSold = Math.floor(Number(product.sold));
+    if (
+      !Number.isInteger(stock) ||
+      !Number.isInteger(itemsSold) ||
+      stock < 0 ||
+      itemsSold < 0 ||
+      itemsSold > stock
+    ) {
+      throw new Error('Invalid stock values: stock and items_sold must be integers, >= 0, and items_sold <= stock.');
+    }
+
+    // ENFORCE SYSTEM INVARIANT (Backend calculation is source of truth)
+    const computedPieces = stock - itemsSold;
+    product.initialStock = stock;
+    product.sold = itemsSold;
+    product.pieces = computedPieces;
+
+    const basePayload: Record<string, unknown> = {
+      Product_ID: productId,
       Name_of_Brand: product.brandName || product.name,
       Name_of_Product: product.productName || product.name,
       Category: product.category,
       Type: product.type,
       Price: product.price,
       Cost: product.cost,
-      Stock: product.initialStock,
-      Items_LEFT_in_stock: product.pieces,
-      Items_Sold: product.sold,
+      Stock: stock,
+      Items_Sold: itemsSold,
       SIZE: product.sizes.join(','),
       Status: product.status || 'Active',
       Pictures: product.image,
       Description: product.description,
-      colors,
+      colors: colors,
     };
-    const executeUpsert = async (payload: any) => {
-      return supabase
-        .from('products')
-        .upsert(payload, {
-          onConflict: 'Product_ID'
-        });
+    // Debug: Log the basePayload that will be sent to Supabase
+    console.log('[saveProduct] basePayload for DB (colors included):', JSON.stringify(basePayload, null, 2));
+
+    const isMissingSchemaColumn = (
+      err: { message?: string; details?: string; hint?: string; code?: string } | null,
+      columnName: string
+    ) => {
+      if (!err) return false;
+      const raw = `${err.message || ''} ${err.details || ''} ${err.hint || ''}`;
+      const t = raw.toLowerCase();
+      const col = columnName.toLowerCase();
+      // Avoid matching `id` inside `product_id` / `Product_ID` (t.includes('id') is a false positive).
+      const colReferenced =
+        col === 'id'
+          ? /['"]id['"]/.test(raw) || /\bthe\s+['"]id['"]\s+column\b/i.test(raw) || /\bcolumn\s+['"]id['"]\s+of\b/i.test(raw)
+          : t.includes(col) || raw.toLowerCase().includes(`'${col}'`);
+      return (
+        colReferenced &&
+        (t.includes('column') || t.includes('schema cache') || err.code === 'PGRST204')
+      );
+    };
+
+    /** PostgREST 400: no UNIQUE constraint / wrong onConflict target (e.g. only PK is `id`). */
+    const isOnConflictTargetError = (err: { message?: string; details?: string; hint?: string } | null) => {
+      if (!err) return false;
+      const t = `${err.message || ''} ${err.details || ''} ${err.hint || ''}`.toLowerCase();
+      return (
+        t.includes('no unique') ||
+        t.includes('unique constraint') ||
+        t.includes('exclusion constraint matching') ||
+        t.includes('on conflict') ||
+        t.includes('42p10')
+      );
     };
 
     const requestedGender = normalizeGender(product.gender);
-    let { error } = await executeUpsert({ ...basePayload, Gender: requestedGender });
+    const db = supabase;
 
+    const omitUndefined = (row: Record<string, unknown>): Record<string, unknown> => {
+      const o: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(row)) {
+        if (v !== undefined) o[k] = v;
+      }
+      return o;
+    };
+
+    /**
+     * Second attempt when Pascal CSV keys fail: keep the same column names as `basePayload` (Category, Type, …).
+     * True snake_case keys like `category` break PostgREST when the table only has quoted `"Category"` (PGRST204).
+     * Only swap the business key to `product_id` for tables that use snake_case there.
+     */
+    const buildRowWithSnakeProductIdOnly = (): Record<string, unknown> => {
+      const row: Record<string, unknown> = { ...basePayload, Gender: requestedGender };
+      delete row.Product_ID;
+      row.product_id = productId;
+      return row;
+    };
+
+    const isUnknownJsonKeyError = (err: { message?: string; details?: string; code?: string } | null) => {
+      if (!err) return false;
+      const t = `${err.message || ''} ${err.details || ''}`.toLowerCase();
+      return (
+        err.code === 'PGRST204' ||
+        (t.includes('column') &&
+          (t.includes('schema cache') || t.includes('could not find') || t.includes('unknown')))
+      );
+    };
+
+    /** Insert or update by business product key without `upsert` / `on_conflict` (avoids PostgREST `id` / cache issues). */
+    const persistByProductId = async (row: Record<string, unknown>) => {
+      const cleanNoId: Record<string, unknown> = omitUndefined({ ...row });
+      delete cleanNoId.id;
+
+      const insertNeedsPkId = (err: { message?: string; details?: string; code?: string } | null) => {
+        if (!err) return false;
+        if (err.code === '23502') return true;
+        const t = `${err.message || ''} ${err.details || ''}`.toLowerCase();
+        return (
+          (t.includes('null value') && /['"]id['"]/.test(t) && (t.includes('not null') || t.includes('not-null'))) ||
+          (t.includes('violates not-null constraint') && /['"]id['"]/.test(t))
+        );
+      };
+
+      for (const key of ['Product_ID', 'product_id'] as const) {
+        const { data: existing, error: selErr } = await db
+          .from('products')
+          .select(key)
+          .eq(key, productId)
+          .maybeSingle();
+
+        if (selErr) {
+          if (key === 'Product_ID' && isMissingSchemaColumn(selErr, 'Product_ID')) continue;
+          if (key === 'product_id' && isMissingSchemaColumn(selErr, 'product_id')) continue;
+          return { error: selErr };
+        }
+
+        if (existing) {
+          return db.from('products').update(cleanNoId).eq(key, productId);
+        }
+
+        let ins = await db.from('products').insert(cleanNoId);
+        if (!ins.error) return ins;
+        if (ins.error.code === '23505') {
+          return db.from('products').update(cleanNoId).eq(key, productId);
+        }
+        if (insertNeedsPkId(ins.error)) {
+          const withPkId = { ...cleanNoId, id: productId };
+          ins = await db.from('products').insert(withPkId);
+          if (!ins.error) return ins;
+          if (ins.error.code === '23505') {
+            return db.from('products').update(withPkId).eq(key, productId);
+          }
+        }
+        if (key === 'Product_ID') continue;
+        return ins;
+      }
+
+      return {
+        error: {
+          message:
+            'Could not resolve products row by Product_ID or product_id (check column names and RLS SELECT).',
+          code: 'PGRST-flexfits',
+        } as any,
+      };
+    };
+
+    const upsertTry = async (payload: Record<string, unknown>, onConflict: string) =>
+      db.from('products').upsert(payload, { onConflict });
+
+    const withIdPk = { id: productId, ...basePayload };
+    let upsertPayload: Record<string, unknown> = { ...basePayload, Gender: requestedGender };
+    let { error } = await persistByProductId(upsertPayload);
     if (error) {
-      const errText = `${error.message || ''} ${error.details || ''} ${error.hint || ''}`.toLowerCase();
-      const hasMissingGenderColumn = errText.includes('gender') && (errText.includes('column') || errText.includes('schema cache') || error.code === 'PGRST204');
+      console.error('[saveProduct] persistByProductId error:', error);
+    } else {
+      console.log('[saveProduct] persistByProductId success');
+    }
 
-      if (hasMissingGenderColumn) {
-        const retry = await executeUpsert(basePayload);
-        error = retry.error;
+    if (error && isUnknownJsonKeyError(error)) {
+      upsertPayload = buildRowWithSnakeProductIdOnly();
+      ({ error } = await persistByProductId(upsertPayload));
+      if (error) {
+        console.error('[saveProduct] persistByProductId (snake_case) error:', error);
+      } else {
+        console.log('[saveProduct] persistByProductId (snake_case) success');
+      }
+    }
+
+    /** Multi-shape writes when Product_ID-only `select` paths failed or JSON keys mismatch. */
+    const persistByLegacyPk = async () => {
+      const name =
+        [product.brandName, product.productName].filter(Boolean).join(' - ') ||
+        product.name ||
+        '';
+      const rowLower: Record<string, unknown> = {
+        id: productId,
+        name,
+        gender: requestedGender,
+        category: product.category,
+        type: product.type,
+        price: product.price,
+        cost: product.cost,
+        initial_stock: product.initialStock,
+        pieces: product.pieces,
+        sold: product.sold,
+        sizes: Array.isArray(product.sizes) && product.sizes.length > 0 ? product.sizes : [],
+        description: product.description || '',
+        image: product.image || '',
+        is_authentic: product.isAuthentic ?? true,
+      };
+      const rowPascal: Record<string, unknown> = {
+        id: productId,
+        name,
+        Gender: requestedGender,
+        Category: product.category,
+        Type: product.type,
+        Price: product.price,
+        Cost: product.cost,
+        initial_stock: product.initialStock,
+        pieces: product.pieces,
+        sold: product.sold,
+        sizes: Array.isArray(product.sizes) && product.sizes.length > 0 ? product.sizes : [],
+        Description: product.description || '',
+        image: product.image || '',
+        is_authentic: product.isAuthentic ?? true,
+      };
+      const rowFullCsv: Record<string, unknown> = {
+        id: productId,
+        ...basePayload,
+        Gender: requestedGender,
+      };
+      const rowCsvNoId: Record<string, unknown> = { ...basePayload, Gender: requestedGender };
+
+      let eqKey: 'Product_ID' | 'product_id' | null = null;
+      for (const key of ['Product_ID', 'product_id'] as const) {
+        const { data: ex, error: selErr } = await db
+          .from('products')
+          .select(key)
+          .eq(key, productId)
+          .maybeSingle();
+        if (selErr) {
+          if (isMissingSchemaColumn(selErr, key)) continue;
+          return { error: selErr };
+        }
+        if (ex) {
+          eqKey = key;
+          break;
+        }
+      }
+
+      const tryWrite = async (r: Record<string, unknown>) => {
+        const body = omitUndefined({ ...r });
+        if (eqKey) {
+          return db.from('products').update(body).eq(eqKey, productId);
+        }
+        const ins = await db.from('products').insert(body);
+        if (ins.error?.code === '23505') {
+          for (const k of ['Product_ID', 'product_id'] as const) {
+            const u = await db.from('products').update(body).eq(k, productId);
+            if (!u.error) return u;
+            if (!isMissingSchemaColumn(u.error, k)) break;
+          }
+        }
+        return ins;
+      };
+
+      const variants = [rowFullCsv, rowPascal, rowLower, rowCsvNoId];
+      let out = await tryWrite(variants[0]);
+      for (let i = 1; i < variants.length; i++) {
+        if (!out.error || !isUnknownJsonKeyError(out.error)) break;
+        out = await tryWrite(variants[i]);
+      }
+      return out;
+    };
+
+    if (
+      error &&
+      (error.code === 'PGRST-flexfits' ||
+        String(error.message || '').includes('Could not resolve products row') ||
+        isUnknownJsonKeyError(error))
+    ) {
+      ({ error } = await persistByLegacyPk());
+      if (error) {
+        console.error('[saveProduct] persistByLegacyPk error:', error);
+      } else {
+        console.log('[saveProduct] persistByLegacyPk success');
+      }
+    }
+
+    const insertLikelyNeedsIdColumn = (err: typeof error) => {
+      // id column is not used in this schema anymore
+      return false;
+    };
+
+    const shouldTryIdKeyUpsert = (err: typeof error) =>
+      !!err &&
+      (isOnConflictTargetError(err) ||
+        isMissingSchemaColumn(err, 'Product_ID') ||
+        isMissingSchemaColumn(err, 'product_id'));
+
+    if (error && shouldTryIdKeyUpsert(error)) {
+      // Do not attempt upsert with 'id' as conflict target; this column does not exist.
+      // Only try with Product_ID or product_id as conflict targets if needed.
+      // If you reach here, the schema is not compatible.
+      console.error('[saveProduct] Schema is not compatible: products.id does not exist.');
+      throw new Error('Product upsert failed: products.id does not exist. Please ensure all code and schema use Product_ID as the key.');
+    }
+
+    if (error && isMissingSchemaColumn(error, 'gender')) {
+      upsertPayload = { ...basePayload };
+      ({ error } = await persistByProductId(upsertPayload));
+      if (error) {
+        console.error('[saveProduct] persistByProductId (no gender) error:', error);
+      } else {
+        console.log('[saveProduct] persistByProductId (no gender) success');
+      }
+    }
+
+    if (error && isMissingSchemaColumn(error, 'gender')) {
+      upsertPayload = { ...withIdPk };
+      ({ error } = await upsertTry(upsertPayload, 'id'));
+      if (error) {
+        console.error('[saveProduct] upsertTry (id) error:', error);
+      } else {
+        console.log('[saveProduct] upsertTry (id) success');
+      }
+      if (error && isMissingSchemaColumn(error, 'id')) {
+        upsertPayload = { ...basePayload };
+        ({ error } = await persistByProductId(upsertPayload));
+        if (error) {
+          console.error('[saveProduct] persistByProductId (after id) error:', error);
+        } else {
+          console.log('[saveProduct] persistByProductId (after id) success');
+        }
+      }
+    }
+
+    if (error && (isOnConflictTargetError(error) || isMissingSchemaColumn(error, 'id'))) {
+      upsertPayload = { ...basePayload, Gender: requestedGender };
+      ({ error } = await persistByProductId(upsertPayload));
+      if (error) {
+        console.error('[saveProduct] persistByProductId (onConflict/id) error:', error);
+      } else {
+        console.log('[saveProduct] persistByProductId (onConflict/id) success');
+      }
+    }
+
+    if (error && isMissingSchemaColumn(error, 'gender')) {
+      upsertPayload = { ...basePayload };
+      ({ error } = await persistByProductId(upsertPayload));
+      if (error) {
+        console.error('[saveProduct] persistByProductId (final no gender) error:', error);
+      } else {
+        console.log('[saveProduct] persistByProductId (final no gender) success');
       }
     }
 
     if (error) {
-      console.error('Supabase saveProduct error details:', {
-        message: error.message,
-        code: error.code,
-        details: error.details,
-        hint: error.hint,
-      });
-      throw error;
+      console.error('[saveProduct] FINAL ERROR:', error);
+      console.error('[saveProduct] FINAL PAYLOAD:', JSON.stringify(upsertPayload, null, 2));
+      console.error('[saveProduct] ORIGINAL PRODUCT:', JSON.stringify(product, null, 2));
+      const detail = [error.message, error.details, error.hint].filter(Boolean).join(' | ');
+      throw new Error(
+        detail ||
+          'Product upsert failed. Typical fixes: UNIQUE("Product_ID") or PK id + upsert; extend category CHECK for Underwear; reload PostgREST schema cache.'
+      );
     }
+
+    // Colors are now saved as part of the main payload above.
+    // No follow-up PATCH needed.
+    console.log('[saveProduct] Product saved successfully with colors:', colors);
   } catch (error) {
     console.error('Error saving product (full):', error);
     throw error;
   }
 }
 
-/** Products whose `colors` array overlaps any of the selected tokens (OR). Uses PostgREST `ov`. */
+/** Products whose `colors` array contains ALL of the selected tokens (AND). Uses PostgREST `cs`. */
 export async function filterProductsByColors(selectedColors: string[]): Promise<Product[]> {
   const normalized = Array.from(
     new Set(selectedColors.map((c) => String(c).trim().toLowerCase()).filter(Boolean))
@@ -981,7 +1313,7 @@ export async function filterProductsByColors(selectedColors: string[]): Promise<
     const all = await getProducts();
     return all.filter((p) => {
       const list = normalizeColorsFromRow(p);
-      return normalized.length > 0 && normalized.some((c) => list.includes(c));
+      return normalized.length > 0 && normalized.every((c) => list.includes(c));
     });
   }
   if (!normalized.length) return getProducts();
@@ -989,7 +1321,7 @@ export async function filterProductsByColors(selectedColors: string[]): Promise<
   const { data, error } = await supabase
     .from('products')
     .select('*')
-    .overlaps('colors', normalized);
+    .contains('colors', normalized);
 
   if (error) throw error;
 
@@ -1007,7 +1339,7 @@ export async function patchProductStockLevels(productId: string, nextDisplayedPi
   if (!supabase) {
     const saved = localStorage.getItem('flex_products');
     const products: Product[] = saved ? JSON.parse(saved) : [];
-    const i = products.findIndex((p) => p.id === productId);
+    const i = products.findIndex((p) => p.Product_ID === productId);
     if (i >= 0) {
       products[i] = { ...products[i], pieces: clamped };
       localStorage.setItem('flex_products', JSON.stringify(products));
@@ -1015,29 +1347,9 @@ export async function patchProductStockLevels(productId: string, nextDisplayedPi
     return;
   }
 
-  let reservedOthers = 0;
-  try {
-    const { data: reservationRows } = await supabase
-      .from('stock_reservations')
-      .select('quantity')
-      .eq('product_id', productId)
-      .eq('status', 'active')
-      .gt('expires_at', new Date().toISOString());
-    for (const row of reservationRows || []) {
-      reservedOthers += Math.max(0, Number((row as any).quantity || 0));
-    }
-  } catch {
-    reservedOthers = 0;
-  }
-
-  const dbLeft = clamped + reservedOthers;
-
-  const { error } = await supabase
-    .from('products')
-    .update({ Items_LEFT_in_stock: dbLeft })
-    .eq('Product_ID', productId);
-
-  if (error) throw error;
+  // This function is now deprecated: items_left_in_stock is generated, so only stock/items_sold should be updated by admin UI.
+  // Recommend removing this function from admin UI. If needed, update stock/items_sold directly via saveProduct.
+  throw new Error('patchProductStockLevels is deprecated. Use saveProduct with updated stock/items_sold.');
 }
 
 export async function deleteProduct(productId: string): Promise<void> {
@@ -1045,20 +1357,40 @@ export async function deleteProduct(productId: string): Promise<void> {
     // Fallback to localStorage
     const saved = localStorage.getItem('flex_products');
     const products = saved ? JSON.parse(saved) : [];
-    const filtered = products.filter((p: Product) => p.id !== productId);
+    const filtered = products.filter((p: Product) => p.Product_ID !== productId);
     localStorage.setItem('flex_products', JSON.stringify(filtered));
     return;
   }
 
   try {
-    const { error } = await supabase
-      .from('products')
-      .delete()
-      .eq('Product_ID', productId);
+    const keysToTry = ['Product_ID', 'id', 'product_id'];
+    let lastError: any = null;
 
-    if (error) throw error;
-  } catch (error) {
+    for (const key of keysToTry) {
+      const { error } = await supabase
+        .from('products')
+        .delete()
+        .eq(key, productId);
+        
+      if (!error) {
+        return; // Success
+      }
+      
+      // If error is not a "missing column" error, it's a real DB error (like Foreign Key constraint)
+      if (error.code !== 'PGRST204' && !String(error.message).includes(key)) {
+        throw error;
+      }
+      
+      lastError = error;
+    }
+
+    if (lastError) throw lastError;
+
+  } catch (error: any) {
     console.error('Error deleting product:', error);
+    if (error?.code === '23503') {
+      throw new Error('This product cannot be deleted because it is tied to existing orders. Please cancel or delete the related orders first, or just mark the product as "Discontinued".');
+    }
     throw error;
   }
 }
@@ -1071,7 +1403,7 @@ export async function updateProductStock(
     // Fallback to localStorage
     const saved = localStorage.getItem('flex_products');
     const products = saved ? JSON.parse(saved) : [];
-    const product = products.find((p: Product) => p.id === productId);
+    const product = products.find((p: Product) => p.Product_ID === productId);
     if (product) {
       product.pieces = Math.max(0, product.pieces - quantityChange);
       product.sold = (product.sold || 0) + quantityChange;
@@ -1081,10 +1413,10 @@ export async function updateProductStock(
   }
 
   try {
-    // First get current product
+    // Get current product
     const { data: product, error: fetchError } = await supabase
       .from('products')
-      .select('Items_LEFT_in_stock, Items_Sold')
+      .select('Stock, Items_Sold')
       .eq('Product_ID', productId)
       .single();
 
@@ -1092,18 +1424,21 @@ export async function updateProductStock(
       throw new Error(`Stock update failed: product ${productId} not found.`);
     }
 
-    const currentLeft = Math.max(0, Number((product as any).Items_LEFT_in_stock || 0));
-    const currentSold = Math.max(0, Number((product as any).Items_Sold || 0));
-    if (currentLeft < quantityChange) {
-      throw new Error(`Stock update failed: insufficient stock for ${productId}. Requested ${quantityChange}, available ${currentLeft}.`);
+    const stock = Math.floor(Number((product as any).Stock || 0));
+    const itemsSold = Math.floor(Number((product as any).Items_Sold || 0));
+    if (!Number.isInteger(stock) || !Number.isInteger(itemsSold) || stock < 0 || itemsSold < 0 || itemsSold > stock) {
+      throw new Error('Invalid stock values in DB.');
+    }
+
+    // Only allow incrementing items_sold (for a sale), or decrementing (for a return/cancel)
+    const newItemsSold = itemsSold + quantityChange;
+    if (newItemsSold < 0 || newItemsSold > stock) {
+      throw new Error('Stock update failed: items_sold would be out of bounds.');
     }
 
     const { error } = await supabase
       .from('products')
-      .update({
-        Items_LEFT_in_stock: currentLeft - quantityChange,
-        Items_Sold: currentSold + quantityChange,
-      })
+      .update({ Items_Sold: newItemsSold })
       .eq('Product_ID', productId);
 
     if (error) throw error;
@@ -1265,7 +1600,7 @@ export async function updateOrderStatus(
         const products = savedProducts ? JSON.parse(savedProducts) : [];
 
         for (const item of order.items || []) {
-          const p = products.find((product: Product) => product.id === item.productId);
+          const p = products.find((product: Product) => product.Product_ID === item.productId);
           if (!p) {
             throw new Error('Sorry, this item is currently out of stock.');
           }
@@ -1626,7 +1961,7 @@ export async function recalculateFinancialMetrics(): Promise<FinancialMetric[]> 
         price: it.price,
         order_id: o.id,
       }))),
-      products.map((p) => ({ Product_ID: p.id, Cost: p.cost }))
+      products.map((p) => ({ Product_ID: p.Product_ID, Cost: p.cost }))
     );
 
     localStorage.setItem('flex_financial_metrics', JSON.stringify(metrics));
@@ -1746,4 +2081,3 @@ export async function getFinancialDashboardTotals(): Promise<FinancialTotals | n
     return null;
   }
 }
-

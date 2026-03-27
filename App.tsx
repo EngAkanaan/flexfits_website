@@ -97,57 +97,8 @@ function ColorTagInput({
   );
 }
 
-function InventoryStockEditor({
-  productId,
-  displayPieces,
-  onSaved,
-}: {
-  productId: string;
-  displayPieces: number;
-  onSaved: () => Promise<void> | void;
-}) {
-  const [val, setVal] = useState(String(displayPieces));
-  const [busy, setBusy] = useState(false);
 
-  useEffect(() => {
-    setVal(String(displayPieces));
-  }, [productId, displayPieces]);
-
-  const save = async () => {
-    const n = Math.max(0, parseInt(val, 10) || 0);
-    setBusy(true);
-    try {
-      await patchProductStockLevels(productId, n);
-      await onSaved();
-    } catch (e) {
-      console.error(e);
-      alert('Failed to update stock. Check Supabase column Items_LEFT_in_stock and RLS.');
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <div className="flex items-center gap-1 justify-end flex-wrap">
-      <input
-        type="number"
-        min={0}
-        disabled={busy}
-        className="w-16 px-1.5 py-1 border rounded text-right font-bold text-orange-600 text-[11px]"
-        value={val}
-        onChange={(e) => setVal(e.target.value)}
-      />
-      <button
-        type="button"
-        disabled={busy}
-        onClick={() => void save()}
-        className="text-[9px] font-black uppercase px-2 py-1 bg-gray-900 text-white rounded-md hover:bg-orange-600 disabled:opacity-50"
-      >
-        Set
-      </button>
-    </div>
-  );
-}
+// --- No InventoryStockEditor: replaced by direct stock/items_sold editing in admin UI ---
 
 function getInitialCartState(): CartItem[] {
   try {
@@ -343,12 +294,12 @@ const App: React.FC = () => {
   useEffect(() => {
     if (products.length === 0 || cart.length === 0) return;
 
-    const productById = new Map(products.map((product) => [product.id, product]));
+    const productById = new Map(products.map((product) => [product.Product_ID, product]));
     setCart((prev) => {
       let changed = false;
       const next = prev
         .map((line) => {
-          const latest = productById.get(line.id);
+          const latest = productById.get(line.Product_ID);
           if (!latest) {
             changed = true;
             return null;
@@ -419,9 +370,9 @@ const App: React.FC = () => {
 
       if (expired.length === 0) return;
 
-      const expiredKeys = new Set(expired.map((item) => `${item.id}::${item.selectedSize}::${item.reservationId || ''}`));
+      const expiredKeys = new Set(expired.map((item) => `${item.Product_ID}::${item.selectedSize}::${item.reservationId || ''}`));
 
-      setCart((prev) => prev.filter((item) => !expiredKeys.has(`${item.id}::${item.selectedSize}::${item.reservationId || ''}`)));
+      setCart((prev) => prev.filter((item) => !expiredKeys.has(`${item.Product_ID}::${item.selectedSize}::${item.reservationId || ''}`)));
       setCartNotice(`${expired.length} item${expired.length > 1 ? 's were' : ' was'} removed due to timeout.`);
 
       for (const item of expired) {
@@ -534,17 +485,17 @@ const App: React.FC = () => {
   const checkoutTotal = cart.length > 0 ? cartTotal + DELIVERY_FEE : 0;
 
   const addToCart = async (product: Product, size: string): Promise<boolean> => {
-    const liveProduct = products.find(p => p.id === product.id);
+    const liveProduct = products.find(p => p.Product_ID === product.Product_ID);
     if (!liveProduct || liveProduct.pieces <= 0) {
       alert("This item is currently out of stock!");
       return false;
     }
 
-    const existing = cart.find(i => i.id === product.id && i.selectedSize === size);
+    const existing = cart.find(i => i.Product_ID === product.Product_ID && i.selectedSize === size);
     const nextQuantity = existing ? existing.quantity + 1 : 1;
 
     let reservation = await reserveCartLine({
-      productId: product.id,
+      productId: product.Product_ID,
       size,
       quantity: nextQuantity,
       existingReservationId: existing?.reservationId,
@@ -553,7 +504,7 @@ const App: React.FC = () => {
     if ((!reservation.ok || !reservation.reservationId) && existing?.reservationId) {
       // If previous reservation id is stale, retry as fresh reservation for this line quantity.
       reservation = await reserveCartLine({
-        productId: product.id,
+        productId: product.Product_ID,
         size,
         quantity: nextQuantity,
       });
@@ -566,7 +517,7 @@ const App: React.FC = () => {
 
     setCartNotice('');
     setCart(prev => {
-      const existingIndex = prev.findIndex(i => i.id === product.id && i.selectedSize === size);
+      const existingIndex = prev.findIndex(i => i.Product_ID === product.Product_ID && i.selectedSize === size);
       if (existingIndex >= 0) {
         const updated = [...prev];
         updated[existingIndex] = {
@@ -580,6 +531,7 @@ const App: React.FC = () => {
       }
       return [...prev, {
         ...product,
+        Product_ID: product.Product_ID,
         quantity: 1,
         selectedSize: size,
         reservationId: reservation.reservationId,
@@ -589,7 +541,7 @@ const App: React.FC = () => {
     });
 
     setProducts(prev => prev.map((p) => {
-      if (p.id !== product.id) return p;
+      if (p.Product_ID !== product.Product_ID) return p;
       if (reservation.availableAfter !== undefined) {
         return { ...p, pieces: Math.max(0, Number(reservation.availableAfter || 0)) };
       }
@@ -970,7 +922,9 @@ const App: React.FC = () => {
     const [selectedSizes, setSelectedSizes] = useState<string[]>([]);
     const [brandName, setBrandName] = useState('');
     const [productName, setProductName] = useState('');
-    const [formColors, setFormColors] = useState<string[]>([]);
+    const [formColors, setFormColors] = useState<string>('');
+    const [formStock, setFormStock] = useState<number | ''>('');
+    const [formSold, setFormSold] = useState<number | ''>('');
     const [inventorySection, setInventorySection] = useState<InventorySection>('All');
     const [inventorySort, setInventorySort] = useState<{ col: 'id' | 'productName' | 'category'; dir: 'asc' | 'desc' } | null>(null);
     const [financialMetrics, setFinancialMetrics] = useState<FinancialMetric[]>([]);
@@ -978,7 +932,7 @@ const App: React.FC = () => {
     const fileRef = useRef<HTMLInputElement>(null);
     const isShoesCategory = formCategory === Category.SHOES;
 
-    const cycleSort = (col: 'id' | 'productName' | 'category') => {
+    const cycleSort = (col: 'Product_ID' | 'productName' | 'category') => {
       setInventorySort(prev =>
         prev?.col !== col ? { col, dir: 'asc' }
         : prev.dir === 'asc' ? { col, dir: 'desc' }
@@ -1002,20 +956,14 @@ const App: React.FC = () => {
 
     const generateNextProductId = () => {
       const maxExisting = products.reduce((max, p) => {
-        const match = /^FF-(\d{3,4})$/i.exec(String(p.id || ''));
+        const match = /^FF-(\d{3,4})$/i.exec(String(p.Product_ID || ''));
         if (!match) return max;
         return Math.max(max, Number(match[1]));
       }, 100);
       return `FF-${Math.min(9999, maxExisting + 1)}`;
     };
 
-    const adminColorSuggestions = useMemo(() => {
-      const s = new Set<string>();
-      for (const p of products) {
-        for (const c of getProductColorTokens(p)) s.add(c);
-      }
-      return Array.from(s).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
-    }, [products]);
+    // adminColorSuggestions removed — colors now use a simple comma-separated text input.
 
     useEffect(() => {
       if (editMode) {
@@ -1024,13 +972,17 @@ const App: React.FC = () => {
         const parsed = splitDisplayName(editMode.name);
         setBrandName(editMode.brandName || parsed.brand);
         setProductName(editMode.productName || parsed.product);
-        setFormColors(getProductColorTokens(editMode));
+        setFormColors((Array.isArray(editMode.colors) && editMode.colors.length > 0 ? editMode.colors : getProductColorTokens(editMode)).join(', '));
+        setFormStock(editMode.initialStock ?? '');
+        setFormSold(editMode.sold ?? 0);
         setActiveTab('add');
       } else {
         setSelectedSizes([]);
         setBrandName('');
         setProductName('');
-        setFormColors([]);
+        setFormColors('');
+        setFormStock('');
+        setFormSold('');
       }
     }, [editMode]);
 
@@ -1064,8 +1016,8 @@ const App: React.FC = () => {
       if (inventorySort) {
         const { col, dir } = inventorySort;
         list = [...list].sort((a, b) => {
-          const va = col === 'id' ? a.id : col === 'productName' ? (a.productName || a.name) : a.category;
-          const vb = col === 'id' ? b.id : col === 'productName' ? (b.productName || b.name) : b.category;
+          const va = col === 'Product_ID' ? a.Product_ID : col === 'productName' ? (a.productName || a.name) : a.category;
+          const vb = col === 'Product_ID' ? b.Product_ID : col === 'productName' ? (b.productName || b.name) : b.category;
           const cmp = va.localeCompare(vb, undefined, { numeric: true, sensitivity: 'base' });
           return dir === 'asc' ? cmp : -cmp;
         });
@@ -1101,7 +1053,6 @@ const App: React.FC = () => {
 
     const saveProduct = async (e: React.FormEvent<HTMLFormElement>) => {
       e.preventDefault();
-      // Capture form element immediately — e.currentTarget becomes null after any await
       const formEl = e.currentTarget;
       if (selectedSizes.length === 0) {
         alert("Select at least one size for this product.");
@@ -1114,15 +1065,34 @@ const App: React.FC = () => {
         return;
       }
       const fd = new FormData(formEl);
-      const pieces = Number(fd.get('pieces'));
-      const productId = editMode?.id || generateNextProductId();
-      
-      const colorTokens: string[] = Array.from(
-        new Set(formColors.map((c) => String(c).trim().toLowerCase()).filter(Boolean))
-      );
+      // DEBUG: Log colors state and product ID before building payload
+      console.log('[saveProduct] formColors text:', formColors);
+      console.log('[saveProduct] editMode?.Product_ID:', editMode?.Product_ID);
 
+      const productId = editMode?.Product_ID || generateNextProductId();
+      console.log('[saveProduct] Resolved productId:', productId, '| isEdit:', !!editMode);
+
+      // Parse comma-separated text into a clean string[] for the DB text[] column
+      const colorTokens: string[] = Array.from(
+        new Set(
+          formColors
+            .split(',')
+            .map((c) => c.trim().toLowerCase())
+            .filter(Boolean)
+        )
+      );
+      console.log('[saveProduct] colorTokens to save:', colorTokens);
+
+      const stock = Number(fd.get('stock'));
+      const itemsSold = Number(fd.get('sold'));
+      const piecesLeft = stock - itemsSold;
+
+      if (!Number.isInteger(stock) || stock < 0 || !Number.isInteger(itemsSold) || itemsSold < 0 || itemsSold > stock) {
+        alert('Stock and items sold must be valid non-negative integers, and items sold cannot exceed stock.');
+        return;
+      }
       const newP: Product = {
-        id: productId,
+        Product_ID: productId,
         name: `${normalizedBrand} - ${normalizedProduct}`,
         brandName: normalizedBrand,
         productName: normalizedProduct,
@@ -1131,9 +1101,9 @@ const App: React.FC = () => {
         type: fd.get('type') as string,
         price: Number(fd.get('price')),
         cost: Number(fd.get('cost')),
-        initialStock: editMode ? editMode.initialStock : pieces,
-        pieces: pieces,
-        sold: editMode ? editMode.sold : 0,
+        initialStock: stock,
+        pieces: piecesLeft,
+        sold: itemsSold,
         sizes: selectedSizes,
         description: fd.get('description') as string,
         image: uploadedImg || (fd.get('image') as string) || (editMode?.image || ''),
@@ -1142,7 +1112,7 @@ const App: React.FC = () => {
         colors: colorTokens,
         color: colorTokens.length ? colorTokens.join(', ') : undefined,
       };
-      
+      console.log('[saveProduct] Final payload:', JSON.stringify(newP, null, 2));
       try {
         await syncProductToDatabase(newP);
         const refreshedProducts = await getProducts();
@@ -1153,7 +1123,9 @@ const App: React.FC = () => {
         setBrandName('');
         setProductName('');
         setActiveTab('inventory');
-        setFormColors([]);
+        setFormColors('');
+        setFormStock('');
+        setFormSold('');
         formEl.reset();
       } catch (error: any) {
         console.error('Error saving product:', error);
@@ -1292,9 +1264,9 @@ const App: React.FC = () => {
                 <thead className="bg-gray-100 uppercase font-black text-gray-500 border-b">
                   <tr>
                     <th className="p-3">
-                      <button onClick={() => cycleSort('id')} className="flex items-center gap-1 hover:text-gray-900 transition-colors">
+                      <button onClick={() => cycleSort('Product_ID')} className="flex items-center gap-1 hover:text-gray-900 transition-colors">
                         Product_ID
-                        <span className="text-[10px] leading-none">{inventorySort?.col === 'id' ? (inventorySort.dir === 'asc' ? '▲' : '▼') : '⇅'}</span>
+                        <span className="text-[10px] leading-none">{inventorySort?.col === 'Product_ID' ? (inventorySort.dir === 'asc' ? '▲' : '▼') : '⇅'}</span>
                       </button>
                     </th>
                     <th className="p-3">Name_of_Brand</th>
@@ -1331,8 +1303,8 @@ const App: React.FC = () => {
                     const normalizedStatus = (p.status === 'Temporary Not Available' || p.status === 'Temporarily unavailable') ? 'Out of Stock' : (p.status || stockStatus);
                     const rowColors = getProductColorTokens(p);
                     return (
-                      <tr key={p.id} className="hover:bg-gray-50 transition-colors">
-                        <td className="p-3 font-bold text-gray-700">{p.id}</td>
+                      <tr key={p.Product_ID} className="hover:bg-gray-50 transition-colors">
+                        <td className="p-3 font-bold text-gray-700">{p.Product_ID}</td>
                         <td className="p-3 font-semibold text-gray-900">{p.brandName || splitDisplayName(p.name).brand || '-'}</td>
                         <td className="p-3 font-semibold text-gray-900">{p.productName || splitDisplayName(p.name).product || '-'}</td>
                         <td className="p-3 text-gray-700">{p.category}</td>
@@ -1356,14 +1328,7 @@ const App: React.FC = () => {
                         <td className="p-3 font-bold text-gray-900">${p.price}</td>
                         <td className="p-3 text-gray-700">{p.initialStock}</td>
                         <td className="p-3 font-bold text-orange-600">
-                          <InventoryStockEditor
-                            productId={p.id}
-                            displayPieces={p.pieces}
-                            onSaved={async () => {
-                              const refreshedProducts = await getProducts();
-                              setProducts(refreshedProducts);
-                            }}
-                          />
+                          {p.pieces}
                         </td>
                         <td className="p-3 text-blue-600 font-bold">{p.sold}</td>
                         <td className="p-3">
@@ -1388,12 +1353,13 @@ const App: React.FC = () => {
                             <button onClick={async () => { 
                               if(confirm('Permanently erase this asset?')) {
                                 try {
-                                  await deleteProduct(p.id);
+                                  await deleteProduct(p.Product_ID);
                                   const refreshedProducts = await getProducts();
                                   setProducts(refreshedProducts);
-                                } catch (error) {
+                                } catch (error: any) {
                                   console.error('Error deleting product:', error);
-                                  alert('Failed to delete product. Please try again.');
+                                  const msg = error?.message || 'Failed to delete product. Please try again.';
+                                  alert(msg);
                                 }
                               }
                             }} className="p-2 hover:bg-red-50 text-gray-400 hover:text-red-600 rounded-lg transition-colors"><Trash2 size={14} /></button>
@@ -1427,7 +1393,7 @@ const App: React.FC = () => {
                 <div>
                   <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Product_ID</label>
                   <input
-                    value={editMode?.id || generateNextProductId()}
+                    value={editMode?.Product_ID || generateNextProductId()}
                     readOnly
                     className="w-full p-4 bg-gray-100 border rounded-2xl text-sm font-bold text-gray-600 outline-none"
                   />
@@ -1472,10 +1438,12 @@ const App: React.FC = () => {
                     <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Type/Style</label>
                     <input name="type" defaultValue={editMode?.type} placeholder="Casual, Vintage..." className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" required />
                     <label className="text-[10px] font-black uppercase text-gray-400 ml-1 mt-4 block">Colors (tags)</label>
-                    <ColorTagInput
+                    <input
+                      type="text"
                       value={formColors}
-                      onChange={setFormColors}
-                      suggestions={adminColorSuggestions}
+                      onChange={(e) => setFormColors(e.target.value)}
+                      placeholder="e.g. orange, black, white"
+                      className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold focus:ring-2 focus:ring-orange-500 outline-none"
                     />
                   </div>
                 </div>
@@ -1487,8 +1455,21 @@ const App: React.FC = () => {
                   </div>
                 </div>
                 <div>
-                  <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Current Stock (Items Left)</label>
-                  <input name="pieces" type="number" defaultValue={editMode?.pieces} placeholder="Total Pieces" className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" required />
+                  <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Stock & Sales Analytics</label>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-[10px] font-black uppercase text-gray-400 ml-1 mb-1 block">Total Initial Stock</label>
+                      <input name="stock" type="number" min="0" value={formStock} onChange={e => setFormStock(e.target.value !== '' ? Number(e.target.value) : '')} placeholder="Total Inventory Ever Added" className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" required />
+                    </div>
+                    <div>
+                      <label className="text-[10px] font-black uppercase text-gray-400 ml-1 mb-1 block">Items Sold</label>
+                      <input name="sold" type="number" min="0" value={formSold} onChange={e => setFormSold(e.target.value !== '' ? Number(e.target.value) : '')} placeholder="Total Items Sold" className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" required />
+                    </div>
+                  </div>
+                  <div className="mt-4 p-4 rounded-xl bg-orange-50 border border-orange-100 flex items-center justify-between">
+                    <span className="text-[10px] font-black uppercase tracking-wider text-orange-600/70">Calculated Final Inventory</span>
+                    <span className="text-xl font-black text-orange-600">{(Number(formStock) || 0) - (Number(formSold) || 0)} pieces left</span>
+                  </div>
                 </div>
               </div>
 
@@ -1581,7 +1562,7 @@ const App: React.FC = () => {
                   </div>
                   <div className="space-y-3">
                     {o.items.map((it, idx) => {
-                      const orderItemImage = products.find((p) => p.id === it.productId)?.image || (it as any).image || BRAND_LOGO_SRC;
+                      const orderItemImage = products.find((p) => p.Product_ID === it.productId)?.image || (it as any).image || BRAND_LOGO_SRC;
                       return (
                       <div key={idx} className="flex justify-between items-center text-xs bg-gray-50 p-4 rounded-2xl border border-gray-100">
                         <div className="flex items-center gap-4">

@@ -17,6 +17,7 @@ CREATE TABLE products (
   pieces INTEGER NOT NULL DEFAULT 0,
   sold INTEGER NOT NULL DEFAULT 0,
   sizes TEXT[] NOT NULL DEFAULT '{}',
+  colors TEXT[] NOT NULL DEFAULT '{}',
   description TEXT NOT NULL,
   image TEXT NOT NULL,
   is_authentic BOOLEAN NOT NULL DEFAULT true,
@@ -45,7 +46,7 @@ CREATE TABLE orders (
 CREATE TABLE order_items (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-  product_id TEXT NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+  product_id TEXT NOT NULL REFERENCES products("Product_ID") ON DELETE RESTRICT,
   product_name TEXT NOT NULL,
   quantity INTEGER NOT NULL,
   size TEXT NOT NULL,
