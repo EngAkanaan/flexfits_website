@@ -1545,20 +1545,44 @@ export async function saveOrder(order: Order): Promise<void> {
 
     // Insert order items
     if (order.items && order.items.length > 0) {
-      const { error: itemsError } = await supabase
-        .from('order_items')
-        .insert(
-          order.items.map((item) => ({
-            order_id: order.id,
-            product_id: item.productId,
-            product_name: item.productName,
-            quantity: item.quantity,
-            size: item.size,
-            price: item.price,
-          }))
-        );
+      const itemsToInsert = order.items.map((item) => {
+        // Validation: ensure non-null/undefined values for required columns
+        const productId = String(item.productId || '').trim();
+        if (!productId) {
+          throw new Error('Order item is missing a valid productId.');
+        }
 
-      if (itemsError) throw itemsError;
+        return {
+          order_id: order.id,
+          product_id: productId,
+          product_name: String(item.productName || item.productId || 'Unknown Item').trim(),
+          quantity: Math.max(1, Number(item.quantity) || 1),
+          size: String(item.size || 'N/A').trim(),
+          price: Number(item.price) || 0,
+          reservation_id: item.reservationId || null,
+        };
+      });
+
+      console.log('DEBUG: Attempting to insert order_items payload:', JSON.stringify(itemsToInsert, null, 2));
+
+      const { data: itemsData, error: itemsError } = await supabase
+        .from('order_items')
+        .insert(itemsToInsert)
+        .select();
+
+      if (itemsError) {
+        console.error('CRITICAL: Supabase order_items insertion failed.', {
+          error: itemsError,
+          payload: itemsToInsert,
+          details: itemsError.details,
+          hint: itemsError.hint,
+          message: itemsError.message,
+          code: itemsError.code
+        });
+        throw itemsError;
+      }
+      
+      console.log('SUCCESS: Order items inserted successfully:', itemsData);
     }
 
     const reservationIds = (order.items || [])
@@ -1577,7 +1601,16 @@ export async function saveOrder(order: Order): Promise<void> {
     await notifyAdminOrderCreated(order);
     await notifyCustomerOrderReceived(order);
   } catch (error) {
-    console.error('Error saving order:', error);
+    console.error('CRITICAL: Error saving order to database:', error);
+    if (error && typeof error === 'object') {
+      const e = error as any;
+      console.error('Error Details:', {
+        message: e.message,
+        details: e.details,
+        hint: e.hint,
+        code: e.code
+      });
+    }
     throw error;
   }
 }

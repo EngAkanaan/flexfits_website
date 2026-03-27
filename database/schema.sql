@@ -147,6 +147,10 @@ RETURNS TRIGGER AS $$
 DECLARE
   line_item RECORD;
   current_left INTEGER;
+  cur_stock INTEGER;
+  cur_sold INTEGER;
+  next_stock INTEGER;
+  next_sold INTEGER;
 BEGIN
   -- Only apply inventory mutation when an order is approved/dispatch-confirmed.
   IF LOWER(COALESCE(NEW.status, 'pending')) <> 'shipped' THEN
@@ -184,12 +188,22 @@ BEGIN
       RAISE EXCEPTION 'Sorry, this item is currently out of stock.';
     END IF;
 
+    -- IMPORTANT: Items_LEFT_in_stock is a generated column; never update it directly.
+    SELECT COALESCE("Stock", 0), COALESCE("Items_Sold", 0)
+    INTO cur_stock, cur_sold
+    FROM products
+    WHERE "Product_ID" = line_item.product_id
+    FOR UPDATE;
+
+    next_stock := GREATEST(0, cur_stock - line_item.total_quantity);
+    next_sold  := GREATEST(0, cur_sold + line_item.total_quantity);
+
     UPDATE products
     SET
-      "Items_Sold" = COALESCE("Items_Sold", 0) + line_item.total_quantity,
-      "Items_LEFT_in_stock" = GREATEST(0, COALESCE("Items_LEFT_in_stock", 0) - line_item.total_quantity),
+      "Stock" = next_stock,
+      "Items_Sold" = next_sold,
       "Status" = CASE
-        WHEN GREATEST(0, COALESCE("Items_LEFT_in_stock", 0) - line_item.total_quantity) = 0 THEN 'Temporarily unavailable'
+        WHEN next_stock - next_sold <= 0 THEN 'Temporarily unavailable'
         ELSE 'In Stock'
       END
     WHERE "Product_ID" = line_item.product_id
@@ -690,10 +704,9 @@ DECLARE
   v_res RECORD;
   v_row JSONB;
   v_ctid TID;
-  v_left INTEGER;
+  v_stock INTEGER;
   v_sold INTEGER;
-  v_next_left INTEGER;
-  v_next_sold INTEGER;
+  v_available INTEGER;
   v_committed INTEGER := 0;
   v_set_clause TEXT;
 BEGIN
@@ -732,38 +745,59 @@ BEGIN
       RETURN;
     END IF;
 
-    v_left := GREATEST(0, COALESCE(NULLIF(v_row->>'Items_LEFT_in_stock', '')::INTEGER, NULLIF(v_row->>'pieces', '')::INTEGER, NULLIF(v_row->>'Stock', '')::INTEGER, 0));
-    v_sold := GREATEST(0, COALESCE(NULLIF(v_row->>'Items_Sold', '')::INTEGER, NULLIF(v_row->>'sold', '')::INTEGER, 0));
-
-    IF v_left < v_res.quantity THEN
-      RETURN QUERY SELECT false, 'Some items in your cart have expired.', v_committed;
-      RETURN;
-    END IF;
-
-    v_next_left := GREATEST(0, v_left - v_res.quantity);
-    v_next_sold := GREATEST(0, v_sold + v_res.quantity);
-
     v_set_clause := '';
-    IF v_row ? 'Items_LEFT_in_stock' THEN
-      v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || '"Items_LEFT_in_stock" = ' || v_next_left;
+    -- Prefer base columns Stock / Items_Sold (works with generated Items_LEFT_in_stock = Stock - Items_Sold).
+    IF (v_row ? 'Stock') OR (v_row ? 'Items_Sold') THEN
+      v_stock := GREATEST(0, COALESCE(NULLIF(v_row->>'Stock', '')::INTEGER, 0));
+      v_sold  := GREATEST(0, COALESCE(NULLIF(v_row->>'Items_Sold', '')::INTEGER, 0));
+      v_available := GREATEST(0, v_stock - v_sold);
+
+      IF v_available < v_res.quantity THEN
+        RETURN QUERY SELECT false, 'Not enough stock.', v_committed;
+        RETURN;
+      END IF;
+
+      IF v_row ? 'Stock' THEN
+        v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || '"Stock" = ' || (v_stock - v_res.quantity);
+      END IF;
+      IF v_row ? 'Items_Sold' THEN
+        v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || '"Items_Sold" = ' || (v_sold + v_res.quantity);
+      END IF;
+    ELSE
+      -- Fallback for older schema that stores remaining stock in pieces and cumulative sold in sold.
+      v_stock := GREATEST(0, COALESCE(NULLIF(v_row->>'pieces', '')::INTEGER, 0));
+      v_sold  := GREATEST(0, COALESCE(NULLIF(v_row->>'sold', '')::INTEGER, 0));
+
+      IF v_stock < v_res.quantity THEN
+        RETURN QUERY SELECT false, 'Not enough stock.', v_committed;
+        RETURN;
+      END IF;
+
+      IF v_row ? 'pieces' THEN
+        v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || 'pieces = ' || (v_stock - v_res.quantity);
+      END IF;
+      IF v_row ? 'sold' THEN
+        v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || 'sold = ' || (v_sold + v_res.quantity);
+      END IF;
     END IF;
-    IF v_row ? 'pieces' THEN
-      v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || 'pieces = ' || v_next_left;
-    END IF;
-    IF v_row ? 'Stock' THEN
-      v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || '"Stock" = ' || v_next_left;
-    END IF;
-    IF v_row ? 'Items_Sold' THEN
-      v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || '"Items_Sold" = ' || v_next_sold;
-    END IF;
-    IF v_row ? 'sold' THEN
-      v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || 'sold = ' || v_next_sold;
-    END IF;
+
     IF v_row ? 'Status' THEN
-      v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || '"Status" = ' || quote_literal(CASE WHEN v_next_left = 0 THEN 'Temporarily unavailable' ELSE 'In Stock' END);
+      v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || '"Status" = ' || quote_literal(
+        CASE
+          WHEN ((v_row ? 'Stock') OR (v_row ? 'Items_Sold')) AND (v_available - v_res.quantity) <= 0 THEN 'Temporarily unavailable'
+          WHEN (NOT ((v_row ? 'Stock') OR (v_row ? 'Items_Sold'))) AND (v_stock - v_res.quantity) <= 0 THEN 'Temporarily unavailable'
+          ELSE 'In Stock'
+        END
+      );
     END IF;
     IF v_row ? 'status' THEN
-      v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || 'status = ' || quote_literal(CASE WHEN v_next_left = 0 THEN 'Temporarily unavailable' ELSE 'In Stock' END);
+      v_set_clause := v_set_clause || CASE WHEN v_set_clause = '' THEN '' ELSE ', ' END || 'status = ' || quote_literal(
+        CASE
+          WHEN ((v_row ? 'Stock') OR (v_row ? 'Items_Sold')) AND (v_available - v_res.quantity) <= 0 THEN 'Temporarily unavailable'
+          WHEN (NOT ((v_row ? 'Stock') OR (v_row ? 'Items_Sold'))) AND (v_stock - v_res.quantity) <= 0 THEN 'Temporarily unavailable'
+          ELSE 'In Stock'
+        END
+      );
     END IF;
 
     IF COALESCE(v_set_clause, '') = '' THEN

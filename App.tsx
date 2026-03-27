@@ -691,10 +691,10 @@ const App: React.FC = () => {
     gesture.pinchStartDistance = 0;
   };
 
-  const removeFromCart = async (id: string, size: string) => {
-    const line = cart.find((item) => item.id === id && item.selectedSize === size);
+  const removeFromCart = async (productId: string, size: string) => {
+    const line = cart.find((item) => item.Product_ID === productId && item.selectedSize === size);
     await releaseCartLineReservation(line?.reservationId);
-    setCart(prev => prev.filter(i => !(i.id === id && i.selectedSize === size)));
+    setCart(prev => prev.filter(i => !(i.Product_ID === productId && i.selectedSize === size)));
     const refreshedProducts = await getProducts();
     setProducts(refreshedProducts);
   };
@@ -1655,7 +1655,7 @@ const App: React.FC = () => {
         if (expMs > Date.now()) continue;
 
         if (!item.reservationId) {
-          setCart(prev => prev.filter((it) => !(it.id === item.id && it.selectedSize === item.selectedSize)));
+          setCart(prev => prev.filter((it) => !(it.Product_ID === item.Product_ID && it.selectedSize === item.selectedSize)));
           setCartNotice('Some items in your cart have expired.');
           alert('Some items in your cart have expired');
           setIsProcessing(false);
@@ -1665,7 +1665,7 @@ const App: React.FC = () => {
         const extension = await extendExpiredReservation(item.reservationId, undefined, 120);
         if (!extension.ok || !extension.expiresAt) {
           await releaseCartLineReservation(item.reservationId);
-          setCart(prev => prev.filter((it) => !(it.id === item.id && it.selectedSize === item.selectedSize)));
+          setCart(prev => prev.filter((it) => !(it.Product_ID === item.Product_ID && it.selectedSize === item.selectedSize)));
           setCartNotice('Some items in your cart have expired.');
           alert('Some items in your cart have expired');
           setIsProcessing(false);
@@ -1676,7 +1676,7 @@ const App: React.FC = () => {
       }
 
       setCart((prev) => prev.map((item) => {
-        const refreshed = checkoutItems.find((line) => line.id === item.id && line.selectedSize === item.selectedSize);
+        const refreshed = checkoutItems.find((line) => line.Product_ID === item.Product_ID && line.selectedSize === item.selectedSize);
         return refreshed ? { ...item, expiresAt: refreshed.expiresAt } : item;
       }));
 
@@ -1690,7 +1690,7 @@ const App: React.FC = () => {
         district: dist,
         village: vill,
         addressDetails: fd.get('address') as string,
-        items: checkoutItems.map(i => ({ productId: i.id, productName: i.productName || i.name, quantity: i.quantity, size: i.selectedSize, price: i.price, reservationId: i.reservationId })),
+        items: checkoutItems.map(i => ({ productId: i.Product_ID, productName: i.productName || i.name, quantity: i.quantity, size: i.selectedSize, price: i.price, reservationId: i.reservationId })),
         total: checkoutTotal,
         status: 'pending',
         date: new Date().toISOString()
@@ -1829,7 +1829,7 @@ const App: React.FC = () => {
                          <span className="text-[10px] font-black uppercase text-gray-400 tracking-widest px-3 py-1 bg-gray-50 rounded-full border border-gray-100">{it.category}</span>
                        </div>
                      </div>
-                    <button onClick={() => void removeFromCart(it.id, it.selectedSize)} className="p-3 bg-gray-50 text-gray-200 hover:text-red-500 hover:bg-red-50 rounded-2xl transition-all">
+                    <button onClick={() => void removeFromCart(it.Product_ID, it.selectedSize)} className="p-3 bg-gray-50 text-gray-200 hover:text-red-500 hover:bg-red-50 rounded-2xl transition-all">
                         <Trash2 size={24} />
                      </button>
                    </div>
@@ -2098,7 +2098,7 @@ const App: React.FC = () => {
                   const isOutOfStock = p.pieces <= 0 || p.status === 'Temporary Not Available' || p.status === 'Temporarily unavailable' || p.status === 'Out of Stock';
                   const cardColors = getProductColorTokens(p);
                   return (
-                    <div key={p.id} className={`group bg-white p-3 sm:p-4 rounded-2xl border-2 border-gray-50 shadow-sm hover:shadow-3xl transition-all duration-700 flex flex-col h-full relative overflow-hidden min-w-0 ${isOutOfStock ? 'opacity-80' : ''}`}>
+                    <div key={p.Product_ID} className={`group bg-white p-3 sm:p-4 rounded-2xl border-2 border-gray-50 shadow-sm hover:shadow-3xl transition-all duration-700 flex flex-col h-full relative overflow-hidden min-w-0 ${isOutOfStock ? 'opacity-80' : ''}`}>
                        <div className="relative aspect-[4/5] rounded-xl overflow-hidden mb-4 bg-white border border-gray-100 flex-shrink-0">
                          <button
                           onClick={() => openImageViewer(p)}
