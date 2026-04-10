@@ -7,6 +7,11 @@ export enum Category {
 
 export type ProductGender = 'Men' | 'Women' | 'Unisex';
 
+export interface ProductSizeStock {
+  size: string;
+  stock: number;
+}
+
 export interface Product {
   Product_ID: string;
   name: string;
@@ -21,10 +26,14 @@ export interface Product {
   pieces: number;       // Items Left
   sold: number;         // Items Sold
   sizes: string[];
+  sizeStock?: ProductSizeStock[];
   description: string;
   image: string;
+  images?: string[];
   isAuthentic: boolean;
   status?: string;      // Product status (Active, Discontinued, etc.)
+  originalPrice?: number;
+  onSale?: boolean;
   /** Canonical list (lowercase tokens), synced with Supabase `colors` text[] */
   colors?: string[];
   /** Legacy comma-separated string; prefer `colors` */
@@ -83,4 +92,4 @@ export interface FinancialTotals {
   calculatedAt: string;
 }
 
-export type View = 'home' | 'shop' | 'admin' | 'cart' | 'checkout';
+export type View = 'home' | 'shop' | 'product' | 'admin' | 'cart' | 'checkout';

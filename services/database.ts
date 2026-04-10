@@ -2,7 +2,7 @@
 // This will replace localStorage with real database calls
 
 import { supabase } from './supabase';
-import { Product, ProductGender, Order, FinancialMetric, FinancialTotals, StockReservation } from '../types';
+import { Product, ProductGender, ProductSizeStock, Order, FinancialMetric, FinancialTotals, StockReservation } from '../types';
 
 const ADMIN_NOTIFICATION_EMAIL = 'flexfitslebanon@gmail.com';
 const EMAIL_WEBHOOK_URL = String(import.meta.env.VITE_EMAIL_WEBHOOK_URL || '').trim();
@@ -12,6 +12,9 @@ const SITE_URL = String(
   (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000')
 ).trim();
 const DEFAULT_PRODUCT_IMAGE = '/flex-logo-bbg.JPG';
+const PRODUCT_IMAGE_BUCKET = String(import.meta.env.VITE_SUPABASE_PRODUCT_IMAGE_BUCKET || 'product-images').trim() || 'product-images';
+const MAX_UPLOAD_IMAGE_BYTES = 50 * 1024 * 1024;
+const ALLOWED_UPLOAD_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 const RESERVATION_TTL_SECONDS = 10 * 60;
 const RESERVATION_SESSION_STORAGE_KEY = 'flex_reservation_session_id';
 const LOCAL_RESERVATION_STORAGE_KEY = 'flex_stock_reservations_local';
@@ -143,10 +146,97 @@ function classifyWebhookResponse(bodyText: string): { success: boolean; detail: 
 }
 
 function normalizeProductImage(value: any): string {
+  const candidate = normalizeImageSourceToken(value);
+  return candidate || DEFAULT_PRODUCT_IMAGE;
+}
+
+function isValidDataImageUrl(value: string): boolean {
+  if (!/^data:image\//i.test(value)) return false;
+  return /^data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=]+$/i.test(value);
+}
+
+function isValidHttpImageUrl(value: string): boolean {
+  if (!/^https?:\/\//i.test(value)) return false;
+  try {
+    new URL(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isValidLocalImagePath(value: string): boolean {
+  // Keep local path support explicit to avoid treating random base64 fragments as relative URLs.
+  return /^\/[\w./%+-]+$/i.test(value);
+}
+
+function normalizeImageSourceToken(value: any): string | null {
   const candidate = String(value || '').trim();
-  if (!candidate) return DEFAULT_PRODUCT_IMAGE;
-  if (/^https?:\/\/via\.placeholder\.com\//i.test(candidate)) return DEFAULT_PRODUCT_IMAGE;
-  return candidate;
+  if (!candidate) return null;
+  if (/^https?:\/\/via\.placeholder\.com\//i.test(candidate)) return null;
+  if (isValidHttpImageUrl(candidate) || isValidLocalImagePath(candidate) || isValidDataImageUrl(candidate)) {
+    return candidate;
+  }
+  return null;
+}
+
+function sanitizeStorageFileName(name: string): string {
+  return String(name || 'image')
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 90) || 'image';
+}
+
+export async function uploadProductImagesToStorage(productId: string, files: File[]): Promise<string[]> {
+  const selected = (files || []).filter((file) => file && Number(file.size || 0) > 0);
+  if (!supabase || selected.length === 0) return [];
+
+  const uploadedUrls: string[] = [];
+  for (const file of selected) {
+    const normalizedType = String(file.type || '').toLowerCase();
+    if (!ALLOWED_UPLOAD_IMAGE_TYPES.has(normalizedType)) {
+      throw new Error(`Unsupported image type for ${file.name}. Allowed: JPG, PNG, WEBP, GIF.`);
+    }
+
+    if (Number(file.size || 0) > MAX_UPLOAD_IMAGE_BYTES) {
+      throw new Error(`Image ${file.name} exceeds 50MB upload limit.`);
+    }
+
+    const ext = String(file.name || '').split('.').pop() || 'jpg';
+    const cleanName = sanitizeStorageFileName(file.name || `upload-${Date.now()}.${ext}`);
+    const objectPath = `${String(productId || 'product').trim()}/${Date.now()}-${cleanName}`;
+    const { error } = await supabase.storage
+      .from(PRODUCT_IMAGE_BUCKET)
+      .upload(objectPath, file, {
+        upsert: false,
+        contentType: file.type || undefined,
+      });
+
+    if (error) {
+      const lowerMessage = String(error.message || '').toLowerCase();
+      if (lowerMessage.includes('bucket') && (lowerMessage.includes('not found') || lowerMessage.includes('does not exist'))) {
+        throw new Error(`Image upload failed: bucket \"${PRODUCT_IMAGE_BUCKET}\" does not exist. Run migration 008_storage_product_images_setup.sql.`);
+      }
+      if (lowerMessage.includes('new row violates row-level security policy') || lowerMessage.includes('row level security')) {
+        throw new Error(`Image upload failed due to storage policy restrictions for bucket \"${PRODUCT_IMAGE_BUCKET}\". Run migration 008_storage_product_images_setup.sql and ensure insert policy exists for current role.`);
+      }
+      if (lowerMessage.includes('row level security') || lowerMessage.includes('permission') || lowerMessage.includes('unauthorized')) {
+        throw new Error(`Image upload failed due to storage policy restrictions on bucket \"${PRODUCT_IMAGE_BUCKET}\".`);
+      }
+      throw new Error(`Image upload failed for ${file.name}: ${error.message}`);
+    }
+
+    const { data } = supabase.storage.from(PRODUCT_IMAGE_BUCKET).getPublicUrl(objectPath);
+    const publicUrl = String(data.publicUrl || '').trim();
+    if (!publicUrl) {
+      throw new Error(`Image upload succeeded but no public URL was returned for ${file.name}.`);
+    }
+    uploadedUrls.push(publicUrl);
+  }
+
+  return uploadedUrls;
 }
 
 function normalizeGender(value: any): ProductGender {
@@ -612,9 +702,10 @@ export async function reserveCartLine(payload: {
     }
 
     if (existingIndex >= 0) {
+      const nextQty = currentExistingQty + quantity;
       reservations[existingIndex] = {
         ...reservations[existingIndex],
-        quantity,
+        quantity: nextQty,
         size: payload.size,
         reservedAt: now.toISOString(),
         expiresAt: expires.toISOString(),
@@ -626,7 +717,7 @@ export async function reserveCartLine(payload: {
         message: 'Reserved successfully.',
         reservationId: reservations[existingIndex].id,
         expiresAt: reservations[existingIndex].expiresAt,
-        availableAfter: Math.max(0, baseStock - reservedOthers - quantity),
+        availableAfter: Math.max(0, baseStock - reservedOthers - nextQty),
       };
     }
 
@@ -812,8 +903,63 @@ export function getProductColorTokens(product: Product): string[] {
   return normalizeColorsFromRow(product as any);
 }
 
+function normalizeImageListFromRow(p: any): string[] {
+  const values: string[] = [];
+  const push = (value: any) => {
+    const token = normalizeImageSourceToken(value);
+    if (token) values.push(token);
+  };
+
+  const rawImages = p.images ?? p.Images ?? p.pictures ?? p.Pictures;
+  if (Array.isArray(rawImages)) {
+    for (const image of rawImages) push(image);
+  } else if (typeof rawImages === 'string' && rawImages.trim()) {
+    const raw = rawImages.trim();
+    if (/^data:image\//i.test(raw)) {
+      // A data URL contains a required comma; splitting would corrupt it.
+      push(raw);
+    } else {
+      for (const image of raw.split(',')) push(image);
+    }
+  }
+
+  if (values.length === 0) {
+    push(p.image ?? p.Image ?? p.picture ?? p.Picture);
+  }
+
+  return Array.from(new Set(values));
+}
+
+function normalizeSizeStockFromRow(p: any): ProductSizeStock[] {
+  const raw = p.size_stock ?? p.sizeStock ?? p.sizes_stock ?? p.Size_Stock;
+  const parsed: any[] = Array.isArray(raw)
+    ? raw
+    : typeof raw === 'string' && raw.trim()
+      ? (() => {
+          try {
+            const json = JSON.parse(raw);
+            return Array.isArray(json) ? json : [];
+          } catch {
+            return [];
+          }
+        })()
+      : [];
+
+  return parsed
+    .map((entry) => ({
+      size: String(entry?.size ?? entry?.Size ?? entry?.label ?? '').trim(),
+      stock: Math.max(0, Math.floor(Number(entry?.stock ?? entry?.Stock ?? 0))),
+    }))
+    .filter((entry) => entry.size);
+}
+
 function mapProductRowToAppProduct(p: any): Product {
   const colors = normalizeColorsFromRow(p);
+  const images = normalizeImageListFromRow(p);
+  const sizeStock = normalizeSizeStockFromRow(p);
+  const sizes = sizeStock.length > 0
+    ? sizeStock.map((entry) => entry.size)
+    : (p.SIZE ? String(p.SIZE).split(',').map((s: string) => s.trim()).filter(Boolean) : []) || p.sizes || [];
   return {
     Product_ID: p.Product_ID,
     brandName: p.Name_of_Brand || p.name_of_brand || '',
@@ -830,11 +976,15 @@ function mapProductRowToAppProduct(p: any): Product {
     initialStock: Math.max(0, toNumberOrNull(p.Stock ?? p.stock ?? p.initial_stock) ?? 0),
     pieces: Math.max(0, toNumberOrNull(p.Items_LEFT_in_stock ?? p.items_left_in_stock ?? p.pieces) ?? toNumberOrNull(p.Stock ?? p.stock ?? p.initial_stock) ?? 0),
     sold: Math.max(0, toNumberOrNull(p.Items_Sold ?? p.items_sold ?? p.sold) ?? 0),
-    sizes: (p.SIZE ? String(p.SIZE).split(',').map((s: string) => s.trim()).filter(Boolean) : []) || p.sizes || [],
+    sizes,
+    sizeStock,
     description: p.Description || p.description || '',
-    image: normalizeProductImage(p.Pictures || p.pictures || p.picture || p.image),
+    image: normalizeProductImage(images[0] || p.Pictures || p.pictures || p.picture || p.image),
+    images,
     isAuthentic: p.is_authentic ?? true,
     status: p.Status || p.status,
+    originalPrice: toNumberOrNull(p.original_price ?? p.Original_Price ?? p.originalPrice),
+    onSale: Boolean(p.on_sale ?? p.On_Sale ?? p.onSale),
     colors,
     color: colors.length ? colors.join(', ') : undefined,
   };
@@ -963,9 +1113,13 @@ export async function saveProduct(product: Product): Promise<void> {
       Items_Sold: itemsSold,
       SIZE: product.sizes.join(','),
       Status: product.status || 'Active',
-      Pictures: product.image,
+      Pictures: product.images?.[0] || product.image,
+      images: product.images && product.images.length > 0 ? product.images : [product.image].filter(Boolean),
       Description: product.description,
       colors: colors,
+      size_stock: Array.isArray(product.sizeStock) ? product.sizeStock : [],
+      original_price: product.originalPrice ?? null,
+      on_sale: Boolean(product.onSale),
     };
     // Debug: Log the basePayload that will be sent to Supabase
     console.log('[saveProduct] basePayload for DB (colors included):', JSON.stringify(basePayload, null, 2));
@@ -1448,6 +1602,53 @@ export async function updateProductStock(
   }
 }
 
+export async function updateProductSizeStock(productId: string, size: string, quantityChange: number): Promise<void> {
+  const normalizedSize = String(size || '').trim();
+  const delta = Math.floor(Number(quantityChange));
+  if (!normalizedSize || !Number.isFinite(delta) || delta === 0) return;
+
+  if (!supabase) {
+    const saved = localStorage.getItem('flex_products');
+    const products: Product[] = saved ? JSON.parse(saved) : [];
+    const product = products.find((item) => item.Product_ID === productId);
+    if (product) {
+      const nextSizeStock = normalizeSizeStockFromRow({ size_stock: product.sizeStock || [] }).length > 0
+        ? (product.sizeStock || []).map((entry) => entry.size === normalizedSize ? { ...entry, stock: Math.max(0, entry.stock - delta) } : entry)
+        : product.sizeStock;
+      product.sizeStock = nextSizeStock;
+      product.pieces = Math.max(0, Number(product.pieces || 0) - delta);
+      localStorage.setItem('flex_products', JSON.stringify(products));
+    }
+    return;
+  }
+
+  try {
+    const { data: product, error: fetchError } = await supabase
+      .from('products')
+      .select('size_stock, pieces')
+      .eq('Product_ID', productId)
+      .single();
+
+    if (fetchError || !product) {
+      throw new Error(`Stock update failed: product ${productId} not found.`);
+    }
+
+    const currentEntries = normalizeSizeStockFromRow(product);
+    const nextEntries = currentEntries.map((entry) => entry.size === normalizedSize ? { ...entry, stock: Math.max(0, entry.stock - delta) } : entry);
+    const nextPieces = Math.max(0, Number((product as any).pieces || 0) - delta);
+
+    const { error } = await supabase
+      .from('products')
+      .update({ size_stock: nextEntries, pieces: nextPieces })
+      .eq('Product_ID', productId);
+
+    if (error) throw error;
+  } catch (error) {
+    console.error('Error updating product size stock:', error);
+    throw error;
+  }
+}
+
 // ==================== ORDERS ====================
 
 export async function getOrders(): Promise<Order[]> {
@@ -1795,6 +1996,7 @@ export async function updateOrderStatus(
         const nextStock = Math.max(0, currentStock - line.quantity);
         const nextSold = Math.max(0, currentSold + line.quantity);
         const nextStatus = nextStock === 0 ? 'Temporarily unavailable' : 'In Stock';
+        const normalizedLineSize = String(line.size || '').trim().toUpperCase();
 
         snapshots.push({
           productId: String(product.Product_ID || line.productId),
@@ -1812,6 +2014,27 @@ export async function updateOrderStatus(
         if ('sold' in product) updatePayload.sold = nextSold;
         if ('Status' in product) updatePayload.Status = nextStatus;
         if ('status' in product) updatePayload.status = nextStatus;
+
+        const rawSizeStock = product.size_stock ?? product.sizeStock;
+        if (Array.isArray(rawSizeStock)) {
+          const nextSizeStock = rawSizeStock
+            .map((entry: any) => ({
+              size: String(entry?.size || '').trim(),
+              stock: Math.max(0, Math.floor(Number(entry?.stock || 0))),
+            }))
+            .filter((entry: { size: string; stock: number }) => entry.size)
+            .map((entry: { size: string; stock: number }) => {
+              const matches = normalizedLineSize && entry.size.toUpperCase() === normalizedLineSize;
+              if (!matches) return entry;
+              return {
+                ...entry,
+                stock: Math.max(0, entry.stock - line.quantity),
+              };
+            });
+
+          if ('size_stock' in product) updatePayload.size_stock = nextSizeStock;
+          if ('sizeStock' in product) updatePayload.sizeStock = nextSizeStock;
+        }
 
         if (Object.keys(updatePayload).length === 0) {
           throw new Error('Failed to update product stock columns in database schema.');
