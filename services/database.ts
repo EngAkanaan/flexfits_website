@@ -83,7 +83,6 @@ function persistOrderStatusForDatabase(value: unknown): string {
 
 function normalizeInventoryStatusToken(value: unknown): string {
   const normalized = String(value || '').trim().toLowerCase();
-  if (normalized === 'temporary not available' || normalized === 'temporarily unavailable') return 'out of stock';
   return normalized;
 }
 
@@ -2120,10 +2119,7 @@ export async function updateOrderStatus(
         throw new Error(`Order ${orderId} cannot be dispatched from status ${previousStatus}.`);
       }
 
-      if (normalizedStatus === 'canceled' && previousStatus !== 'pending') {
-        if (previousStatus === 'canceled') return;
-        throw new Error(`Order ${orderId} cannot be canceled from status ${previousStatus}.`);
-      }
+      if (normalizedStatus === 'canceled' && previousStatus === 'canceled') return;
 
       if (normalizedStatus === 'canceled') {
         const savedProducts = localStorage.getItem('flex_products');
@@ -2151,6 +2147,12 @@ export async function updateOrderStatus(
           } as StockReservation;
         });
         writeLocalReservations(reservations);
+
+        try {
+          await recalculateFinancialMetrics();
+        } catch (metricsError) {
+          console.warn('Unable to refresh local financial metrics after cancellation:', metricsError);
+        }
       }
 
       order.status = normalizedStatus;
@@ -2233,15 +2235,15 @@ export async function updateOrderStatus(
     }
 
     if (normalizedStatus === 'canceled') {
-      if (previousStatus !== 'pending') {
-        throw new Error(`Order ${orderId} cannot be canceled from status ${previousStatus}.`);
+      if (previousStatus === 'canceled') {
+        return;
       }
 
       const { data: transitionedOrder, error: transitionError } = await supabase
         .from('orders')
         .update({ status: persistOrderStatusForDatabase('canceled') })
         .eq('id', orderId)
-        .eq('status', 'pending')
+        .in('status', ['pending', 'shipped', 'dispatched', 'delivered'])
         .select('*')
         .maybeSingle();
 
@@ -2260,7 +2262,8 @@ export async function updateOrderStatus(
         .in('status', ['active', 'confirmed'])
         .limit(1);
 
-      const shouldApplyManualRefund = Array.isArray(openReservationRows) && openReservationRows.length > 0;
+      const hasOpenReservationRows = Array.isArray(openReservationRows) && openReservationRows.length > 0;
+      const shouldApplyManualRefund = previousStatus !== 'pending' || hasOpenReservationRows;
 
       if (!shouldApplyManualRefund) {
         try {
@@ -2353,6 +2356,12 @@ export async function updateOrderStatus(
         .update({ status: 'released', released_at: new Date().toISOString() })
         .eq('order_id', orderId)
         .in('status', ['active', 'confirmed']);
+
+      try {
+        await recalculateFinancialMetrics();
+      } catch (metricsError) {
+        console.warn('Unable to refresh financial metrics after cancellation:', metricsError);
+      }
 
       try {
         const canceledOrder = await mapOrderRowToOrder(transitionedOrder);

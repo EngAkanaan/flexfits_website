@@ -5,6 +5,7 @@ import { Category, Product, ProductGender, ProductSizeStock, Order, CartItem, Fi
 import { INITIAL_PRODUCTS, ADMIN_CREDENTIALS, ADMIN_USER, ADMIN_PASS, LEBANON_LOCATIONS, SIZE_OPTIONS } from './constants';
 import { getProductRecommendation } from './services/gemini';
 import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals, reserveCartLine, releaseCartLineReservation, cleanupExpiredReservations, extendExpiredReservation, getProductColorTokens, uploadProductImagesToStorage, normalizeOrderStatus } from './services/database';
+import { supabase } from './services/supabase';
 
 const BRAND_LOGO_SRC = '/flex-logo.JPG';
 const DELIVERY_FEE = 5;
@@ -252,7 +253,6 @@ function normalizeSizeStockEntries(product: Product): ProductSizeStock[] {
 
 function normalizeCustomerProductStatus(value: unknown): string {
   const normalized = String(value || '').trim().toLowerCase();
-  if (normalized === 'temporary not available' || normalized === 'temporarily unavailable') return 'out of stock';
   return normalized;
 }
 
@@ -261,11 +261,40 @@ function isProductVisibleToCustomer(product: Product): boolean {
 }
 
 function isProductPurchasableForCustomer(product: Product): boolean {
-  const normalizedStatus = normalizeCustomerProductStatus((product as any).Status ?? product.status ?? '');
-  if (normalizedStatus === 'discontinued' || normalizedStatus === 'coming soon' || normalizedStatus === 'out of stock') {
-    return false;
+  return getProductAvailabilityState(product) === 'available';
+}
+
+function getCommittedAvailableForSize(product: Product, size: string): number {
+  const normalizedSize = String(size || '').trim();
+  const sizeEntries = normalizeSizeStockEntries(product);
+  const match = sizeEntries.find((entry) => String(entry.size || '').trim() === normalizedSize);
+  if (match) {
+    const stock = Math.max(0, Math.floor(Number(match.stock || 0)));
+    const sold = Math.max(0, Math.floor(Number(match.sold || 0)));
+    return Math.max(0, stock - sold);
   }
-  return getTotalSizeStock(product) > 0;
+
+  if (sizeEntries.length > 0) return 0;
+
+  const totalStock = Math.max(0, Math.floor(Number(product.initialStock || 0)));
+  const totalSold = Math.max(0, Math.floor(Number(product.sold || 0)));
+  return Math.max(0, totalStock - totalSold);
+}
+
+function getProductAvailabilityState(product: Product): 'available' | 'reserved' | 'unavailable' | 'coming_soon' | 'discontinued' {
+  const normalizedStatus = normalizeCustomerProductStatus((product as any).Status ?? product.status ?? '');
+  if (normalizedStatus === 'discontinued') return 'discontinued';
+  if (normalizedStatus === 'coming soon') return 'coming_soon';
+  if (normalizedStatus === 'out of stock') return 'unavailable';
+
+  const visibleLeftNow = getTotalSizeStock(product);
+  if (visibleLeftNow > 0) return 'available';
+
+  const committed = getProductStockTotals(product);
+  const committedAvailable = Math.max(0, committed.stock - committed.sold);
+  if (committedAvailable > 0) return 'reserved';
+
+  return 'unavailable';
 }
 
 function getProductStockTotals(product: Product): { stock: number; sold: number; left: number } {
@@ -365,9 +394,10 @@ function ProductCard({
     return () => window.clearInterval(interval);
   }, [isHovered, images.length]);
 
-  const normalizedStatus = normalizeCustomerProductStatus((product as any).Status ?? product.status ?? '');
-  const isComingSoon = normalizedStatus === 'coming soon';
-  const isOutOfStock = getTotalStock(product) <= 0 || normalizedStatus === 'out of stock';
+  const availabilityState = getProductAvailabilityState(product);
+  const isComingSoon = availabilityState === 'coming_soon';
+  const isReserved = availabilityState === 'reserved';
+  const isOutOfStock = availabilityState === 'unavailable';
   const cardColors = getProductColorTokens(product);
 
   return (
@@ -405,9 +435,9 @@ function ProductCard({
             )}
           </div>
         </div>
-        {(isOutOfStock || isComingSoon) && (
-          <div className={`absolute bottom-2 right-2 text-white text-[8px] font-black uppercase tracking-[0.12em] px-2 py-1 rounded-full shadow-lg ${isComingSoon ? 'bg-blue-600' : 'bg-red-600'}`}>
-            {isComingSoon ? 'Coming Soon' : 'Out Of Stock'}
+        {(isOutOfStock || isComingSoon || isReserved) && (
+          <div className={`absolute bottom-2 right-2 text-white text-[8px] font-black uppercase tracking-[0.12em] px-2 py-1 rounded-full shadow-lg ${isComingSoon ? 'bg-blue-600' : isReserved ? 'bg-amber-600' : 'bg-red-600'}`}>
+            {isComingSoon ? 'Coming Soon' : isReserved ? 'Reserved' : 'Out Of Stock'}
           </div>
         )}
       </div>
@@ -453,8 +483,8 @@ function ProductCard({
 
         <div className="mb-3 flex items-center gap-2">
           <span className="text-[9px] font-black uppercase text-gray-400 tracking-widest">In Stock:</span>
-          <span className={`text-[11px] font-black ${getTotalStock(product) <= 0 ? 'text-red-500' : getTotalStock(product) < 10 ? 'text-orange-500' : 'text-green-600'}`}>
-            {isComingSoon ? 'Coming Soon' : (isOutOfStock ? 'Out of stock' : `${getTotalStock(product)} left`)}
+          <span className={`text-[11px] font-black ${isOutOfStock ? 'text-red-500' : isReserved ? 'text-amber-600' : getTotalStock(product) < 10 ? 'text-orange-500' : 'text-green-600'}`}>
+            {isComingSoon ? 'Coming Soon' : (isReserved ? 'Reserved by another customer' : isOutOfStock ? 'Out of stock' : `${getTotalStock(product)} left`)}
           </span>
         </div>
 
@@ -564,6 +594,8 @@ const App: React.FC = () => {
   const [imageViewerScale, setImageViewerScale] = useState<number>(1);
   const [imageViewerTranslate, setImageViewerTranslate] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const preloadedImageUrlsRef = useRef<Set<string>>(new Set());
+  const liveRefreshInFlightRef = useRef(false);
+  const liveRefreshQueuedRef = useRef(false);
   const imageViewerGestureRef = useRef({
     isPinching: false,
     pinchStartDistance: 0,
@@ -574,6 +606,31 @@ const App: React.FC = () => {
     lastTouchY: 0,
   });
   const [isLoading, setIsLoading] = useState(true);
+
+  const refreshLiveState = useCallback(async () => {
+    if (liveRefreshInFlightRef.current) {
+      liveRefreshQueuedRef.current = true;
+      return;
+    }
+
+    liveRefreshInFlightRef.current = true;
+    try {
+      const [loadedProducts, loadedOrders] = await Promise.all([
+        getProducts(),
+        getOrders(),
+      ]);
+      setProducts(loadedProducts);
+      setOrders(loadedOrders);
+    } catch (error) {
+      console.error('Error refreshing live data:', error);
+    } finally {
+      liveRefreshInFlightRef.current = false;
+      if (liveRefreshQueuedRef.current) {
+        liveRefreshQueuedRef.current = false;
+        void refreshLiveState();
+      }
+    }
+  }, []);
   
   // Load data from database on mount
   useEffect(() => {
@@ -609,6 +666,73 @@ const App: React.FC = () => {
     
     loadData();
   }, []);
+
+  useEffect(() => {
+    if (!supabase) return;
+    const client = supabase;
+
+    const channel = client
+      .channel('flexfits-live-sync')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'products' }, () => {
+        void refreshLiveState();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'stock_reservations' }, () => {
+        void refreshLiveState();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'orders' }, () => {
+        void refreshLiveState();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'order_items' }, () => {
+        void refreshLiveState();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'product_financial_metrics' }, () => {
+        void refreshLiveState();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'financial_dashboard_totals' }, () => {
+        void refreshLiveState();
+      })
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          void refreshLiveState();
+        }
+      });
+
+    return () => {
+      void client.removeChannel(channel);
+    };
+  }, [refreshLiveState]);
+
+  useEffect(() => {
+    const syncFromVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshLiveState();
+      }
+    };
+
+    const syncFromFocus = () => {
+      void refreshLiveState();
+    };
+
+    window.addEventListener('focus', syncFromFocus);
+    document.addEventListener('visibilitychange', syncFromVisibility);
+    return () => {
+      window.removeEventListener('focus', syncFromFocus);
+      document.removeEventListener('visibilitychange', syncFromVisibility);
+    };
+  }, [refreshLiveState]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void (async () => {
+        await cleanupExpiredReservations();
+        await refreshLiveState();
+      })();
+    }, 12000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [refreshLiveState]);
 
   useEffect(() => {
     try {
@@ -778,9 +902,8 @@ const App: React.FC = () => {
     const q = deferredSearchQuery.trim().toLowerCase();
     return products.filter(p => {
       if (!isProductVisibleToCustomer(p)) return false;
-      const leftStock = getTotalSizeStock(p);
-      const normalizedStatus = normalizeCustomerProductStatus((p as any).Status ?? p.status ?? '');
-      const isSoldOut = leftStock <= 0 || normalizedStatus === 'out of stock';
+      const availabilityState = getProductAvailabilityState(p);
+      const isSoldOut = availabilityState === 'unavailable';
       const productGender = normalizeGender(p.gender);
 
       const colorTokens = getProductColorTokens(p);
@@ -876,18 +999,32 @@ const App: React.FC = () => {
   const addToCart = async (product: Product, size: string, quantityToAdd: number = 1): Promise<boolean> => {
     const requestedQty = Math.max(1, Math.floor(Number(quantityToAdd || 1)));
     const liveProduct = products.find(p => p.Product_ID === product.Product_ID);
-    if (liveProduct && !isProductPurchasableForCustomer(liveProduct)) {
-      alert('This product is currently unavailable for purchase.');
+    const liveAvailabilityState = liveProduct ? getProductAvailabilityState(liveProduct) : 'unavailable';
+    if (!liveProduct) {
+      alert('This product is currently unavailable.');
       return false;
     }
-    const liveTotalStock = liveProduct ? getTotalSizeStock(liveProduct) : 0;
-    if (!liveProduct || liveTotalStock <= 0) {
+    if (liveAvailabilityState === 'reserved') {
+      alert('This product is currently reserved by another customer.');
+      return false;
+    }
+    if (liveAvailabilityState !== 'available') {
+      alert('This product is currently unavailable.');
+      return false;
+    }
+    const liveTotalStock = getTotalSizeStock(liveProduct);
+    if (liveTotalStock <= 0) {
       alert("This item is currently out of stock!");
       return false;
     }
 
     const liveSizeStock = getSizeStock(liveProduct, size);
     if (liveSizeStock <= 0) {
+      const sizeCommittedAvailable = getCommittedAvailableForSize(liveProduct, size);
+      if (sizeCommittedAvailable > 0) {
+        alert('This product is currently reserved by another customer.');
+        return false;
+      }
       alert('That size is currently out of stock!');
       return false;
     }
@@ -1524,7 +1661,7 @@ const App: React.FC = () => {
       return () => {
         window.clearTimeout(timeout);
       };
-    }, [isAdmin, orders.length]);
+    }, [isAdmin, orders]);
 
     useEffect(() => {
       return () => {
@@ -2096,7 +2233,7 @@ const App: React.FC = () => {
                     const totals = getProductStockTotals(p);
                     const computedLeft = totals.left;
                     const stockStatus = computedLeft <= 0 ? 'Out of Stock' : computedLeft < 10 ? 'Low Stock' : 'Healthy';
-                    const normalizedStatus = (p.status === 'Temporary Not Available' || p.status === 'Temporarily unavailable') ? 'Out of Stock' : (p.status || stockStatus);
+                    const normalizedStatus = p.status || stockStatus;
                     const rowColors = getProductColorTokens(p);
                     const sizeBreakdown = normalizeSizeStockEntries(p);
                     return (
@@ -2569,9 +2706,9 @@ const App: React.FC = () => {
                     </button>
                     <button
                       type="button"
-                      disabled={normalizeOrderStatus(o.status) !== 'pending' || cancelingOrderIds.has(o.id) || dispatchingOrderIds.has(o.id)}
+                      disabled={normalizeOrderStatus(o.status) === 'canceled' || cancelingOrderIds.has(o.id) || dispatchingOrderIds.has(o.id)}
                       onClick={async () => {
-                        if (normalizeOrderStatus(o.status) !== 'pending') return;
+                        if (normalizeOrderStatus(o.status) === 'canceled') return;
                         if (!beginOrderCancel(o.id)) return;
 
                         try {
@@ -2604,7 +2741,7 @@ const App: React.FC = () => {
                           endOrderCancel(o.id);
                         }
                       }}
-                      className={`w-full px-6 py-4 rounded-2xl text-[11px] font-black uppercase tracking-widest transition-all shadow-xl border ${normalizeOrderStatus(o.status) === 'pending' && !cancelingOrderIds.has(o.id) && !dispatchingOrderIds.has(o.id) ? 'bg-white text-red-600 border-red-200 hover:bg-red-50 shadow-red-600/10' : 'bg-gray-200 text-gray-500 cursor-not-allowed shadow-transparent border-transparent'}`}
+                      className={`w-full px-6 py-4 rounded-2xl text-[11px] font-black uppercase tracking-widest transition-all shadow-xl border ${normalizeOrderStatus(o.status) !== 'canceled' && !cancelingOrderIds.has(o.id) && !dispatchingOrderIds.has(o.id) ? 'bg-white text-red-600 border-red-200 hover:bg-red-50 shadow-red-600/10' : 'bg-gray-200 text-gray-500 cursor-not-allowed shadow-transparent border-transparent'}`}
                     >
                       {cancelingOrderIds.has(o.id) ? 'Canceling...' : 'Cancel Order'}
                     </button>
@@ -3114,21 +3251,36 @@ const App: React.FC = () => {
                     <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
                       {activeProduct.sizes.map((size) => {
                         const sizeStock = getSizeStock(activeProduct, size);
+                        const committedSizeAvailable = getCommittedAvailableForSize(activeProduct, size);
+                        const isReservedForSize = sizeStock <= 0 && committedSizeAvailable > 0;
                         const isSelected = productDetailSelectedSize === size;
                         const isUnavailable = sizeStock <= 0 || !isProductPurchasableForCustomer(activeProduct);
                         return (
                           <button key={size} type="button" onClick={() => { if (!isUnavailable) { setProductDetailSelectedSize(size); setProductDetailQuantity(1); } }} disabled={isUnavailable} className={`rounded-xl border px-3 py-3 text-[11px] font-black uppercase tracking-widest transition-all ${isSelected ? 'bg-black text-white border-black' : isUnavailable ? 'bg-gray-50 text-gray-300 border-gray-100 cursor-not-allowed' : 'bg-white text-gray-700 border-gray-200 hover:border-orange-500'}`}>
                             <span className="block">{size}</span>
-                            <span className="mt-1 block text-[9px] font-bold normal-case tracking-normal">{sizeStock > 0 ? `${sizeStock} left` : 'Out of stock'}</span>
+                            <span className="mt-1 block text-[9px] font-bold normal-case tracking-normal">{sizeStock > 0 ? `${sizeStock} left` : isReservedForSize ? 'Reserved' : 'Out of stock'}</span>
                           </button>
                         );
                       })}
                     </div>
-                    {!isProductPurchasableForCustomer(activeProduct) && (
-                      <p className="mt-3 text-[10px] font-black uppercase tracking-[0.18em] text-red-500">
-                        This product is currently unavailable.
-                      </p>
-                    )}
+                    {(() => {
+                      const availabilityState = getProductAvailabilityState(activeProduct);
+                      if (availabilityState === 'reserved') {
+                        return (
+                          <p className="mt-3 text-[10px] font-black uppercase tracking-[0.18em] text-amber-600">
+                            This product is currently reserved by another customer.
+                          </p>
+                        );
+                      }
+                      if (!isProductPurchasableForCustomer(activeProduct)) {
+                        return (
+                          <p className="mt-3 text-[10px] font-black uppercase tracking-[0.18em] text-red-500">
+                            This product is currently unavailable.
+                          </p>
+                        );
+                      }
+                      return null;
+                    })()}
                   </div>
 
                   {productDetailSelectedSize && (
