@@ -2,12 +2,11 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback, useDeferredValue } from 'react';
 import { ShoppingBag, User, Search, Filter, Trash2, Plus, LogOut, ChevronRight, CheckCircle, Package, BarChart3, Menu, X, Star, ExternalLink, Edit2, Upload, Phone, MapPin, Truck, Check, Mail, List, Layers, Info } from 'lucide-react';
 import { Category, Product, ProductGender, ProductSizeStock, Order, CartItem, FinancialMetric, FinancialTotals, View } from './types';
-import { INITIAL_PRODUCTS, ADMIN_USER, ADMIN_PASS, LEBANON_LOCATIONS, SIZE_OPTIONS } from './constants';
+import { INITIAL_PRODUCTS, ADMIN_CREDENTIALS, ADMIN_USER, ADMIN_PASS, DELIVERY_FEE, LEBANON_LOCATIONS, SIZE_OPTIONS } from './constants';
 import { getProductRecommendation } from './services/gemini';
-import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals, reserveCartLine, releaseCartLineReservation, cleanupExpiredReservations, extendExpiredReservation, getProductColorTokens, uploadProductImagesToStorage } from './services/database';
+import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals, reserveCartLine, releaseCartLineReservation, cleanupExpiredReservations, extendExpiredReservation, getProductColorTokens, uploadProductImagesToStorage, normalizeOrderStatus } from './services/database';
 
 const BRAND_LOGO_SRC = '/flex-logo.JPG';
-const DELIVERY_FEE = 4;
 const GENDER_OPTIONS: ProductGender[] = ['Men', 'Women', 'Unisex'];
 const NUMERIC_SIZE_FILTER_OPTIONS = Array.from({ length: 16 }, (_, i) => String(35 + i));
 const CLOTHING_SIZE_FILTER_OPTIONS = ['S', 'M', 'L', 'XL'];
@@ -209,13 +208,81 @@ function normalizeSizeStockEntries(product: Product): ProductSizeStock[] {
     return product.sizeStock
       .map((entry) => ({
         size: String(entry?.size || '').trim(),
-        stock: Math.max(0, Math.floor(Number(entry?.stock || 0))),
+        stock: Math.max(
+          0,
+          Math.floor(
+            Number(
+              entry?.stock
+              ?? (Math.max(0, Math.floor(Number(entry?.left || 0))) + Math.max(0, Math.floor(Number(entry?.sold || 0))))
+              ?? 0
+            )
+          )
+        ),
+        sold: Math.max(0, Math.floor(Number(entry?.sold || 0))),
+        left: Math.max(
+          0,
+          Math.floor(
+            Number(
+              entry?.left
+              ?? entry?.Left
+              ?? (Math.max(0, Math.floor(Number(entry?.stock || 0))) - Math.max(0, Math.floor(Number(entry?.sold || 0))))
+              ?? 0
+            )
+          )
+        ),
       }))
+      .map((entry) => {
+        const clampedSold = Math.min(entry.stock, Math.max(0, entry.sold));
+        const clampedLeft = Math.min(entry.stock, Math.max(0, entry.left));
+        return {
+          ...entry,
+          sold: clampedSold,
+          left: clampedLeft,
+        };
+      })
       .filter((entry) => entry.size);
   }
 
   const fallbackPieces = Math.max(0, Math.floor(Number(product.pieces || 0)));
-  return (product.sizes || []).map((size) => ({ size, stock: fallbackPieces }));
+  const sizes = (product.sizes || []).map((size) => String(size || '').trim()).filter(Boolean);
+  if (sizes.length === 0) return [];
+  return sizes.map((size, index) => {
+    const perSize = Math.floor(fallbackPieces / sizes.length);
+    const extra = index < (fallbackPieces % sizes.length) ? 1 : 0;
+    const stock = Math.max(0, perSize + extra);
+    return { size, stock, left: stock, sold: 0 };
+  });
+}
+
+function normalizeCustomerProductStatus(value: unknown): string {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'temporary not available' || normalized === 'temporarily unavailable') return 'out of stock';
+  return normalized;
+}
+
+function isProductVisibleToCustomer(product: Product): boolean {
+  return normalizeCustomerProductStatus((product as any).Status ?? product.status ?? '') !== 'discontinued';
+}
+
+function isProductPurchasableForCustomer(product: Product): boolean {
+  const normalizedStatus = normalizeCustomerProductStatus((product as any).Status ?? product.status ?? '');
+  if (normalizedStatus === 'discontinued' || normalizedStatus === 'coming soon' || normalizedStatus === 'out of stock') {
+    return false;
+  }
+  return getTotalSizeStock(product) > 0;
+}
+
+function getProductStockTotals(product: Product): { stock: number; sold: number; left: number } {
+  const entries = normalizeSizeStockEntries(product);
+  if (entries.length > 0) {
+    const stock = entries.reduce((sum, entry) => sum + Math.max(0, Math.floor(Number(entry.stock || 0))), 0);
+    const sold = entries.reduce((sum, entry) => sum + Math.max(0, Math.floor(Number(entry.sold || 0))), 0);
+    const left = entries.reduce((sum, entry) => sum + Math.max(0, Math.floor(Number(entry.left || 0))), 0);
+    return { stock, sold, left };
+  }
+  const stock = Math.max(0, Math.floor(Number(product.initialStock || 0)));
+  const sold = Math.max(0, Math.floor(Number(product.sold || 0)));
+  return { stock, sold, left: Math.max(0, stock - sold) };
 }
 
 function getProductImages(product: Product): string[] {
@@ -302,7 +369,9 @@ function ProductCard({
     return () => window.clearInterval(interval);
   }, [isHovered, images.length]);
 
-  const isOutOfStock = getTotalStock(product) <= 0 || product.status === 'Temporary Not Available' || product.status === 'Temporarily unavailable' || product.status === 'Out of Stock';
+  const normalizedStatus = normalizeCustomerProductStatus((product as any).Status ?? product.status ?? '');
+  const isComingSoon = normalizedStatus === 'coming soon';
+  const isOutOfStock = getTotalStock(product) <= 0 || normalizedStatus === 'out of stock';
   const cardColors = getProductColorTokens(product);
 
   return (
@@ -340,9 +409,9 @@ function ProductCard({
             )}
           </div>
         </div>
-        {isOutOfStock && (
-          <div className="absolute bottom-2 right-2 bg-red-600 text-white text-[8px] font-black uppercase tracking-[0.12em] px-2 py-1 rounded-full shadow-lg">
-            Sold Out
+        {(isOutOfStock || isComingSoon) && (
+          <div className={`absolute bottom-2 right-2 text-white text-[8px] font-black uppercase tracking-[0.12em] px-2 py-1 rounded-full shadow-lg ${isComingSoon ? 'bg-blue-600' : 'bg-red-600'}`}>
+            {isComingSoon ? 'Coming Soon' : 'Out Of Stock'}
           </div>
         )}
       </div>
@@ -389,7 +458,7 @@ function ProductCard({
         <div className="mb-3 flex items-center gap-2">
           <span className="text-[9px] font-black uppercase text-gray-400 tracking-widest">In Stock:</span>
           <span className={`text-[11px] font-black ${getTotalStock(product) <= 0 ? 'text-red-500' : getTotalStock(product) < 10 ? 'text-orange-500' : 'text-green-600'}`}>
-            {isOutOfStock ? 'Sold Out' : `${getTotalStock(product)} left`}
+            {isComingSoon ? 'Coming Soon' : (isOutOfStock ? 'Out of stock' : `${getTotalStock(product)} left`)}
           </span>
         </div>
 
@@ -411,7 +480,7 @@ function ProductCard({
               return (
                 <span key={sizeValue} className={`w-10 h-10 border-2 rounded-lg flex flex-col items-center justify-center text-[9px] font-black uppercase italic select-none ${sizeStock <= 0 ? 'border-gray-100 text-gray-300 bg-gray-50' : 'border-gray-100 text-gray-500 bg-white'}`}>
                   <span>{sizeValue}</span>
-                  <span className="text-[8px] normal-case tracking-normal">{sizeStock > 0 ? sizeStock : '0'}</span>
+                  <span className="text-[8px] normal-case tracking-normal">{sizeStock > 0 ? `${sizeStock}` : 'Out'}</span>
                 </span>
               );
             })}
@@ -424,7 +493,7 @@ function ProductCard({
 
 function getTotalSizeStock(product: Product): number {
   if (Array.isArray(product.sizeStock) && product.sizeStock.length > 0) {
-    return product.sizeStock.reduce((total, entry) => total + Math.max(0, Math.floor(Number(entry.stock || 0))), 0);
+    return product.sizeStock.reduce((total, entry) => total + Math.max(0, Math.floor(Number(entry.left ?? entry.stock ?? 0))), 0);
   }
   return Math.max(0, Math.floor(Number(product.pieces || 0)));
 }
@@ -433,7 +502,8 @@ function getSizeStock(product: Product, size: string): number {
   const normalizedSize = String(size || '').trim();
   const sizeEntries = normalizeSizeStockEntries(product);
   const match = sizeEntries.find((entry) => String(entry.size || '').trim() === normalizedSize);
-  if (match) return Math.max(0, Math.floor(Number(match.stock || 0)));
+  if (match) return Math.max(0, Math.floor(Number(match.left ?? match.stock ?? 0)));
+  if (Array.isArray(product.sizeStock) && product.sizeStock.length > 0) return 0;
   return Math.max(0, Math.floor(Number(product.pieces || 0)));
 }
 
@@ -441,7 +511,9 @@ function buildEditableSizeStock(product: Product): ProductSizeStock[] {
   if (Array.isArray(product.sizeStock) && product.sizeStock.length > 0) {
     return product.sizeStock.map((entry) => ({
       size: String(entry.size || '').trim(),
-      stock: Math.max(0, Math.floor(Number(entry.stock || 0))),
+      stock: Math.max(0, Math.floor(Number(entry.left ?? entry.stock ?? 0))),
+      left: Math.max(0, Math.floor(Number(entry.left ?? entry.stock ?? 0))),
+      sold: Math.max(0, Math.floor(Number(entry.sold || 0))),
     })).filter((entry) => entry.size);
   }
 
@@ -452,6 +524,8 @@ function buildEditableSizeStock(product: Product): ProductSizeStock[] {
   return sizes.map((size, index) => ({
     size,
     stock: Math.max(0, Math.floor(totalStock / sizes.length) + (index < (totalStock % sizes.length) ? 1 : 0)),
+    left: Math.max(0, Math.floor(totalStock / sizes.length) + (index < (totalStock % sizes.length) ? 1 : 0)),
+    sold: 0,
   }));
 }
 
@@ -707,8 +781,9 @@ const App: React.FC = () => {
   const filteredProducts = useMemo(() => {
     const q = deferredSearchQuery.trim().toLowerCase();
     return products.filter(p => {
+      if (!isProductVisibleToCustomer(p)) return false;
       const leftStock = getTotalSizeStock(p);
-      const normalizedStatus = String((p as any).Status ?? p.status ?? '').trim().toLowerCase();
+      const normalizedStatus = normalizeCustomerProductStatus((p as any).Status ?? p.status ?? '');
       const isSoldOut = leftStock <= 0 || normalizedStatus === 'out of stock';
       const productGender = normalizeGender(p.gender);
 
@@ -805,7 +880,12 @@ const App: React.FC = () => {
   const addToCart = async (product: Product, size: string, quantityToAdd: number = 1): Promise<boolean> => {
     const requestedQty = Math.max(1, Math.floor(Number(quantityToAdd || 1)));
     const liveProduct = products.find(p => p.Product_ID === product.Product_ID);
-    if (!liveProduct || liveProduct.pieces <= 0) {
+    if (liveProduct && !isProductPurchasableForCustomer(liveProduct)) {
+      alert('This product is currently unavailable for purchase.');
+      return false;
+    }
+    const liveTotalStock = liveProduct ? getTotalSizeStock(liveProduct) : 0;
+    if (!liveProduct || liveTotalStock <= 0) {
       alert("This item is currently out of stock!");
       return false;
     }
@@ -841,7 +921,23 @@ const App: React.FC = () => {
     }
 
     if (!reservation.ok || !reservation.reservationId || !reservation.expiresAt) {
-      alert(reservation.message || "Sorry, this item is currently reserved by another shopper.");
+      try {
+        const refreshedProducts = await getProducts();
+        setProducts(refreshedProducts);
+      } catch {
+        // Keep UX resilient even if refresh fails.
+      }
+
+      if (reservation.reason === 'size_out_of_stock') {
+        alert(`Size ${size} is currently out of stock.`);
+      } else if (reservation.reason === 'reserved_by_others') {
+        const cappedAvailable = Math.max(0, Number(reservation.availableAfter || 0));
+        alert(cappedAvailable > 0
+          ? `Only ${cappedAvailable} item(s) are currently available for size ${size}.`
+          : 'This item is currently reserved by another shopper. Please try again shortly.');
+      } else {
+        alert(reservation.message || 'Unable to reserve this item right now. Please retry.');
+      }
       return false;
     }
 
@@ -874,12 +970,13 @@ const App: React.FC = () => {
       if (p.Product_ID !== product.Product_ID) return p;
       const currentSizeStock = normalizeSizeStockEntries(p);
       const nextSizeStock = currentSizeStock.length > 0
-        ? currentSizeStock.map((entry) => entry.size === size ? { ...entry, stock: Math.max(0, entry.stock - requestedQty) } : entry)
+        ? currentSizeStock.map((entry) => entry.size === size ? { ...entry, left: Math.max(0, entry.left - requestedQty) } : entry)
         : currentSizeStock;
+      const nextPiecesBySize = nextSizeStock.reduce((total, entry) => total + Math.max(0, Number(entry.left || 0)), 0);
       if (reservation.availableAfter !== undefined) {
-        return { ...p, pieces: Math.max(0, Number(reservation.availableAfter || 0)), sizeStock: nextSizeStock.length > 0 ? nextSizeStock : p.sizeStock };
+        return { ...p, pieces: Math.max(0, Number(nextPiecesBySize || reservation.availableAfter || 0)), sizeStock: nextSizeStock.length > 0 ? nextSizeStock : p.sizeStock };
       }
-      return { ...p, pieces: Math.max(0, Number(p.pieces || 0) - requestedQty), sizeStock: nextSizeStock.length > 0 ? nextSizeStock : p.sizeStock };
+      return { ...p, pieces: Math.max(0, Number(nextPiecesBySize || 0)), sizeStock: nextSizeStock.length > 0 ? nextSizeStock : p.sizeStock };
     }));
     return true;
   };
@@ -1039,14 +1136,17 @@ const App: React.FC = () => {
       const nextSizeStock = sizeStock.length > 0
         ? sizeStock.map((entry) => (
             String(entry.size || '').trim() === normalizedSize
-              ? { ...entry, stock: Math.max(0, entry.stock + releasedQty) }
+              ? { ...entry, left: Math.max(0, entry.left + releasedQty) }
               : entry
           ))
         : product.sizeStock;
+      const nextPiecesBySize = Array.isArray(nextSizeStock)
+        ? nextSizeStock.reduce((total, entry) => total + Math.max(0, Number(entry.left || 0)), 0)
+        : Math.max(0, Number(product.pieces || 0) + releasedQty);
 
       return {
         ...product,
-        pieces: Math.max(0, Number(product.pieces || 0) + releasedQty),
+        pieces: Math.max(0, Number(nextPiecesBySize || 0)),
         sizeStock: nextSizeStock,
       };
     }));
@@ -1326,6 +1426,10 @@ const App: React.FC = () => {
     const [inventorySort, setInventorySort] = useState<{ col: 'id' | 'productName' | 'category'; dir: 'asc' | 'desc' } | null>(null);
     const [financialMetrics, setFinancialMetrics] = useState<FinancialMetric[]>([]);
     const [financialTotals, setFinancialTotals] = useState<FinancialTotals | null>(null);
+    const [dispatchingOrderIds, setDispatchingOrderIds] = useState<Set<string>>(new Set());
+    const dispatchingOrderIdsRef = useRef<Set<string>>(new Set());
+    const [cancelingOrderIds, setCancelingOrderIds] = useState<Set<string>>(new Set());
+    const cancelingOrderIdsRef = useRef<Set<string>>(new Set());
     const [inventoryPage, setInventoryPage] = useState(1);
     const inventoryPageSize = 20;
     const fileRef = useRef<HTMLInputElement>(null);
@@ -1399,7 +1503,7 @@ const App: React.FC = () => {
       setFormSizeStock((prev) => {
         const next = selectedSizes.map((size) => {
           const existing = prev.find((entry) => entry.size === size);
-          return existing || { size, stock: 0 };
+          return existing || { size, stock: 0, left: 0, sold: 0 };
         });
         return next;
       });
@@ -1436,8 +1540,35 @@ const App: React.FC = () => {
       };
     }, [uploadedImagePreviews]);
 
-    const fallbackRevenue = financialMetrics.reduce((acc, row) => acc + row.revenue, 0);
-    const fallbackProfit = financialMetrics.reduce((acc, row) => acc + row.netProfit, 0);
+    const displayFinancialMetrics = useMemo<FinancialMetric[]>(() => {
+      if (financialMetrics.length > 0) {
+        return financialMetrics;
+      }
+
+      return products.map((product) => {
+        const totals = getProductStockTotals(product);
+        const itemPrice = Number(product.price || 0);
+        const itemCost = Number(product.cost || 0);
+        const normalizedName = String(product.productName || '').trim()
+          || splitDisplayName(product.name).product
+          || String(product.name || '').trim()
+          || product.Product_ID;
+
+        return {
+          productId: product.Product_ID,
+          productName: normalizedName,
+          itemsSold: totals.sold,
+          itemPrice,
+          itemCost,
+          revenue: totals.sold * itemPrice,
+          netProfit: totals.sold * (itemPrice - itemCost),
+          calculatedAt: new Date().toISOString(),
+        };
+      });
+    }, [financialMetrics, products]);
+
+    const fallbackRevenue = displayFinancialMetrics.reduce((acc, row) => acc + row.revenue, 0);
+    const fallbackProfit = displayFinancialMetrics.reduce((acc, row) => acc + row.netProfit, 0);
     const totalSalesValue = financialTotals?.totalRevenue ?? fallbackRevenue;
     const profit = financialTotals?.totalNetProfit ?? fallbackProfit;
 
@@ -1468,6 +1599,46 @@ const App: React.FC = () => {
       return inventoryProducts.slice(start, start + inventoryPageSize);
     }, [inventoryProducts, inventoryPage, inventoryPageSize]);
 
+    const beginOrderDispatch = (orderId: string): boolean => {
+      const normalized = String(orderId || '').trim();
+      if (!normalized) return false;
+      if (dispatchingOrderIdsRef.current.has(normalized)) return false;
+      const next = new Set(dispatchingOrderIdsRef.current);
+      next.add(normalized);
+      dispatchingOrderIdsRef.current = next;
+      setDispatchingOrderIds(next);
+      return true;
+    };
+
+    const endOrderDispatch = (orderId: string): void => {
+      const normalized = String(orderId || '').trim();
+      if (!normalized || !dispatchingOrderIdsRef.current.has(normalized)) return;
+      const next = new Set(dispatchingOrderIdsRef.current);
+      next.delete(normalized);
+      dispatchingOrderIdsRef.current = next;
+      setDispatchingOrderIds(next);
+    };
+
+    const beginOrderCancel = (orderId: string): boolean => {
+      const normalized = String(orderId || '').trim();
+      if (!normalized) return false;
+      if (cancelingOrderIdsRef.current.has(normalized)) return false;
+      const next = new Set(cancelingOrderIdsRef.current);
+      next.add(normalized);
+      cancelingOrderIdsRef.current = next;
+      setCancelingOrderIds(next);
+      return true;
+    };
+
+    const endOrderCancel = (orderId: string): void => {
+      const normalized = String(orderId || '').trim();
+      if (!normalized || !cancelingOrderIdsRef.current.has(normalized)) return;
+      const next = new Set(cancelingOrderIdsRef.current);
+      next.delete(normalized);
+      cancelingOrderIdsRef.current = next;
+      setCancelingOrderIds(next);
+    };
+
     if (!isAdmin) {
       return (
         <div className="min-h-[60vh] flex items-center justify-center p-4">
@@ -1475,7 +1646,11 @@ const App: React.FC = () => {
             <h2 className="text-xl font-black mb-6 text-center uppercase tracking-widest">Admin Authorization</h2>
             <input type="text" placeholder="Admin Username" className="w-full mb-4 p-3 bg-gray-50 rounded-xl border focus:ring-2 focus:ring-orange-500 transition-all outline-none" value={user} onChange={e => setUser(e.target.value)} />
             <input type="password" placeholder="Password" className="w-full mb-6 p-3 bg-gray-50 rounded-xl border focus:ring-2 focus:ring-orange-500 transition-all outline-none" value={pass} onChange={e => setPass(e.target.value)} />
-            <button onClick={() => { if (user === ADMIN_USER && pass === ADMIN_PASS) setIsAdmin(true); else alert('Access Denied: Incorrect Credentials'); }} className="w-full bg-black text-white py-4 rounded-xl font-bold hover:bg-orange-600 transition-all uppercase tracking-widest">Login</button>
+            <button onClick={() => {
+              const isValidLogin = ADMIN_CREDENTIALS.some((credential) => credential.username === user && credential.password === pass);
+              if (isValidLogin) setIsAdmin(true);
+              else alert('Access Denied: Incorrect Credentials');
+            }} className="w-full bg-black text-white py-4 rounded-xl font-bold hover:bg-orange-600 transition-all uppercase tracking-widest">Login</button>
           </div>
         </div>
       );
@@ -1660,9 +1835,12 @@ const App: React.FC = () => {
       }
       const normalizedSizeStock = selectedSizes.map((size) => {
         const existing = formSizeStock.find((entry) => entry.size === size);
+        const stockAmount = Math.max(0, Math.floor(Number(existing?.stock ?? 0)));
         return {
           size,
-          stock: Math.max(0, Math.floor(Number(existing?.stock ?? 0))),
+          stock: stockAmount,
+          left: stockAmount,
+          sold: 0,
         };
       });
 
@@ -1681,10 +1859,15 @@ const App: React.FC = () => {
 
       const derivedSizeStock = explicitSizeStockTotal > 0
         ? normalizedSizeStock
-        : selectedSizes.map((size, index) => ({
-            size,
-            stock: Math.max(0, Math.floor(resolvedStock / selectedSizes.length) + (index < (resolvedStock % selectedSizes.length) ? 1 : 0)),
-          }));
+        : selectedSizes.map((size, index) => {
+            const stockAmount = Math.max(0, Math.floor(resolvedStock / selectedSizes.length) + (index < (resolvedStock % selectedSizes.length) ? 1 : 0));
+            return {
+              size,
+              stock: stockAmount,
+              left: stockAmount,
+              sold: 0,
+            };
+          });
 
       const originalPriceValue = Number(fd.get('original_price'));
       const isOnSale = Boolean(fd.get('on_sale'));
@@ -1795,7 +1978,7 @@ const App: React.FC = () => {
                 <p className="text-[10px] font-bold uppercase text-gray-500">Financial Breakdown (Database)</p>
                 <h3 className="text-sm md:text-base font-black uppercase text-gray-900">Revenue & Net Profit Per Product</h3>
               </div>
-              <span className="text-[10px] bg-gray-900 text-white px-3 py-1 rounded-full font-bold uppercase">{financialMetrics.length} Items</span>
+              <span className="text-[10px] bg-gray-900 text-white px-3 py-1 rounded-full font-bold uppercase">{displayFinancialMetrics.length} Items</span>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-left text-[11px] min-w-[900px]">
@@ -1811,7 +1994,7 @@ const App: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {financialMetrics.map((row) => (
+                  {displayFinancialMetrics.map((row) => (
                     <tr key={row.productId} className="hover:bg-gray-50 transition-colors">
                       <td className="p-3 font-bold text-gray-700">{row.productId}</td>
                       <td className="p-3 font-semibold text-gray-900">{row.productName}</td>
@@ -1822,9 +2005,9 @@ const App: React.FC = () => {
                       <td className={`p-3 font-bold ${row.netProfit >= 0 ? 'text-green-700' : 'text-red-600'}`}>${row.netProfit.toFixed(2)}</td>
                     </tr>
                   ))}
-                  {financialMetrics.length === 0 && (
+                  {displayFinancialMetrics.length === 0 && (
                     <tr>
-                      <td colSpan={7} className="p-6 text-center text-gray-500">No financial data yet — run the SQL in Supabase to backfill.</td>
+                      <td colSpan={7} className="p-6 text-center text-gray-500">No products available yet.</td>
                     </tr>
                   )}
                 </tbody>
@@ -1905,6 +2088,7 @@ const App: React.FC = () => {
                     <th className="p-3">Stock</th>
                     <th className="p-3">Items left (set)</th>
                     <th className="p-3">Items_Sold</th>
+                    <th className="p-3">Size Breakdown</th>
                     <th className="p-3">Status</th>
                     <th className="p-3">Pictures</th>
                     <th className="p-3">Description</th>
@@ -1913,9 +2097,12 @@ const App: React.FC = () => {
                 </thead>
                 <tbody className="divide-y">
                   {pagedInventoryProducts.map(p => {
-                    const stockStatus = p.pieces <= 0 ? 'Out of Stock' : p.pieces < 10 ? 'Low Stock' : 'Healthy';
+                    const totals = getProductStockTotals(p);
+                    const computedLeft = totals.left;
+                    const stockStatus = computedLeft <= 0 ? 'Out of Stock' : computedLeft < 10 ? 'Low Stock' : 'Healthy';
                     const normalizedStatus = (p.status === 'Temporary Not Available' || p.status === 'Temporarily unavailable') ? 'Out of Stock' : (p.status || stockStatus);
                     const rowColors = getProductColorTokens(p);
+                    const sizeBreakdown = normalizeSizeStockEntries(p);
                     return (
                       <tr key={p.Product_ID} className="hover:bg-gray-50 transition-colors">
                         <td className="p-3 font-bold text-gray-700">{p.Product_ID}</td>
@@ -1940,11 +2127,24 @@ const App: React.FC = () => {
                         </td>
                         <td className="p-3 text-gray-700">${p.cost}</td>
                         <td className="p-3 font-bold text-gray-900">${p.price}</td>
-                        <td className="p-3 text-gray-700">{p.initialStock}</td>
+                        <td className="p-3 text-gray-700">{totals.stock}</td>
                         <td className="p-3 font-bold text-orange-600">
-                          {p.pieces}
+                          {computedLeft}
                         </td>
-                        <td className="p-3 text-blue-600 font-bold">{p.sold}</td>
+                        <td className="p-3 text-blue-600 font-bold">{totals.sold}</td>
+                        <td className="p-3 text-gray-700">
+                          {sizeBreakdown.length > 0 ? (
+                            <div className="flex flex-col gap-1">
+                              {sizeBreakdown.map((entry) => (
+                                <span key={`${p.Product_ID}-${entry.size}`} className="text-[10px] font-bold">
+                                  {entry.size}: {entry.left} left
+                                </span>
+                              ))}
+                            </div>
+                          ) : (
+                            <span className="text-[10px] text-gray-400">-</span>
+                          )}
+                        </td>
                         <td className="p-3">
                           <span className={`px-2 py-1 rounded text-[10px] font-bold uppercase ${normalizedStatus === 'Out of Stock' ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>
                             {normalizedStatus}
@@ -1952,8 +2152,8 @@ const App: React.FC = () => {
                         </td>
                         <td className="p-3">
                           <div className="flex items-center gap-2">
-                            <div className="w-9 h-9 rounded border overflow-hidden bg-gray-50">
-                                <SafeImage src={p.image} className="w-full h-full object-cover" alt={p.name} />
+                            <div className="w-9 h-9 rounded border overflow-hidden bg-gray-50 flex items-center justify-center">
+                                <SafeImage src={p.image} className="w-full h-full object-contain p-0.5" alt={p.name} />
                               </div>
                             <span className="text-[10px] text-gray-500 max-w-[180px] truncate">{p.image || '-'}</span>
                           </div>
@@ -2270,10 +2470,23 @@ const App: React.FC = () => {
             ) : orders.map(o => (
               <div key={o.id} className="p-4 border rounded-2xl bg-white hover:shadow-2xl transition-all flex flex-col md:flex-row justify-between gap-4 border-gray-100">
                 <div className="flex-1">
+                  {(() => {
+                    const normalizedStatus = normalizeOrderStatus(o.status);
+                    const statusLabel = normalizedStatus === 'dispatched' ? 'dispatched' : normalizedStatus;
+                    const statusClasses = normalizedStatus === 'pending'
+                      ? 'bg-orange-100 text-orange-600'
+                      : normalizedStatus === 'dispatched'
+                        ? 'bg-blue-100 text-blue-600'
+                        : normalizedStatus === 'canceled'
+                          ? 'bg-red-100 text-red-700'
+                          : 'bg-green-100 text-green-700';
+                    return (
                   <div className="flex items-center gap-4 mb-6">
                     <span className="font-black uppercase text-2xl tracking-tighter italic text-black">{o.customerName}</span>
-                    <span className={`text-[9px] px-5 py-2 rounded-full font-black uppercase tracking-[0.2em] ${o.status === 'pending' ? 'bg-orange-100 text-orange-600' : o.status === 'shipped' ? 'bg-blue-100 text-blue-600' : o.status === 'cancelled' ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>{o.status === 'shipped' ? 'dispatched' : o.status}</span>
+                    <span className={`text-[9px] px-5 py-2 rounded-full font-black uppercase tracking-[0.2em] ${statusClasses}`}>{statusLabel}</span>
                   </div>
+                    );
+                  })()}
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-8">
                     <p className="flex items-center gap-2 bg-gray-50 p-3 rounded-2xl border text-[10px] font-black uppercase text-gray-500"><Phone size={14} className="text-orange-600" /> {o.customerPhone}</p>
                     <p className="flex items-center gap-2 bg-gray-50 p-3 rounded-2xl border text-[10px] font-black uppercase text-gray-500"><Mail size={14} className="text-orange-600" /> {o.customerEmail}</p>
@@ -2306,29 +2519,99 @@ const App: React.FC = () => {
                     <p className="text-[8px] text-gray-500 mt-1 font-bold uppercase">{new Date(o.date).toLocaleDateString()}</p>
                   </div>
                   <div className="flex flex-col gap-2 w-full mt-4">
-                    {o.status === 'pending' && (
-                      <button onClick={async () => {
+                    <button
+                      type="button"
+                      disabled={normalizeOrderStatus(o.status) !== 'pending' || dispatchingOrderIds.has(o.id) || cancelingOrderIds.has(o.id)}
+                      onClick={async () => {
+                        if (normalizeOrderStatus(o.status) !== 'pending') return;
+                        if (!beginOrderDispatch(o.id)) return;
+
+                        let dispatchSucceeded = false;
                         try {
-                          await updateOrderStatus(o.id, 'shipped');
-                          const [refreshedOrders, refreshedProducts, refreshedMetrics, refreshedTotals] = await Promise.all([
-                            getOrders(),
-                            getProducts(),
-                            recalculateFinancialMetrics(),
-                            getFinancialDashboardTotals(),
-                          ]);
-                          setOrders(refreshedOrders);
-                          setProducts(refreshedProducts);
-                          setFinancialMetrics(refreshedMetrics);
-                          setFinancialTotals(refreshedTotals);
+                          await updateOrderStatus(o.id, 'dispatched');
+                          dispatchSucceeded = true;
+
+                          // Keep the UI consistent even if refresh fails after a successful dispatch.
+                          setOrders((prev) => prev.map((order) => (
+                            order.id === o.id ? { ...order, status: 'dispatched' } : order
+                          )));
+
+                          try {
+                            const [refreshedOrders, refreshedProducts, refreshedMetrics, refreshedTotals] = await Promise.all([
+                              getOrders(),
+                              getProducts(),
+                              recalculateFinancialMetrics(),
+                              getFinancialDashboardTotals(),
+                            ]);
+                            setOrders(refreshedOrders);
+                            setProducts(refreshedProducts);
+                            setFinancialMetrics(refreshedMetrics);
+                            setFinancialTotals(refreshedTotals);
+                          } catch (refreshError) {
+                            console.error('Dispatch succeeded but refresh failed:', refreshError);
+                          }
                         } catch (error) {
                           console.error('Error updating order status:', error);
                           const message = error instanceof Error
                             ? error.message
-                            : String((error as any)?.message || (error as any)?.details || (error as any)?.hint || 'Failed to update order status. Please try again.');
+                            : String((error as any)?.message || (error as any)?.details || (error as any)?.hint || 'Failed to dispatch order. Please try again.');
                           alert(message);
+                        } finally {
+                          endOrderDispatch(o.id);
+                          if (!dispatchSucceeded) {
+                            // Nothing else required: pending orders become clickable again after lock is released.
+                          }
                         }
-                      }} className="w-full bg-orange-600 text-white px-6 py-4 rounded-2xl text-[11px] font-black uppercase tracking-widest hover:bg-orange-700 transition-all shadow-xl shadow-orange-600/20">Approve / Dispatch Order</button>
-                    )}
+                      }}
+                      className={`w-full px-6 py-4 rounded-2xl text-[11px] font-black uppercase tracking-widest transition-all shadow-xl ${normalizeOrderStatus(o.status) === 'pending' && !dispatchingOrderIds.has(o.id) && !cancelingOrderIds.has(o.id) ? 'bg-orange-600 text-white hover:bg-orange-700 shadow-orange-600/20' : 'bg-gray-200 text-gray-500 cursor-not-allowed shadow-transparent'}`}
+                    >
+                      {dispatchingOrderIds.has(o.id)
+                        ? 'Dispatching...'
+                        : normalizeOrderStatus(o.status) === 'dispatched'
+                          ? 'Dispatched'
+                          : 'Dispatch Order'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={normalizeOrderStatus(o.status) !== 'pending' || cancelingOrderIds.has(o.id) || dispatchingOrderIds.has(o.id)}
+                      onClick={async () => {
+                        if (normalizeOrderStatus(o.status) !== 'pending') return;
+                        if (!beginOrderCancel(o.id)) return;
+
+                        try {
+                          await updateOrderStatus(o.id, 'canceled');
+                          setOrders((prev) => prev.map((order) => (
+                            order.id === o.id ? { ...order, status: 'canceled' } : order
+                          )));
+
+                          try {
+                            const [refreshedOrders, refreshedProducts, refreshedMetrics, refreshedTotals] = await Promise.all([
+                              getOrders(),
+                              getProducts(),
+                              recalculateFinancialMetrics(),
+                              getFinancialDashboardTotals(),
+                            ]);
+                            setOrders(refreshedOrders);
+                            setProducts(refreshedProducts);
+                            setFinancialMetrics(refreshedMetrics);
+                            setFinancialTotals(refreshedTotals);
+                          } catch (refreshError) {
+                            console.error('Cancel succeeded but refresh failed:', refreshError);
+                          }
+                        } catch (error) {
+                          console.error('Error canceling order:', error);
+                          const message = error instanceof Error
+                            ? error.message
+                            : String((error as any)?.message || (error as any)?.details || (error as any)?.hint || 'Failed to cancel order. Please try again.');
+                          alert(message);
+                        } finally {
+                          endOrderCancel(o.id);
+                        }
+                      }}
+                      className={`w-full px-6 py-4 rounded-2xl text-[11px] font-black uppercase tracking-widest transition-all shadow-xl border ${normalizeOrderStatus(o.status) === 'pending' && !cancelingOrderIds.has(o.id) && !dispatchingOrderIds.has(o.id) ? 'bg-white text-red-600 border-red-200 hover:bg-red-50 shadow-red-600/10' : 'bg-gray-200 text-gray-500 cursor-not-allowed shadow-transparent border-transparent'}`}
+                    >
+                      {cancelingOrderIds.has(o.id) ? 'Canceling...' : 'Cancel Order'}
+                    </button>
                     <button onClick={async () => { 
                       if(confirm('Erase this distribution record?')) {
                         try {
@@ -2360,6 +2643,8 @@ const App: React.FC = () => {
     const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
       e.preventDefault();
       setIsProcessing(true);
+      const form = e.currentTarget;
+      const fd = new FormData(form);
 
       const checkoutItems = [...cart];
 
@@ -2370,9 +2655,6 @@ const App: React.FC = () => {
       }
 
       for (const item of checkoutItems) {
-        const expMs = item.expiresAt ? new Date(item.expiresAt).getTime() : 0;
-        if (expMs > Date.now()) continue;
-
         if (!item.reservationId) {
           setCart(prev => prev.filter((it) => !(it.Product_ID === item.Product_ID && it.selectedSize === item.selectedSize)));
           setCartNotice('Some items in your cart have expired.');
@@ -2381,7 +2663,7 @@ const App: React.FC = () => {
           return;
         }
 
-        const extension = await extendExpiredReservation(item.reservationId, undefined, 120);
+        const extension = await extendExpiredReservation(item.reservationId, undefined, 180);
         if (!extension.ok || !extension.expiresAt) {
           await releaseCartLineReservation(item.reservationId);
           setCart(prev => prev.filter((it) => !(it.Product_ID === item.Product_ID && it.selectedSize === item.selectedSize)));
@@ -2399,7 +2681,6 @@ const App: React.FC = () => {
         return refreshed ? { ...item, expiresAt: refreshed.expiresAt } : item;
       }));
 
-      const fd = new FormData(e.currentTarget);
       const order: Order = {
         id: `ORD-${Date.now()}`,
         customerName: fd.get('name') as string,
@@ -2838,15 +3119,20 @@ const App: React.FC = () => {
                       {activeProduct.sizes.map((size) => {
                         const sizeStock = getSizeStock(activeProduct, size);
                         const isSelected = productDetailSelectedSize === size;
-                        const isUnavailable = sizeStock <= 0;
+                        const isUnavailable = sizeStock <= 0 || !isProductPurchasableForCustomer(activeProduct);
                         return (
                           <button key={size} type="button" onClick={() => { if (!isUnavailable) { setProductDetailSelectedSize(size); setProductDetailQuantity(1); } }} disabled={isUnavailable} className={`rounded-xl border px-3 py-3 text-[11px] font-black uppercase tracking-widest transition-all ${isSelected ? 'bg-black text-white border-black' : isUnavailable ? 'bg-gray-50 text-gray-300 border-gray-100 cursor-not-allowed' : 'bg-white text-gray-700 border-gray-200 hover:border-orange-500'}`}>
                             <span className="block">{size}</span>
-                            <span className="mt-1 block text-[9px] font-bold normal-case tracking-normal">{sizeStock > 0 ? `${sizeStock} left` : 'Unavailable'}</span>
+                            <span className="mt-1 block text-[9px] font-bold normal-case tracking-normal">{sizeStock > 0 ? `${sizeStock} left` : 'Out of stock'}</span>
                           </button>
                         );
                       })}
                     </div>
+                    {!isProductPurchasableForCustomer(activeProduct) && (
+                      <p className="mt-3 text-[10px] font-black uppercase tracking-[0.18em] text-red-500">
+                        This product is currently unavailable.
+                      </p>
+                    )}
                   </div>
 
                   {productDetailSelectedSize && (
@@ -2905,7 +3191,7 @@ const App: React.FC = () => {
 
                   <div className="flex gap-3">
                     <button type="button" onClick={() => { setView('shop'); setSelectedProductId(null); window.scrollTo(0, 0); }} className="px-5 py-3 rounded-full border border-gray-200 font-black uppercase tracking-widest text-[10px] text-gray-600 hover:border-black hover:text-black transition-colors">Back</button>
-                    <button type="button" disabled={!productDetailSelectedSize || getSizeStock(activeProduct, productDetailSelectedSize) <= 0} onClick={async () => {
+                    <button type="button" disabled={!productDetailSelectedSize || getSizeStock(activeProduct, productDetailSelectedSize) <= 0 || !isProductPurchasableForCustomer(activeProduct)} onClick={async () => {
                       if (!productDetailSelectedSize) return;
                       const added = await addToCart(activeProduct, productDetailSelectedSize, productDetailQuantity);
                       if (added) setView('cart');

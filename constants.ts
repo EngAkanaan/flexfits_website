@@ -57,5 +57,21 @@ export const SIZE_OPTIONS = {
 
 export const INITIAL_PRODUCTS: Product[] = [];
 
-export const ADMIN_USER = 'AdamFlex';
-export const ADMIN_PASS = 'Akanaan2025';
+export const DELIVERY_FEE = 5;
+
+export const ADMIN_CREDENTIALS = [
+  {
+    name: 'Adam Kanaan (Co-Founder)',
+    username: 'AdamFlex',
+    password: 'Kanaan20044',
+  },
+  {
+    name: 'Rashed Mrad (Co-Founder)',
+    username: 'RashedFlex',
+    password: 'Mrad20043',
+  },
+] as const;
+
+export const ADMIN_USER = ADMIN_CREDENTIALS[0].username;
+export const ADMIN_PASS = ADMIN_CREDENTIALS[0].password;
+
