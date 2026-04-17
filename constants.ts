@@ -57,8 +57,6 @@ export const SIZE_OPTIONS = {
 
 export const INITIAL_PRODUCTS: Product[] = [];
 
-export const DELIVERY_FEE = 5;
-
 export const ADMIN_CREDENTIALS = [
   {
     name: 'Adam Kanaan (Co-Founder)',

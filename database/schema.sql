@@ -51,6 +51,7 @@ CREATE TABLE order_items (
   quantity INTEGER NOT NULL,
   size TEXT NOT NULL,
   price DECIMAL(10, 2) NOT NULL,
+  reservation_id UUID,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 

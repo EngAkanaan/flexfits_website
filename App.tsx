@@ -2,11 +2,12 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback, useDeferredValue } from 'react';
 import { ShoppingBag, User, Search, Filter, Trash2, Plus, LogOut, ChevronRight, CheckCircle, Package, BarChart3, Menu, X, Star, ExternalLink, Edit2, Upload, Phone, MapPin, Truck, Check, Mail, List, Layers, Info } from 'lucide-react';
 import { Category, Product, ProductGender, ProductSizeStock, Order, CartItem, FinancialMetric, FinancialTotals, View } from './types';
-import { INITIAL_PRODUCTS, ADMIN_CREDENTIALS, ADMIN_USER, ADMIN_PASS, DELIVERY_FEE, LEBANON_LOCATIONS, SIZE_OPTIONS } from './constants';
+import { INITIAL_PRODUCTS, ADMIN_CREDENTIALS, ADMIN_USER, ADMIN_PASS, LEBANON_LOCATIONS, SIZE_OPTIONS } from './constants';
 import { getProductRecommendation } from './services/gemini';
 import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals, reserveCartLine, releaseCartLineReservation, cleanupExpiredReservations, extendExpiredReservation, getProductColorTokens, uploadProductImagesToStorage, normalizeOrderStatus } from './services/database';
 
 const BRAND_LOGO_SRC = '/flex-logo.JPG';
+const DELIVERY_FEE = 5;
 const GENDER_OPTIONS: ProductGender[] = ['Men', 'Women', 'Unisex'];
 const NUMERIC_SIZE_FILTER_OPTIONS = Array.from({ length: 16 }, (_, i) => String(35 + i));
 const CLOTHING_SIZE_FILTER_OPTIONS = ['S', 'M', 'L', 'XL'];
@@ -212,9 +213,7 @@ function normalizeSizeStockEntries(product: Product): ProductSizeStock[] {
           0,
           Math.floor(
             Number(
-              entry?.stock
-              ?? (Math.max(0, Math.floor(Number(entry?.left || 0))) + Math.max(0, Math.floor(Number(entry?.sold || 0))))
-              ?? 0
+              entry?.stock || 0
             )
           )
         ),
@@ -223,10 +222,7 @@ function normalizeSizeStockEntries(product: Product): ProductSizeStock[] {
           0,
           Math.floor(
             Number(
-              entry?.left
-              ?? entry?.Left
-              ?? (Math.max(0, Math.floor(Number(entry?.stock || 0))) - Math.max(0, Math.floor(Number(entry?.sold || 0))))
-              ?? 0
+              entry?.left || 0
             )
           )
         ),
@@ -1423,7 +1419,7 @@ const App: React.FC = () => {
     const [formStock, setFormStock] = useState<number | ''>('');
     const [formSold, setFormSold] = useState<number | ''>('');
     const [inventorySection, setInventorySection] = useState<InventorySection>('All');
-    const [inventorySort, setInventorySort] = useState<{ col: 'id' | 'productName' | 'category'; dir: 'asc' | 'desc' } | null>(null);
+    const [inventorySort, setInventorySort] = useState<{ col: 'Product_ID' | 'productName' | 'category'; dir: 'asc' | 'desc' } | null>(null);
     const [financialMetrics, setFinancialMetrics] = useState<FinancialMetric[]>([]);
     const [financialTotals, setFinancialTotals] = useState<FinancialTotals | null>(null);
     const [dispatchingOrderIds, setDispatchingOrderIds] = useState<Set<string>>(new Set());
@@ -1437,7 +1433,7 @@ const App: React.FC = () => {
 
     const cycleSort = (col: 'Product_ID' | 'productName' | 'category') => {
       setInventorySort(prev =>
-        prev?.col !== col ? { col, dir: 'asc' }
+        prev?.col !== col || !prev ? { col, dir: 'asc' }
         : prev.dir === 'asc' ? { col, dir: 'desc' }
         : null
       );
@@ -3230,7 +3226,7 @@ const App: React.FC = () => {
               </div>
 
               <div className="flex-1 space-y-8 min-w-0">
-              {filterCategory === 'ComingSoon' ? (
+              {products.some((product) => /t-?shirt|hoodie/i.test(product.type)) && filteredProducts.length === 0 ? (
                 <div className="min-h-[60vh] flex items-center justify-center">
                   <div className="text-center px-8 py-24 bg-white rounded-3xl border-2 border-dashed border-orange-600 shadow-xl">
                     <div className="text-6xl mb-6">👕🧥</div>

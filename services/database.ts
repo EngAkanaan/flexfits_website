@@ -33,7 +33,7 @@ type EmailLogStatus = 'success' | 'failed' | 'fallback-unknown';
 type EmailDeliveryLog = {
   id: string;
   ts: string;
-  event: 'order_created_admin' | 'order_received_customer' | 'order_dispatched_customer';
+  event: 'order_created_admin' | 'order_received_customer' | 'order_dispatched_customer' | 'order_canceled_customer';
   toEmail: string;
   subject: string;
   orderId: string;
@@ -64,6 +64,102 @@ function pushEmailLog(entry: EmailDeliveryLog): void {
 
 function formatMoney(value: number): string {
   return `$${Math.max(0, Number(value || 0)).toFixed(2)}`;
+}
+
+export function normalizeOrderStatus(value: unknown): Order['status'] {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'dispatched' || normalized === 'shipped') return 'dispatched';
+  if (normalized === 'canceled' || normalized === 'cancelled') return 'canceled';
+  if (normalized === 'delivered') return 'delivered';
+  return 'pending';
+}
+
+function persistOrderStatusForDatabase(value: unknown): string {
+  const normalized = normalizeOrderStatus(value);
+  if (normalized === 'dispatched') return 'shipped';
+  if (normalized === 'canceled') return 'cancelled';
+  return normalized;
+}
+
+function normalizeInventoryStatusToken(value: unknown): string {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'temporary not available' || normalized === 'temporarily unavailable') return 'out of stock';
+  return normalized;
+}
+
+function isManualMerchandisingStatus(value: unknown): boolean {
+  const normalized = normalizeInventoryStatusToken(value);
+  return normalized === 'discontinued' || normalized === 'coming soon';
+}
+
+function deriveAvailabilityStatusFromLeft(left: number): string {
+  return left <= 0 ? 'Out of Stock' : 'Active';
+}
+
+function resolveNextProductStatus(currentStatus: unknown, left: number): string {
+  if (isManualMerchandisingStatus(currentStatus)) {
+    return String(currentStatus || '').trim();
+  }
+  return deriveAvailabilityStatusFromLeft(Math.max(0, Math.floor(Number(left || 0))));
+}
+
+function getSizeStockSummary(entries: ProductSizeStock[]): { totalStock: number; totalSold: number; totalLeft: number } {
+  const totalStock = entries.reduce((sum, entry) => sum + Math.max(0, Math.floor(Number(entry.stock || 0))), 0);
+  const totalSold = entries.reduce((sum, entry) => sum + Math.max(0, Math.floor(Number(entry.sold || 0))), 0);
+  const totalLeft = entries.reduce((sum, entry) => sum + Math.max(0, Math.floor(Number(entry.left || 0))), 0);
+  return { totalStock, totalSold, totalLeft };
+}
+
+function applyLocalProductStockDelta(product: Product, size: string, quantityDelta: number): Product {
+  const normalizedSize = String(size || '').trim();
+  const delta = Math.trunc(Number(quantityDelta));
+  if (!normalizedSize || !Number.isFinite(delta) || delta === 0) return product;
+
+  const sizeEntries = normalizeSizeStockFromRow({ size_stock: Array.isArray(product.sizeStock) ? product.sizeStock : [] });
+  const hasSizeStock = sizeEntries.length > 0;
+
+  if (hasSizeStock) {
+    const matchIndex = sizeEntries.findIndex((entry) => String(entry.size || '').trim().toUpperCase() === normalizedSize.toUpperCase());
+    if (matchIndex < 0) return product;
+
+    const nextEntries = sizeEntries.map((entry, index) => {
+      if (index !== matchIndex) return entry;
+      const stock = Math.max(0, Math.floor(Number(entry.stock || 0)));
+      const nextLeft = Math.max(0, Math.min(stock, Math.floor(Number(entry.left || 0)) + delta));
+      return { ...entry, left: nextLeft };
+    });
+
+    const nextSummary = getSizeStockSummary(nextEntries);
+
+    return {
+      ...product,
+      initialStock: nextSummary.totalStock,
+      pieces: nextSummary.totalLeft,
+      sold: nextSummary.totalSold,
+      sizeStock: nextEntries,
+      status: resolveNextProductStatus(product.status, nextSummary.totalLeft),
+    };
+  }
+
+  const nextPieces = Math.max(0, Math.floor(Number(product.pieces || 0)) + delta);
+  const nextSold = Math.max(0, Math.floor(Number(product.sold || 0)) - delta);
+
+  return {
+    ...product,
+    pieces: nextPieces,
+    sold: nextSold,
+    status: resolveNextProductStatus(product.status, nextPieces),
+  };
+}
+
+function normalizeLocalProductStockFromReservations(products: Product[], reservations: Array<{ productId: string; size: string; quantity: number }>): Product[] {
+  const nextProducts = products.map((product) => ({ ...product, sizeStock: Array.isArray(product.sizeStock) ? product.sizeStock.map((entry) => ({ ...entry })) : product.sizeStock }));
+  for (const reservation of reservations) {
+    const productIndex = nextProducts.findIndex((item) => String(item.Product_ID || '').trim() === String(reservation.productId || '').trim());
+    if (productIndex < 0) continue;
+    nextProducts[productIndex] = applyLocalProductStockDelta(nextProducts[productIndex], reservation.size, -Math.max(0, Math.floor(Number(reservation.quantity || 0))));
+  }
+  return nextProducts;
 }
 
 function escapeHtml(value: string): string {
@@ -557,6 +653,38 @@ async function notifyCustomerOrderDispatched(order: Order): Promise<void> {
   });
 }
 
+async function notifyCustomerOrderCanceled(order: Order): Promise<void> {
+  if (!order.customerEmail) return;
+
+  const items = await getItemsWithProductImages(order.items || []);
+  const html = buildOrderEmailHtml(
+    order,
+    items,
+    'Order Canceled',
+    'Your order has been canceled. The order details are included below for your reference.'
+  );
+
+  await sendEmailEvent({
+    event: 'order_canceled_customer',
+    toEmail: order.customerEmail,
+    subject: `Your Flex Fits order ${order.id} has been canceled`,
+    html,
+    order,
+    items,
+  });
+}
+
+function normalizeOrderItems(items: Order['items']): Order['items'] {
+  return (items || []).map((item) => ({
+    ...item,
+    productId: String(item.productId || '').trim(),
+    productName: String(item.productName || '').trim(),
+    quantity: Math.max(0, Math.floor(Number(item.quantity || 0))),
+    size: String(item.size || '').trim(),
+    price: Math.max(0, Number(item.price || 0)),
+  }));
+}
+
 async function notifyCustomerOrderReceived(order: Order): Promise<void> {
   if (!order.customerEmail) return;
 
@@ -675,7 +803,7 @@ export async function reserveCartLine(payload: {
   quantity: number;
   existingReservationId?: string;
   sessionId?: string;
-}): Promise<{ ok: boolean; message: string; reservationId?: string; expiresAt?: string; availableAfter?: number }> {
+}): Promise<{ ok: boolean; message: string; reservationId?: string; expiresAt?: string; availableAfter?: number; reason?: 'size_out_of_stock' | 'reserved_by_others' | 'unknown' }> {
   const sessionId = payload.sessionId || getReservationSessionId();
   const quantity = Math.max(1, Number(payload.quantity || 1));
 
@@ -687,18 +815,29 @@ export async function reserveCartLine(payload: {
       ? reservations.findIndex((row) => row.id === payload.existingReservationId && row.sessionId === sessionId && row.status === 'active')
       : -1;
 
-    const activeForProduct = reservations
-      .filter((row) => row.productId === payload.productId && row.status === 'active' && new Date(row.expiresAt).getTime() > now.getTime())
+    const activeForSize = reservations
+      .filter((row) => row.productId === payload.productId && row.status === 'active' && String(row.size || '').trim().toUpperCase() === String(payload.size || '').trim().toUpperCase() && new Date(row.expiresAt).getTime() > now.getTime())
       .reduce((sum, row) => sum + Math.max(0, Number(row.quantity || 0)), 0);
 
     const savedProducts = localStorage.getItem('flex_products');
     const products = savedProducts ? JSON.parse(savedProducts) : [];
     const product = (products || []).find((p: Product) => p.Product_ID === payload.productId);
-    const baseStock = Math.max(0, Number((product as any)?.pieces || 0));
+    const normalizedSize = String(payload.size || '').trim();
+    const sizeEntries = normalizeSizeStockFromRow({ size_stock: Array.isArray((product as any)?.sizeStock) ? (product as any).sizeStock : [] });
+    const matchedSize = sizeEntries.find((entry) => String(entry.size || '').trim().toUpperCase() === normalizedSize.toUpperCase());
+    const baseStock = matchedSize
+      ? Math.max(0, Number(matchedSize.left ?? matchedSize.stock ?? 0))
+      : sizeEntries.length > 0
+        ? 0
+        : Math.max(0, Number((product as any)?.pieces || 0));
     const currentExistingQty = existingIndex >= 0 ? Math.max(0, Number(reservations[existingIndex].quantity || 0)) : 0;
-    const reservedOthers = Math.max(0, activeForProduct - currentExistingQty);
+    const reservedOthers = Math.max(0, activeForSize - currentExistingQty);
     if (baseStock - reservedOthers < quantity) {
-      return { ok: false, message: 'Reserved by another shopper. Please reduce quantity.', availableAfter: Math.max(0, baseStock - reservedOthers) };
+      const availableAfter = Math.max(0, baseStock - reservedOthers);
+      if (baseStock <= 0) {
+        return { ok: false, message: `Size ${payload.size} is currently out of stock.`, availableAfter, reason: 'size_out_of_stock' };
+      }
+      return { ok: false, message: 'Reserved by another shopper. Please reduce quantity.', availableAfter, reason: 'reserved_by_others' };
     }
 
     if (existingIndex >= 0) {
@@ -754,18 +893,31 @@ export async function reserveCartLine(payload: {
 
   if (error) {
     console.error('reserve_product_stock_fcfs error:', error);
-    return { ok: false, message: 'Unable to reserve stock right now. Please retry.' };
+    return { ok: false, message: 'Unable to reserve stock right now. Please retry.', reason: 'unknown' };
   }
 
   const row = Array.isArray(data) ? data[0] : data;
   if (!row) return { ok: false, message: 'No reservation result received.' };
 
+  const ok = Boolean(row.ok);
+  const availableAfter = row.available_after !== undefined && row.available_after !== null ? Math.max(0, Number(row.available_after)) : undefined;
+  const rawMessage = String(row.message || (ok ? 'Reserved successfully.' : 'Reservation failed.'));
+  const messageLower = rawMessage.toLowerCase();
+  const reason: 'size_out_of_stock' | 'reserved_by_others' | 'unknown' = ok
+    ? 'unknown'
+    : (availableAfter === 0 || messageLower.includes('out of stock') || messageLower.includes('unavailable'))
+      ? 'size_out_of_stock'
+      : (messageLower.includes('reserved') || messageLower.includes('another shopper') || messageLower.includes('reduce quantity'))
+        ? 'reserved_by_others'
+        : 'unknown';
+
   return {
-    ok: Boolean(row.ok),
-    message: String(row.message || (row.ok ? 'Reserved successfully.' : 'Reservation failed.')),
+    ok,
+    message: rawMessage,
     reservationId: row.reservation_id ? String(row.reservation_id) : undefined,
     expiresAt: row.expires_at ? String(row.expires_at) : undefined,
-    availableAfter: row.available_after !== undefined && row.available_after !== null ? Math.max(0, Number(row.available_after)) : undefined,
+    availableAfter,
+    reason,
   };
 }
 
@@ -835,7 +987,7 @@ export async function extendExpiredReservation(reservationId: string, sessionId:
 }
 
 export async function commitCheckoutReservations(orderId: string, reservationIds: string[], sessionId: string = getReservationSessionId()): Promise<void> {
-  const ids = reservationIds.map((v) => String(v || '').trim()).filter(Boolean);
+  const ids = Array.from(new Set(reservationIds.map((v) => String(v || '').trim()).filter(Boolean)));
   if (ids.length === 0) {
     throw new Error('Some items in your cart have expired.');
   }
@@ -843,12 +995,26 @@ export async function commitCheckoutReservations(orderId: string, reservationIds
   if (!supabase) {
     const nowIso = new Date().toISOString();
     const rows = readLocalReservations();
+    const matching = rows.filter((row) => ids.includes(row.id) && row.sessionId === sessionId && row.status === 'active' && new Date(row.expiresAt).getTime() > Date.now());
+    if (matching.length !== ids.length) {
+      throw new Error('Some items in your cart have expired.');
+    }
+
+    const savedProducts = localStorage.getItem('flex_products');
+    const products: Product[] = savedProducts ? JSON.parse(savedProducts) : [];
+    const nextProducts = normalizeLocalProductStockFromReservations(
+      products,
+      matching.map((row) => ({ productId: row.productId, size: row.size, quantity: row.quantity }))
+    );
+
     const updated = rows.map((row) => {
-      if (ids.includes(row.id) && row.sessionId === sessionId && row.status === 'active' && new Date(row.expiresAt).getTime() > Date.now()) {
-        return { ...row, status: 'confirmed', orderId, confirmedAt: nowIso } as any;
+      if (!ids.includes(row.id) || row.sessionId !== sessionId || row.status !== 'active' || new Date(row.expiresAt).getTime() <= Date.now()) {
+        return row;
       }
-      return row;
+      return { ...row, status: 'confirmed', orderId, confirmedAt: nowIso } as any;
     });
+
+    localStorage.setItem('flex_products', JSON.stringify(nextProducts));
     writeLocalReservations(updated);
     return;
   }
@@ -861,7 +1027,23 @@ export async function commitCheckoutReservations(orderId: string, reservationIds
 
   if (error) {
     console.error('commit_checkout_reservations error:', error);
-    throw new Error('Some items in your cart have expired.');
+    const rawMessage = String((error as any)?.message || '').toLowerCase();
+    const rawDetails = String((error as any)?.details || '').toLowerCase();
+    const rawHint = String((error as any)?.hint || '').toLowerCase();
+    const isExpiredError =
+      rawMessage.includes('expired') ||
+      rawDetails.includes('expired') ||
+      rawHint.includes('expired');
+
+    if (isExpiredError) {
+      throw new Error('Some items in your cart have expired.');
+    }
+
+    const detail = String((error as any)?.details || '').trim();
+    const hint = String((error as any)?.hint || '').trim();
+    const message = String((error as any)?.message || 'Checkout stock commit failed.').trim();
+    const composed = [message, detail, hint].filter(Boolean).join(' | ');
+    throw new Error(composed || 'Checkout stock commit failed.');
   }
 
   const row = Array.isArray(data) ? data[0] : data;
@@ -946,10 +1128,19 @@ function normalizeSizeStockFromRow(p: any): ProductSizeStock[] {
       : [];
 
   return parsed
-    .map((entry) => ({
-      size: String(entry?.size ?? entry?.Size ?? entry?.label ?? '').trim(),
-      stock: Math.max(0, Math.floor(Number(entry?.stock ?? entry?.Stock ?? 0))),
-    }))
+    .map((entry) => {
+      const fallbackStock = Math.max(0, Math.floor(Number(entry?.left ?? entry?.Left ?? 0))) + Math.max(0, Math.floor(Number(entry?.sold ?? entry?.Sold ?? 0)));
+      const stock = Math.max(0, Math.floor(Number(entry?.stock ?? entry?.Stock ?? fallbackStock)));
+      const soldRaw = Math.max(0, Math.floor(Number(entry?.sold ?? entry?.Sold ?? 0)));
+      const sold = Math.min(stock, soldRaw);
+      const left = Math.max(0, stock - sold);
+      return {
+        size: String(entry?.size ?? entry?.Size ?? entry?.label ?? '').trim(),
+        stock,
+        left,
+        sold,
+      };
+    })
     .filter((entry) => entry.size);
 }
 
@@ -957,6 +1148,14 @@ function mapProductRowToAppProduct(p: any): Product {
   const colors = normalizeColorsFromRow(p);
   const images = normalizeImageListFromRow(p);
   const sizeStock = normalizeSizeStockFromRow(p);
+  const stockTotalFromColumns = Math.max(0, toNumberOrNull(p.Stock ?? p.stock ?? p.initial_stock) ?? 0);
+  const sizeSummary = getSizeStockSummary(sizeStock);
+  const soldFromColumns = Math.max(0, toNumberOrNull(p.Items_Sold ?? p.items_sold ?? p.sold) ?? 0);
+  const stockTotal = sizeStock.length > 0 ? sizeSummary.totalStock : stockTotalFromColumns;
+  const normalizedSold = sizeStock.length > 0 ? sizeSummary.totalSold : soldFromColumns;
+  const normalizedPieces = sizeStock.length > 0
+    ? sizeSummary.totalLeft
+    : Math.max(0, stockTotal - normalizedSold);
   const sizes = sizeStock.length > 0
     ? sizeStock.map((entry) => entry.size)
     : (p.SIZE ? String(p.SIZE).split(',').map((s: string) => s.trim()).filter(Boolean) : []) || p.sizes || [];
@@ -973,9 +1172,9 @@ function mapProductRowToAppProduct(p: any): Product {
     type: p.Type || p.type,
     price: toNumberOrNull(p.Price ?? p.price) ?? 0,
     cost: toNumberOrNull(p.Cost ?? p.cost) ?? 0,
-    initialStock: Math.max(0, toNumberOrNull(p.Stock ?? p.stock ?? p.initial_stock) ?? 0),
-    pieces: Math.max(0, toNumberOrNull(p.Items_LEFT_in_stock ?? p.items_left_in_stock ?? p.pieces) ?? toNumberOrNull(p.Stock ?? p.stock ?? p.initial_stock) ?? 0),
-    sold: Math.max(0, toNumberOrNull(p.Items_Sold ?? p.items_sold ?? p.sold) ?? 0),
+    initialStock: stockTotal,
+    pieces: normalizedPieces,
+    sold: normalizedSold,
     sizes,
     sizeStock,
     description: p.Description || p.description || '',
@@ -995,21 +1194,40 @@ async function subtractActiveReservationsFromProducts(products: Product[]): Prom
   try {
     const { data: reservationRows } = await supabase
       .from('stock_reservations')
-      .select('product_id,quantity')
+      .select('product_id,size,quantity')
       .eq('status', 'active')
       .gt('expires_at', new Date().toISOString());
 
-    const reservedByProduct = new Map<string, number>();
+    const reservedByProductAndSize = new Map<string, number>();
     for (const row of reservationRows || []) {
       const productId = String((row as any).product_id || '').trim();
+      const size = String((row as any).size || '').trim().toUpperCase();
       const qty = Math.max(0, Number((row as any).quantity || 0));
-      if (!productId || qty <= 0) continue;
-      reservedByProduct.set(productId, (reservedByProduct.get(productId) || 0) + qty);
+      if (!productId || !size || qty <= 0) continue;
+      const key = `${productId}::${size}`;
+      reservedByProductAndSize.set(key, (reservedByProductAndSize.get(key) || 0) + qty);
     }
 
     for (const product of products) {
-      const reserved = Math.max(0, reservedByProduct.get(String(product.Product_ID || '').trim()) || 0);
-      product.pieces = Math.max(0, Number(product.pieces || 0) - reserved);
+      const sizeEntries = normalizeSizeStockFromRow({ size_stock: Array.isArray(product.sizeStock) ? product.sizeStock : [] });
+      if (sizeEntries.length > 0) {
+        const nextEntries = sizeEntries.map((entry) => {
+          const key = `${String(product.Product_ID || '').trim()}::${String(entry.size || '').trim().toUpperCase()}`;
+          const reserved = Math.max(0, reservedByProductAndSize.get(key) || 0);
+          if (reserved <= 0) return entry;
+          return {
+            ...entry,
+            left: Math.max(0, Math.floor(Number(entry.left || 0)) - reserved),
+          };
+        });
+        product.sizeStock = nextEntries;
+        product.pieces = nextEntries.reduce((sum, entry) => sum + Math.max(0, Math.floor(Number(entry.left || 0))), 0);
+      } else {
+        const reserved = Math.max(0, Array.from(reservedByProductAndSize.entries())
+          .filter(([key]) => key.startsWith(`${String(product.Product_ID || '').trim()}::`))
+          .reduce((sum, [, qty]) => sum + qty, 0));
+        product.pieces = Math.max(0, Number(product.pieces || 0) - reserved);
+      }
     }
   } catch {
     // Keep product list available even if reservation table is not migrated yet.
@@ -1020,7 +1238,12 @@ export async function getProducts(): Promise<Product[]> {
   if (!supabase) {
     // Fallback to localStorage if Supabase not configured
     const saved = localStorage.getItem('flex_products');
-    return saved ? JSON.parse(saved) : [];
+    const products: Product[] = saved ? JSON.parse(saved) : [];
+    const reservations = readLocalReservations().filter((row) => row.status === 'active' && new Date(row.expiresAt).getTime() > Date.now());
+    return normalizeLocalProductStockFromReservations(
+      products,
+      reservations.map((row) => ({ productId: row.productId, size: row.size, quantity: row.quantity }))
+    );
   }
 
   try {
@@ -1082,9 +1305,16 @@ export async function saveProduct(product: Product): Promise<void> {
       throw new Error('Product_ID is required to save a product.');
     }
 
+    const normalizedSizeStock = normalizeSizeStockFromRow({ size_stock: Array.isArray(product.sizeStock) ? product.sizeStock : [] });
+    const sizeSummary = getSizeStockSummary(normalizedSizeStock);
+
     // Validate stock and items_sold
-    const stock = Math.floor(Number(product.initialStock));
-    const itemsSold = Math.floor(Number(product.sold));
+    const stock = normalizedSizeStock.length > 0
+      ? sizeSummary.totalStock
+      : Math.floor(Number(product.initialStock));
+    const itemsSold = normalizedSizeStock.length > 0
+      ? sizeSummary.totalSold
+      : Math.floor(Number(product.sold));
     if (
       !Number.isInteger(stock) ||
       !Number.isInteger(itemsSold) ||
@@ -1096,10 +1326,13 @@ export async function saveProduct(product: Product): Promise<void> {
     }
 
     // ENFORCE SYSTEM INVARIANT (Backend calculation is source of truth)
-    const computedPieces = stock - itemsSold;
+    const computedPieces = normalizedSizeStock.length > 0
+      ? sizeSummary.totalLeft
+      : stock - itemsSold;
     product.initialStock = stock;
     product.sold = itemsSold;
     product.pieces = computedPieces;
+    product.sizeStock = normalizedSizeStock;
 
     const basePayload: Record<string, unknown> = {
       Product_ID: productId,
@@ -1112,12 +1345,12 @@ export async function saveProduct(product: Product): Promise<void> {
       Stock: stock,
       Items_Sold: itemsSold,
       SIZE: product.sizes.join(','),
-      Status: product.status || 'Active',
+      Status: resolveNextProductStatus(product.status || 'Active', computedPieces),
       Pictures: product.images?.[0] || product.image,
       images: product.images && product.images.length > 0 ? product.images : [product.image].filter(Boolean),
       Description: product.description,
       colors: colors,
-      size_stock: Array.isArray(product.sizeStock) ? product.sizeStock : [],
+      size_stock: normalizedSizeStock,
       original_price: product.originalPrice ?? null,
       on_sale: Boolean(product.onSale),
     };
@@ -1284,8 +1517,6 @@ export async function saveProduct(product: Product): Promise<void> {
         price: product.price,
         cost: product.cost,
         initial_stock: product.initialStock,
-        pieces: product.pieces,
-        sold: product.sold,
         sizes: Array.isArray(product.sizes) && product.sizes.length > 0 ? product.sizes : [],
         description: product.description || '',
         image: product.image || '',
@@ -1300,8 +1531,6 @@ export async function saveProduct(product: Product): Promise<void> {
         Price: product.price,
         Cost: product.cost,
         initial_stock: product.initialStock,
-        pieces: product.pieces,
-        sold: product.sold,
         sizes: Array.isArray(product.sizes) && product.sizes.length > 0 ? product.sizes : [],
         Description: product.description || '',
         image: product.image || '',
@@ -1612,11 +1841,24 @@ export async function updateProductSizeStock(productId: string, size: string, qu
     const products: Product[] = saved ? JSON.parse(saved) : [];
     const product = products.find((item) => item.Product_ID === productId);
     if (product) {
-      const nextSizeStock = normalizeSizeStockFromRow({ size_stock: product.sizeStock || [] }).length > 0
-        ? (product.sizeStock || []).map((entry) => entry.size === normalizedSize ? { ...entry, stock: Math.max(0, entry.stock - delta) } : entry)
+      const normalizedEntries = normalizeSizeStockFromRow({ size_stock: product.sizeStock || [] });
+      const nextSizeStock = normalizedEntries.length > 0
+        ? normalizedEntries.map((entry) => {
+            if (String(entry.size || '').trim().toUpperCase() !== normalizedSize.toUpperCase()) return entry;
+            const stock = Math.max(0, Math.floor(Number(entry.stock || 0)));
+            const nextSold = Math.max(0, Math.min(stock, Math.floor(Number(entry.sold || 0)) + delta));
+            const nextLeft = Math.max(0, stock - nextSold);
+            return { ...entry, left: nextLeft, sold: nextSold };
+          })
         : product.sizeStock;
       product.sizeStock = nextSizeStock;
-      product.pieces = Math.max(0, Number(product.pieces || 0) - delta);
+      if (Array.isArray(nextSizeStock)) {
+        const summary = getSizeStockSummary(nextSizeStock);
+        product.initialStock = summary.totalStock;
+        product.pieces = summary.totalLeft;
+        product.sold = summary.totalSold;
+        product.status = resolveNextProductStatus(product.status, summary.totalLeft);
+      }
       localStorage.setItem('flex_products', JSON.stringify(products));
     }
     return;
@@ -1625,7 +1867,7 @@ export async function updateProductSizeStock(productId: string, size: string, qu
   try {
     const { data: product, error: fetchError } = await supabase
       .from('products')
-      .select('size_stock, pieces')
+      .select('size_stock')
       .eq('Product_ID', productId)
       .single();
 
@@ -1634,12 +1876,25 @@ export async function updateProductSizeStock(productId: string, size: string, qu
     }
 
     const currentEntries = normalizeSizeStockFromRow(product);
-    const nextEntries = currentEntries.map((entry) => entry.size === normalizedSize ? { ...entry, stock: Math.max(0, entry.stock - delta) } : entry);
-    const nextPieces = Math.max(0, Number((product as any).pieces || 0) - delta);
+    const nextEntries = currentEntries.map((entry) => {
+      if (String(entry.size || '').trim().toUpperCase() !== normalizedSize.toUpperCase()) return entry;
+      const stock = Math.max(0, Math.floor(Number(entry.stock || 0)));
+      const nextSold = Math.max(0, Math.min(stock, Math.floor(Number(entry.sold || 0)) + delta));
+      const nextLeft = Math.max(0, stock - nextSold);
+      return { ...entry, left: nextLeft, sold: nextSold };
+    });
+    const nextSummary = getSizeStockSummary(nextEntries);
 
     const { error } = await supabase
       .from('products')
-      .update({ size_stock: nextEntries, pieces: nextPieces })
+      .update({
+        Stock: nextSummary.totalStock,
+        size_stock: nextEntries,
+        Items_Sold: nextSummary.totalSold,
+        pieces: nextSummary.totalLeft,
+        sold: nextSummary.totalSold,
+        Status: resolveNextProductStatus((product as any).Status ?? (product as any).status ?? 'Active', nextSummary.totalLeft),
+      })
       .eq('Product_ID', productId);
 
     if (error) throw error;
@@ -1655,7 +1910,12 @@ export async function getOrders(): Promise<Order[]> {
   if (!supabase) {
     // Fallback to localStorage
     const saved = localStorage.getItem('flex_orders');
-    return saved ? JSON.parse(saved) : [];
+    const parsed = saved ? JSON.parse(saved) : [];
+    return (Array.isArray(parsed) ? parsed : []).map((order: any) => ({
+      ...order,
+      status: normalizeOrderStatus(order.status),
+      items: normalizeOrderItems(order.items || []),
+    }));
   }
 
   try {
@@ -1693,7 +1953,7 @@ export async function getOrders(): Promise<Order[]> {
             price: parseFloat(item.price),
           })),
           total: parseFloat(order.total),
-          status: order.status,
+          status: normalizeOrderStatus(order.status),
           date: order.date,
         };
       })
@@ -1715,10 +1975,28 @@ export async function saveOrder(order: Order): Promise<void> {
     // Fallback to localStorage
     const saved = localStorage.getItem('flex_orders');
     const orders = saved ? JSON.parse(saved) : [];
-    orders.unshift(order);
+    const normalizedOrder = {
+      ...order,
+      status: normalizeOrderStatus(order.status),
+      items: normalizeOrderItems(order.items || []),
+    };
+    orders.unshift(normalizedOrder);
     localStorage.setItem('flex_orders', JSON.stringify(orders));
-    await notifyAdminOrderCreated(order);
-    await notifyCustomerOrderReceived(order);
+    const reservationIds = (normalizedOrder.items || [])
+      .map((item) => String((item as any).reservationId || '').trim())
+      .filter(Boolean);
+
+    if (reservationIds.length > 0) {
+      try {
+        await commitCheckoutReservations(normalizedOrder.id, reservationIds);
+      } catch (reservationError) {
+        localStorage.setItem('flex_orders', JSON.stringify(orders.filter((entry: Order) => entry.id !== normalizedOrder.id)));
+        throw reservationError;
+      }
+    }
+
+    await notifyAdminOrderCreated(normalizedOrder);
+    await notifyCustomerOrderReceived(normalizedOrder);
     return;
   }
 
@@ -1736,7 +2014,7 @@ export async function saveOrder(order: Order): Promise<void> {
         village: order.village,
         address_details: order.addressDetails,
         total: order.total,
-        status: order.status,
+        status: persistOrderStatusForDatabase(order.status),
         date: order.date,
       })
       .select()
@@ -1786,21 +2064,27 @@ export async function saveOrder(order: Order): Promise<void> {
       console.log('SUCCESS: Order items inserted successfully:', itemsData);
     }
 
-    const reservationIds = (order.items || [])
+    const normalizedOrder = {
+      ...order,
+      status: normalizeOrderStatus(order.status),
+      items: normalizeOrderItems(order.items || []),
+    };
+
+    const reservationIds = (normalizedOrder.items || [])
       .map((item) => String((item as any).reservationId || '').trim())
       .filter(Boolean);
 
     if (reservationIds.length > 0) {
       try {
-        await commitCheckoutReservations(order.id, reservationIds);
+        await commitCheckoutReservations(normalizedOrder.id, reservationIds);
       } catch (reservationError) {
-        await supabase.from('orders').delete().eq('id', order.id);
+        await supabase.from('orders').delete().eq('id', normalizedOrder.id);
         throw reservationError;
       }
     }
 
-    await notifyAdminOrderCreated(order);
-    await notifyCustomerOrderReceived(order);
+    await notifyAdminOrderCreated(normalizedOrder);
+    await notifyCustomerOrderReceived(normalizedOrder);
   } catch (error) {
     console.error('CRITICAL: Error saving order to database:', error);
     if (error && typeof error === 'object') {
@@ -1818,46 +2102,66 @@ export async function saveOrder(order: Order): Promise<void> {
 
 export async function updateOrderStatus(
   orderId: string,
-  status: 'pending' | 'shipped' | 'delivered' | 'cancelled'
+  status: 'pending' | 'dispatched' | 'delivered' | 'canceled' | 'shipped' | 'cancelled'
 ): Promise<void> {
+  const normalizedStatus = normalizeOrderStatus(status);
+
   if (!supabase) {
     // Fallback to localStorage
     const saved = localStorage.getItem('flex_orders');
     const orders = saved ? JSON.parse(saved) : [];
     const order = orders.find((o: Order) => o.id === orderId);
     if (order) {
-      const previousStatus = order.status;
-      if (previousStatus === status) return;
+      const previousStatus = normalizeOrderStatus(order.status);
+      if (previousStatus === normalizedStatus) return;
 
-      if (previousStatus === 'pending' && status === 'shipped') {
-        const savedProducts = localStorage.getItem('flex_products');
-        const products = savedProducts ? JSON.parse(savedProducts) : [];
-
-        for (const item of order.items || []) {
-          const p = products.find((product: Product) => product.Product_ID === item.productId);
-          if (!p) {
-            throw new Error('Sorry, this item is currently out of stock.');
-          }
-
-          const qty = Math.max(0, Number(item.quantity || 0));
-          const currentLeft = Math.max(0, Number(p.pieces || 0));
-          if (qty > currentLeft) {
-            throw new Error('Sorry, this item is currently out of stock.');
-          }
-
-          p.sold = Math.max(0, Number(p.sold || 0) + qty);
-          p.pieces = Math.max(0, currentLeft - qty);
-          p.status = p.pieces === 0 ? 'Temporarily unavailable' : 'In Stock';
-        }
-
-        localStorage.setItem('flex_products', JSON.stringify(products));
+      if (normalizedStatus === 'dispatched' && previousStatus !== 'pending') {
+        if (previousStatus === 'dispatched') return;
+        throw new Error(`Order ${orderId} cannot be dispatched from status ${previousStatus}.`);
       }
 
-      order.status = status;
+      if (normalizedStatus === 'canceled' && previousStatus !== 'pending') {
+        if (previousStatus === 'canceled') return;
+        throw new Error(`Order ${orderId} cannot be canceled from status ${previousStatus}.`);
+      }
+
+      if (normalizedStatus === 'canceled') {
+        const savedProducts = localStorage.getItem('flex_products');
+        const products: Product[] = savedProducts ? JSON.parse(savedProducts) : [];
+        const restoredProducts = products.map((product) => ({
+          ...product,
+          sizeStock: Array.isArray(product.sizeStock) ? product.sizeStock.map((entry) => ({ ...entry })) : product.sizeStock,
+        }));
+
+        for (const item of normalizeOrderItems(order.items || [])) {
+          const productIndex = restoredProducts.findIndex((candidate) => String(candidate.Product_ID || '').trim() === item.productId);
+          if (productIndex < 0) continue;
+          restoredProducts[productIndex] = applyLocalProductStockDelta(restoredProducts[productIndex], item.size, item.quantity);
+        }
+
+        localStorage.setItem('flex_products', JSON.stringify(restoredProducts));
+
+        const reservations = readLocalReservations().map((row) => {
+          if (String(row.orderId || '') !== orderId) return row;
+          if (row.status !== 'confirmed' && row.status !== 'active') return row;
+          return {
+            ...row,
+            status: 'released',
+            releasedAt: new Date().toISOString(),
+          } as StockReservation;
+        });
+        writeLocalReservations(reservations);
+      }
+
+      order.status = normalizedStatus;
       localStorage.setItem('flex_orders', JSON.stringify(orders));
 
-      if (previousStatus === 'pending' && status === 'shipped') {
-        await notifyCustomerOrderDispatched(order);
+      if (normalizedStatus === 'dispatched') {
+        await notifyCustomerOrderDispatched({ ...order, status: 'dispatched' });
+      }
+
+      if (normalizedStatus === 'canceled') {
+        await notifyCustomerOrderCanceled({ ...order, status: 'canceled' });
       }
     }
     return;
@@ -1872,233 +2176,196 @@ export async function updateOrderStatus(
 
     if (fetchError) throw fetchError;
     if (!existingOrder) throw new Error(`Order ${orderId} was not found.`);
-    if (existingOrder.status === status) return;
+    const previousStatus = normalizeOrderStatus(existingOrder.status);
+    if (previousStatus === normalizedStatus) return;
 
-    // Apply inventory updates only when admin dispatches/approves (pending -> shipped)
-    // and only for legacy orders that were not already committed at checkout.
-    if (existingOrder.status === 'pending' && status === 'shipped') {
-      const { data: confirmedReservationRows, error: confirmedReservationError } = await supabase
+    const mapOrderRowToOrder = async (row: any): Promise<Order> => {
+      const { data: itemRows } = await supabase
+        .from('order_items')
+        .select('product_id,product_name,size,quantity,price,reservation_id')
+        .eq('order_id', orderId);
+
+      return {
+        id: String(row.id),
+        customerName: String(row.customer_name || ''),
+        customerEmail: String(row.customer_email || ''),
+        customerPhone: String(row.customer_phone || ''),
+        governorate: String(row.governorate || ''),
+        district: String(row.district || ''),
+        village: String(row.village || ''),
+        addressDetails: String(row.address_details || ''),
+        items: (itemRows || []).map((itemRow: any) => ({
+          productId: String(itemRow.product_id || ''),
+          productName: String(itemRow.product_name || itemRow.product_id || ''),
+          quantity: Math.max(0, Number(itemRow.quantity || 0)),
+          size: String(itemRow.size || ''),
+          price: Math.max(0, Number(itemRow.price || 0)),
+          reservationId: itemRow.reservation_id ? String(itemRow.reservation_id) : undefined,
+        })),
+        total: Math.max(0, Number(row.total || 0)),
+        status: normalizeOrderStatus(row.status),
+        date: String(row.date || new Date().toISOString()),
+      };
+    };
+
+    if (normalizedStatus === 'dispatched') {
+      if (previousStatus !== 'pending') {
+        throw new Error(`Order ${orderId} cannot be dispatched from status ${previousStatus}.`);
+      }
+
+      // Atomic idempotent status transition: only one caller can claim pending -> shipped.
+      const { data: transitionedOrder, error: transitionError } = await supabase
+        .from('orders')
+        .update({ status: persistOrderStatusForDatabase('dispatched') })
+        .eq('id', orderId)
+        .eq('status', 'pending')
+        .select('*')
+        .maybeSingle();
+
+      if (transitionError) throw transitionError;
+      if (!transitionedOrder) {
+        // Another request has already dispatched this order.
+        return;
+      }
+      const dispatchOrder = await mapOrderRowToOrder(transitionedOrder);
+      await notifyCustomerOrderDispatched({ ...dispatchOrder, status: 'dispatched' });
+      return;
+    }
+
+    if (normalizedStatus === 'canceled') {
+      if (previousStatus !== 'pending') {
+        throw new Error(`Order ${orderId} cannot be canceled from status ${previousStatus}.`);
+      }
+
+      const { data: transitionedOrder, error: transitionError } = await supabase
+        .from('orders')
+        .update({ status: persistOrderStatusForDatabase('canceled') })
+        .eq('id', orderId)
+        .eq('status', 'pending')
+        .select('*')
+        .maybeSingle();
+
+      if (transitionError) throw transitionError;
+      if (!transitionedOrder) return;
+
+      const { data: itemRows } = await supabase
+        .from('order_items')
+        .select('product_id,size,quantity')
+        .eq('order_id', orderId);
+
+      const { data: openReservationRows } = await supabase
         .from('stock_reservations')
         .select('id')
         .eq('order_id', orderId)
-        .eq('status', 'confirmed')
+        .in('status', ['active', 'confirmed'])
         .limit(1);
 
-      if (confirmedReservationError) {
-        throw confirmedReservationError;
-      }
+      const shouldApplyManualRefund = Array.isArray(openReservationRows) && openReservationRows.length > 0;
 
-      const hasCommittedAtCheckout = Array.isArray(confirmedReservationRows) && confirmedReservationRows.length > 0;
-      if (hasCommittedAtCheckout) {
-        const { error: orderUpdateError } = await supabase
-          .from('orders')
-          .update({ status })
-          .eq('id', orderId);
-
-        if (orderUpdateError) throw orderUpdateError;
-
-        const { data: itemRowsForMail } = await supabase
-          .from('order_items')
-          .select('product_id,product_name,size,quantity,price')
-          .eq('order_id', orderId);
-
-        const dispatchOrder: Order = {
-          id: String((existingOrder as any).id),
-          customerName: String((existingOrder as any).customer_name || ''),
-          customerEmail: String((existingOrder as any).customer_email || ''),
-          customerPhone: String((existingOrder as any).customer_phone || ''),
-          governorate: String((existingOrder as any).governorate || ''),
-          district: String((existingOrder as any).district || ''),
-          village: String((existingOrder as any).village || ''),
-          addressDetails: String((existingOrder as any).address_details || ''),
-          items: (itemRowsForMail || []).map((row: any) => ({
-            productId: String(row.product_id || ''),
-            productName: String(row.product_name || row.product_id || ''),
-            quantity: Math.max(0, Number(row.quantity || 0)),
-            size: String(row.size || ''),
-            price: Math.max(0, Number(row.price || 0)),
-          })),
-          total: Math.max(0, Number((existingOrder as any).total || 0)),
-          status: 'shipped',
-          date: String((existingOrder as any).date || new Date().toISOString()),
-        };
-
-        await notifyCustomerOrderDispatched(dispatchOrder);
+      if (!shouldApplyManualRefund) {
+        try {
+          const canceledOrder = await mapOrderRowToOrder(transitionedOrder);
+          await notifyCustomerOrderCanceled({ ...canceledOrder, status: 'canceled' });
+        } catch (cancelMailError) {
+          console.warn('Cancel email failed after order cancellation:', cancelMailError);
+        }
         return;
       }
 
-      const { data: itemRows, error: itemsFetchError } = await supabase
-        .from('order_items')
-        .select('product_id,product_name,size,quantity,price')
-        .eq('order_id', orderId);
-
-      if (itemsFetchError) throw itemsFetchError;
-
-      const { data: allProductsRows, error: productsFetchError } = await supabase
-        .from('products')
-        .select('*');
-
-      if (productsFetchError) throw productsFetchError;
-      const allProducts = (allProductsRows || []) as any[];
-
-      const grouped = new Map<string, { productId: string; size: string; quantity: number }>();
+      const refundByProduct = new Map<string, Map<string, number>>();
       for (const row of itemRows || []) {
         const productId = String((row as any).product_id || '').trim();
-        const size = String((row as any).size || '').trim();
-        const qty = Math.max(0, toNumberOrNull((row as any).quantity) ?? 0);
-        if (!productId || qty <= 0) continue;
-
-        const key = `${productId}::${size.toUpperCase()}`;
-        const existing = grouped.get(key);
-        if (existing) {
-          existing.quantity += qty;
-        } else {
-          grouped.set(key, { productId, size, quantity: qty });
-        }
+        const size = String((row as any).size || '').trim().toUpperCase();
+        const qty = Math.max(0, Math.floor(Number((row as any).quantity || 0)));
+        if (!productId || !size || qty <= 0) continue;
+        if (!refundByProduct.has(productId)) refundByProduct.set(productId, new Map<string, number>());
+        const sizeMap = refundByProduct.get(productId)!;
+        sizeMap.set(size, Math.max(0, Number(sizeMap.get(size) || 0)) + qty);
       }
 
-      type Snapshot = {
-        productId: string;
-        leftInStock: number;
-        sold: number;
-        status: string;
-      };
+      const orderProductIds = Array.from(refundByProduct.keys());
+      const { data: productRows, error: productRowsError } = await supabase
+        .from('products')
+        .select('*')
+        .in('Product_ID', orderProductIds);
 
-      const snapshots: Snapshot[] = [];
+      if (productRowsError) throw productRowsError;
 
-      for (const line of grouped.values()) {
-        const product = allProducts.find((p: any) => {
-          const candidateIds = [p.Product_ID]
-            .map((v) => String(v || '').trim())
-            .filter(Boolean);
-          return candidateIds.includes(line.productId);
-        }) as any;
-        if (!product) {
-          throw new Error('Sorry, this item is currently out of stock.');
-        }
-
-        const allowedSizes = [
-          ...String(product.SIZE || '').split(',').map((s) => s.trim()),
-          ...((Array.isArray(product.sizes) ? product.sizes : []) as string[]).map((s) => String(s).trim()),
-        ]
-          .map((s) => s.toUpperCase())
-          .filter(Boolean);
-        if (line.size && allowedSizes.length > 0 && !allowedSizes.includes(line.size.toUpperCase())) {
-          throw new Error('Sorry, this item is currently out of stock.');
-        }
-
-        const currentStock = Math.max(0, toNumberOrNull(product.Items_LEFT_in_stock ?? product.items_left_in_stock ?? product.pieces ?? product.Stock ?? product.stock) ?? 0);
-        const currentSold = Math.max(0, toNumberOrNull(product.Items_Sold ?? product.items_sold ?? product.sold) ?? 0);
-        if (line.quantity > currentStock) {
-          throw new Error('Sorry, this item is currently out of stock.');
-        }
-
-        const nextStock = Math.max(0, currentStock - line.quantity);
-        const nextSold = Math.max(0, currentSold + line.quantity);
-        const nextStatus = nextStock === 0 ? 'Temporarily unavailable' : 'In Stock';
-        const normalizedLineSize = String(line.size || '').trim().toUpperCase();
-
-        snapshots.push({
-          productId: String(product.Product_ID || line.productId),
-          leftInStock: currentStock,
-          sold: currentSold,
-          status: String(product.Status || product.status || ''),
-        });
-
-        const updatePayload: any = {};
-        if ('Items_LEFT_in_stock' in product) updatePayload.Items_LEFT_in_stock = nextStock;
-        if ('items_left_in_stock' in product) updatePayload.items_left_in_stock = nextStock;
-        if ('pieces' in product) updatePayload.pieces = nextStock;
-        if ('Items_Sold' in product) updatePayload.Items_Sold = nextSold;
-        if ('items_sold' in product) updatePayload.items_sold = nextSold;
-        if ('sold' in product) updatePayload.sold = nextSold;
-        if ('Status' in product) updatePayload.Status = nextStatus;
-        if ('status' in product) updatePayload.status = nextStatus;
-
-        const rawSizeStock = product.size_stock ?? product.sizeStock;
-        if (Array.isArray(rawSizeStock)) {
-          const nextSizeStock = rawSizeStock
-            .map((entry: any) => ({
-              size: String(entry?.size || '').trim(),
-              stock: Math.max(0, Math.floor(Number(entry?.stock || 0))),
-            }))
-            .filter((entry: { size: string; stock: number }) => entry.size)
-            .map((entry: { size: string; stock: number }) => {
-              const matches = normalizedLineSize && entry.size.toUpperCase() === normalizedLineSize;
-              if (!matches) return entry;
-              return {
-                ...entry,
-                stock: Math.max(0, entry.stock - line.quantity),
-              };
-            });
-
-          if ('size_stock' in product) updatePayload.size_stock = nextSizeStock;
-          if ('sizeStock' in product) updatePayload.sizeStock = nextSizeStock;
-        }
-
-        if (Object.keys(updatePayload).length === 0) {
-          throw new Error('Failed to update product stock columns in database schema.');
-        }
-
-        const { error: productUpdateError } = await supabase
-          .from('products')
-          .update(updatePayload)
-          .eq('Product_ID', line.productId);
-
-        if (productUpdateError) {
-          throw productUpdateError;
-        }
+      const productById = new Map<string, any>();
+      for (const row of productRows || []) {
+        const id = String((row as any).Product_ID || '').trim();
+        if (id) productById.set(id, row);
       }
 
-      const { error: orderUpdateError } = await supabase
-        .from('orders')
-        .update({ status })
-        .eq('id', orderId);
+      for (const [productId, sizeMap] of refundByProduct.entries()) {
+        const product = productById.get(productId);
+        if (!product) continue;
 
-      if (orderUpdateError) {
-        for (const s of snapshots) {
-          await supabase
+        const sizeEntries = normalizeSizeStockFromRow(product);
+        if (sizeEntries.length > 0) {
+          const nextSizeStock = sizeEntries.map((entry) => {
+            const token = String(entry.size || '').trim().toUpperCase();
+            const refundQty = Math.max(0, Number(sizeMap.get(token) || 0));
+            if (refundQty <= 0) return entry;
+            const stock = Math.max(0, Math.floor(Number(entry.stock || 0)));
+            const nextSold = Math.max(0, Math.min(stock, Math.floor(Number(entry.sold || 0)) - refundQty));
+            return {
+              ...entry,
+              left: Math.max(0, stock - nextSold),
+              sold: nextSold,
+            };
+          });
+          const nextSummary = getSizeStockSummary(nextSizeStock);
+
+          const { error: stockError } = await supabase
             .from('products')
             .update({
-              Items_Sold: s.sold,
-              Items_LEFT_in_stock: s.leftInStock,
-              Status: s.status || (s.leftInStock === 0 ? 'Temporarily unavailable' : 'In Stock'),
+              Stock: nextSummary.totalStock,
+              size_stock: nextSizeStock,
+              Items_Sold: nextSummary.totalSold,
+              pieces: nextSummary.totalLeft,
+              sold: nextSummary.totalSold,
+              Status: resolveNextProductStatus((product as any).Status ?? (product as any).status ?? 'Active', nextSummary.totalLeft),
             })
-            .eq('Product_ID', s.productId);
+            .eq('Product_ID', productId);
+
+          if (stockError) throw stockError;
+        } else {
+          const baseStock = Math.max(0, Number((product as any).Stock ?? (product as any).stock ?? 0));
+          const baseSold = Math.max(0, Number((product as any).Items_Sold ?? (product as any).items_sold ?? 0));
+          const refundQty = Array.from(sizeMap.values()).reduce((sum, qty) => sum + Math.max(0, Number(qty || 0)), 0);
+          const nextSold = Math.max(0, baseSold - refundQty);
+          const nextLeft = Math.max(0, baseStock - nextSold);
+          const { error: stockError } = await supabase
+            .from('products')
+            .update({
+              Items_Sold: nextSold,
+              Status: resolveNextProductStatus((product as any).Status ?? (product as any).status ?? 'Active', nextLeft),
+            })
+            .eq('Product_ID', productId);
+
+          if (stockError) throw stockError;
         }
-        throw orderUpdateError;
       }
 
-      await recalculateFinancialMetrics();
+      await supabase
+        .from('stock_reservations')
+        .update({ status: 'released', released_at: new Date().toISOString() })
+        .eq('order_id', orderId)
+        .in('status', ['active', 'confirmed']);
 
-      const dispatchOrder: Order = {
-        id: String((existingOrder as any).id),
-        customerName: String((existingOrder as any).customer_name || ''),
-        customerEmail: String((existingOrder as any).customer_email || ''),
-        customerPhone: String((existingOrder as any).customer_phone || ''),
-        governorate: String((existingOrder as any).governorate || ''),
-        district: String((existingOrder as any).district || ''),
-        village: String((existingOrder as any).village || ''),
-        addressDetails: String((existingOrder as any).address_details || ''),
-        items: (itemRows || []).map((row: any) => ({
-          productId: String(row.product_id || ''),
-          productName: String(row.product_name || row.product_id || ''),
-          quantity: Math.max(0, Number(row.quantity || 0)),
-          size: String(row.size || ''),
-          price: Math.max(0, Number(row.price || 0)),
-        })),
-        total: Math.max(0, Number((existingOrder as any).total || 0)),
-        status: 'shipped',
-        date: String((existingOrder as any).date || new Date().toISOString()),
-      };
-
-      await notifyCustomerOrderDispatched(dispatchOrder);
+      try {
+        const canceledOrder = await mapOrderRowToOrder(transitionedOrder);
+        await notifyCustomerOrderCanceled({ ...canceledOrder, status: 'canceled' });
+      } catch (cancelMailError) {
+        console.warn('Cancel email failed after order cancellation:', cancelMailError);
+      }
       return;
     }
 
     const { error } = await supabase
       .from('orders')
-      .update({ status })
+      .update({ status: normalizedStatus })
       .eq('id', orderId);
 
     if (error) throw error;
@@ -2142,8 +2409,8 @@ function buildFinancialMetricsFromOrderHistory(
   const completedOrderIds = new Set(
     orders
       .filter((o) => {
-        const normalized = String(o.status || '').toLowerCase();
-        return normalized === 'shipped' || normalized === 'delivered';
+        const normalized = normalizeOrderStatus(o.status);
+        return normalized === 'dispatched' || normalized === 'delivered';
       })
       .map((o) => String(o.id))
   );
@@ -2336,4 +2603,12 @@ export async function getFinancialDashboardTotals(): Promise<FinancialTotals | n
     console.error('Error fetching financial dashboard totals:', error);
     return null;
   }
+}
+
+function restoreLocalOrderStockFromItems(product: Product, items: Order['items']): Product {
+  let nextProduct = product;
+  for (const item of normalizeOrderItems(items || [])) {
+    nextProduct = applyLocalProductStockDelta(nextProduct, item.size, item.quantity);
+  }
+  return nextProduct;
 }

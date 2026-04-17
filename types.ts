@@ -7,9 +7,12 @@ export enum Category {
 
 export type ProductGender = 'Men' | 'Women' | 'Unisex';
 
+/**Per-size stock tracking: stock=original amount (fixed), left=currently available, sold=total sold */
 export interface ProductSizeStock {
   size: string;
-  stock: number;
+  stock: number; // Original amount added for this size (never changes)
+  left: number;  // Currently available for this size (decreases with orders)
+  sold: number;  // Total sold for this size (increases with orders)
 }
 
 export interface Product {
@@ -51,7 +54,7 @@ export interface Order {
   addressDetails: string;
   items: { productId: string; productName: string; quantity: number; size: string; price: number; reservationId?: string }[];
   total: number;
-  status: 'pending' | 'shipped' | 'delivered' | 'cancelled';
+  status: 'pending' | 'dispatched' | 'delivered' | 'canceled';
   date: string;
 }
 
