@@ -436,7 +436,7 @@ function ProductCard({
           </div>
         </div>
         {(isOutOfStock || isComingSoon || isReserved) && (
-          <div className={`absolute bottom-2 right-2 text-white text-[8px] font-black uppercase tracking-[0.12em] px-2 py-1 rounded-full shadow-lg ${isComingSoon ? 'bg-blue-600' : isReserved ? 'bg-amber-600' : 'bg-red-600'}`}>
+          <div className={`absolute bottom-2 right-2 text-white text-[8px] font-black uppercase tracking-[0.12em] px-2 py-1 rounded-full shadow-lg ${isComingSoon ? 'bg-blue-600' : isReserved ? 'bg-amber-600' : 'bg-orange-600'}`}>
             {isComingSoon ? 'Coming Soon' : isReserved ? 'Reserved' : 'Out Of Stock'}
           </div>
         )}
@@ -589,10 +589,16 @@ const App: React.FC = () => {
   const [isGenderFilterExpanded, setIsGenderFilterExpanded] = useState<boolean>(false);
   const [isBrandFilterExpanded, setIsBrandFilterExpanded] = useState<boolean>(false);
   const [isMobileFilterOpen, setIsMobileFilterOpen] = useState<boolean>(false);
+  const [mobileFilterPanelOffsetY, setMobileFilterPanelOffsetY] = useState<number>(0);
   const [cartNotice, setCartNotice] = useState<string>('');
   const [imageViewerProduct, setImageViewerProduct] = useState<Product | null>(null);
+  const [imageViewerImageIndex, setImageViewerImageIndex] = useState<number>(0);
   const [imageViewerScale, setImageViewerScale] = useState<number>(1);
   const [imageViewerTranslate, setImageViewerTranslate] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const mobileFilterGestureRef = useRef({
+    isDragging: false,
+    startY: 0,
+  });
   const preloadedImageUrlsRef = useRef<Set<string>>(new Set());
   const liveRefreshInFlightRef = useRef(false);
   const liveRefreshQueuedRef = useRef(false);
@@ -813,6 +819,13 @@ const App: React.FC = () => {
       window.removeEventListener('keydown', onKeyDown);
     };
   }, [isMobileFilterOpen, imageViewerProduct]);
+
+  useEffect(() => {
+    if (!isMobileFilterOpen) {
+      setMobileFilterPanelOffsetY(0);
+      mobileFilterGestureRef.current = { isDragging: false, startY: 0 };
+    }
+  }, [isMobileFilterOpen]);
 
   useEffect(() => {
     if (cart.length === 0) return;
@@ -1122,6 +1135,7 @@ const App: React.FC = () => {
 
   const closeImageViewer = () => {
     setImageViewerProduct(null);
+    setImageViewerImageIndex(0);
     setImageViewerScale(1);
     setImageViewerTranslate({ x: 0, y: 0 });
     imageViewerGestureRef.current = {
@@ -1135,10 +1149,69 @@ const App: React.FC = () => {
     };
   };
 
-  const openImageViewer = (product: Product) => {
+  const openImageViewer = (product: Product, startIndex: number = 0) => {
+    const imageCount = getProductImages(product).length;
+    const normalizedStart = imageCount > 0
+      ? Math.max(0, Math.min(startIndex, imageCount - 1))
+      : 0;
     setImageViewerProduct(product);
+    setImageViewerImageIndex(normalizedStart);
     setImageViewerScale(1);
     setImageViewerTranslate({ x: 0, y: 0 });
+  };
+
+  const imageViewerImages = useMemo(
+    () => (imageViewerProduct ? getProductImages(imageViewerProduct) : []),
+    [imageViewerProduct]
+  );
+
+  const imageViewerActiveSrc = imageViewerProduct
+    ? (imageViewerImages[imageViewerImageIndex] || imageViewerProduct.image || '/flex-logo-bbg.JPG')
+    : '';
+
+  const stepImageViewer = useCallback((step: number) => {
+    setImageViewerImageIndex((prev) => {
+      if (imageViewerImages.length <= 1) return 0;
+      const next = prev + step;
+      if (next < 0) return imageViewerImages.length - 1;
+      if (next >= imageViewerImages.length) return 0;
+      return next;
+    });
+    setImageViewerScale(1);
+    setImageViewerTranslate({ x: 0, y: 0 });
+  }, [imageViewerImages.length]);
+
+  const handleMobileFilterTouchStart = (event: React.TouchEvent<HTMLDivElement>) => {
+    const firstTouch = event.touches[0];
+    if (!firstTouch) return;
+    mobileFilterGestureRef.current = {
+      isDragging: true,
+      startY: firstTouch.clientY,
+    };
+  };
+
+  const handleMobileFilterTouchMove = (event: React.TouchEvent<HTMLDivElement>) => {
+    if (!mobileFilterGestureRef.current.isDragging) return;
+    const firstTouch = event.touches[0];
+    if (!firstTouch) return;
+    const deltaY = Math.max(0, firstTouch.clientY - mobileFilterGestureRef.current.startY);
+    setMobileFilterPanelOffsetY(Math.min(deltaY, 260));
+    if (event.cancelable && deltaY > 0) {
+      event.preventDefault();
+    }
+  };
+
+  const handleMobileFilterTouchEnd = () => {
+    const shouldClose = mobileFilterPanelOffsetY > 90;
+    mobileFilterGestureRef.current = {
+      isDragging: false,
+      startY: 0,
+    };
+    if (shouldClose) {
+      setIsMobileFilterOpen(false);
+      return;
+    }
+    setMobileFilterPanelOffsetY(0);
   };
 
   const clampScale = (value: number) => Math.min(4, Math.max(1, value));
@@ -1236,6 +1309,11 @@ const App: React.FC = () => {
     if (endingTouch && imageViewerScale <= 1.05) {
       const swipeX = endingTouch.clientX - gesture.touchStartX;
       const swipeY = endingTouch.clientY - gesture.touchStartY;
+      const isHorizontalGallerySwipe = imageViewerImages.length > 1 && Math.abs(swipeX) > 70 && Math.abs(swipeX) > Math.abs(swipeY) * 1.1;
+      if (isHorizontalGallerySwipe) {
+        stepImageViewer(swipeX < 0 ? 1 : -1);
+        return;
+      }
       const isVerticalDismiss = Math.abs(swipeY) > 90 && Math.abs(swipeY) > Math.abs(swipeX) * 1.2;
       if (isVerticalDismiss) {
         closeImageViewer();
@@ -3194,7 +3272,7 @@ const App: React.FC = () => {
               <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_0.9fr] gap-8 lg:gap-12">
                 <div className="space-y-4">
                   <div className="rounded-[2rem] border border-gray-100 bg-white overflow-hidden shadow-xl">
-                    <div className="aspect-[4/5] bg-white flex items-center justify-center overflow-hidden">
+                    <div className="relative aspect-[4/5] bg-white flex items-center justify-center overflow-hidden">
                       <div
                         className="flex h-full w-full transition-transform duration-700 ease-out will-change-transform"
                         style={{ transform: `translateX(-${Math.min(productDetailSelectedImageIndex, Math.max(0, activeProductImages.length - 1)) * 100}%)` }}
@@ -3205,6 +3283,12 @@ const App: React.FC = () => {
                           </div>
                         ))}
                       </div>
+                      <button
+                        type="button"
+                        onClick={() => openImageViewer(activeProduct, productDetailSelectedImageIndex)}
+                        className="absolute inset-0 z-10 cursor-zoom-in"
+                        aria-label="Open product image viewer"
+                      />
                     </div>
                   </div>
                   <div className="grid grid-cols-4 sm:grid-cols-6 gap-2">
@@ -3357,7 +3441,10 @@ const App: React.FC = () => {
           <div className="max-w-[1680px] w-full mx-auto px-2 sm:px-4 lg:px-6 xl:px-8 py-8 md:py-12 overflow-x-hidden">
             <div className="md:hidden mb-6">
               <button
-                onClick={() => setIsMobileFilterOpen(true)}
+                onClick={() => {
+                  setIsMobileFilterOpen(true);
+                  setMobileFilterPanelOffsetY(0);
+                }}
                 className="w-full bg-white border-2 border-gray-100 rounded-2xl px-4 py-3 flex items-center justify-between shadow-sm"
               >
                 <span className="flex items-center gap-2 text-[11px] font-black uppercase tracking-wider text-gray-700 italic">
@@ -3431,16 +3518,17 @@ const App: React.FC = () => {
                   onClick={() => setIsMobileFilterOpen(false)}
                   className="absolute inset-0 bg-black/40 backdrop-blur-[1px]"
                 />
-                <div className="absolute inset-x-0 bottom-0 bg-white rounded-t-3xl border-t border-gray-100 shadow-2xl max-h-[85vh] overflow-y-auto">
+                <div
+                  onTouchStart={handleMobileFilterTouchStart}
+                  onTouchMove={handleMobileFilterTouchMove}
+                  onTouchEnd={handleMobileFilterTouchEnd}
+                  className="absolute inset-x-0 bottom-0 bg-white rounded-t-3xl border-t border-gray-100 shadow-2xl max-h-[85vh] overflow-y-auto transition-transform duration-200 ease-out"
+                  style={{ transform: `translateY(${mobileFilterPanelOffsetY}px)` }}
+                >
                   <div className="sticky top-0 bg-white border-b border-gray-100 px-4 py-3 flex items-center justify-between">
+                    <div className="absolute top-1 left-1/2 -translate-x-1/2 w-10 h-1 rounded-full bg-gray-200" aria-hidden="true" />
                     <h3 className="font-black text-xs uppercase tracking-[0.4em] text-gray-500 italic">Classification</h3>
-                    <button
-                      onClick={() => setIsMobileFilterOpen(false)}
-                      className="p-2 rounded-full text-orange-600 hover:bg-orange-50"
-                      aria-label="Close filters"
-                    >
-                      <X size={16} />
-                    </button>
+                    <span className="text-[9px] font-black uppercase tracking-widest text-gray-400">Swipe down to close</span>
                   </div>
                   <div className="p-4">
                     {renderFilterControls()}
@@ -3465,8 +3553,32 @@ const App: React.FC = () => {
                 </button>
 
                 <div className="absolute top-3 left-3 z-[92] bg-white/10 border border-white/20 text-white rounded-full px-3 py-1.5 text-[10px] font-black uppercase tracking-[0.14em]">
-                  Pinch or wheel to zoom
+                  Pinch or wheel to zoom{imageViewerImages.length > 1 ? ' • swipe to switch' : ''}
                 </div>
+
+                {imageViewerImages.length > 1 && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => stepImageViewer(-1)}
+                      aria-label="Previous image"
+                      className="absolute left-3 sm:left-5 top-1/2 -translate-y-1/2 z-[92] w-10 h-10 rounded-full bg-white/10 border border-white/20 text-white flex items-center justify-center hover:bg-white/20 transition-colors"
+                    >
+                      <ChevronRight size={18} className="rotate-180" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => stepImageViewer(1)}
+                      aria-label="Next image"
+                      className="absolute right-3 sm:right-5 top-1/2 -translate-y-1/2 z-[92] w-10 h-10 rounded-full bg-white/10 border border-white/20 text-white flex items-center justify-center hover:bg-white/20 transition-colors"
+                    >
+                      <ChevronRight size={18} />
+                    </button>
+                    <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-[92] bg-white/10 border border-white/20 text-white rounded-full px-3 py-1 text-[10px] font-black uppercase tracking-[0.12em]">
+                      {imageViewerImageIndex + 1} / {imageViewerImages.length}
+                    </div>
+                  </>
+                )}
 
                 <div
                   onClick={(event) => event.stopPropagation()}
@@ -3477,7 +3589,7 @@ const App: React.FC = () => {
                   className="absolute inset-0 z-[91] flex items-center justify-center p-4 sm:p-8 touch-none"
                 >
                   <img
-                    src={imageViewerProduct.image}
+                    src={imageViewerActiveSrc}
                     alt={imageViewerProduct.productName || imageViewerProduct.name}
                     draggable={false}
                     style={{ transform: `translate(${imageViewerTranslate.x}px, ${imageViewerTranslate.y}px) scale(${imageViewerScale})` }}
