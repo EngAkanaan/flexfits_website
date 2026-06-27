@@ -2,7 +2,7 @@
 // This will replace localStorage with real database calls
 
 import { supabase } from './supabase';
-import { Product, ProductGender, ProductSizeStock, Order, FinancialMetric, FinancialTotals, StockReservation } from '../types';
+import { Product, ProductGender, ProductSizeStock, Order, FinancialMetric, FinancialTotals, StockReservation, Announcement, HeroSlide, HomepageSectionSetting, Tag } from '../types';
 
 const ADMIN_NOTIFICATION_EMAIL = 'flexfitslebanon@gmail.com';
 const EMAIL_WEBHOOK_URL = String(import.meta.env.VITE_EMAIL_WEBHOOK_URL || '').trim();
@@ -13,7 +13,9 @@ const SITE_URL = String(
 ).trim();
 const DEFAULT_PRODUCT_IMAGE = '/flex-logo-bbg.JPG';
 const PRODUCT_IMAGE_BUCKET = String(import.meta.env.VITE_SUPABASE_PRODUCT_IMAGE_BUCKET || 'product-images').trim() || 'product-images';
+const THEME_IMAGE_BUCKET = String(import.meta.env.VITE_SUPABASE_THEME_IMAGE_BUCKET || 'theme-images').trim() || 'theme-images';
 const MAX_UPLOAD_IMAGE_BYTES = 50 * 1024 * 1024;
+const MAX_THEME_IMAGE_BYTES = 5 * 1024 * 1024;
 const ALLOWED_UPLOAD_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 const RESERVATION_TTL_SECONDS = 10 * 60;
 const RESERVATION_SESSION_STORAGE_KEY = 'flex_reservation_session_id';
@@ -261,8 +263,10 @@ function isValidHttpImageUrl(value: string): boolean {
 }
 
 function isValidLocalImagePath(value: string): boolean {
-  // Keep local path support explicit to avoid treating random base64 fragments as relative URLs.
-  return /^\/[\w./%+-]+$/i.test(value);
+  // Bounded length is what actually keeps this from matching base64 fragments: real local asset
+  // paths are short (e.g. /flex-logo.JPG), while base64 image data is thousands of chars long and
+  // (sans the "=" padding char) happens to satisfy this character class too.
+  return value.length <= 200 && /^\/[\w./%+-]+$/i.test(value);
 }
 
 function normalizeImageSourceToken(value: any): string | null {
@@ -332,6 +336,51 @@ export async function uploadProductImagesToStorage(productId: string, files: Fil
   }
 
   return uploadedUrls;
+}
+
+/** Uploads a single hero-banner image (desktop or mobile) to the `theme-images` bucket and returns its public URL. */
+export async function uploadThemeImage(file: File, folder: 'hero-desktop' | 'hero-mobile'): Promise<string> {
+  if (!file || Number(file.size || 0) <= 0) {
+    throw new Error('No file selected.');
+  }
+  if (!supabase) {
+    throw new Error('Image upload requires Supabase to be configured.');
+  }
+
+  const normalizedType = String(file.type || '').toLowerCase();
+  if (!ALLOWED_UPLOAD_IMAGE_TYPES.has(normalizedType)) {
+    throw new Error(`Unsupported image type for ${file.name}. Allowed: JPG, PNG, WEBP, GIF.`);
+  }
+  if (Number(file.size || 0) > MAX_THEME_IMAGE_BYTES) {
+    throw new Error(`Image ${file.name} exceeds the 5MB limit for theme images.`);
+  }
+
+  const cleanName = sanitizeStorageFileName(file.name || `upload-${Date.now()}`);
+  const objectPath = `${folder}/${Date.now()}-${cleanName}`;
+  const { error } = await supabase.storage
+    .from(THEME_IMAGE_BUCKET)
+    .upload(objectPath, file, {
+      upsert: false,
+      contentType: file.type || undefined,
+    });
+
+  if (error) {
+    const lowerMessage = String(error.message || '').toLowerCase();
+    if (lowerMessage.includes('bucket') && (lowerMessage.includes('not found') || lowerMessage.includes('does not exist'))) {
+      throw new Error(`Image upload failed: bucket "${THEME_IMAGE_BUCKET}" does not exist. Run migration 015_storage_theme_images_setup.sql.`);
+    }
+    if (lowerMessage.includes('row level security') || lowerMessage.includes('permission') || lowerMessage.includes('unauthorized')) {
+      throw new Error(`Image upload failed due to storage policy restrictions on bucket "${THEME_IMAGE_BUCKET}".`);
+    }
+    throw new Error(`Image upload failed for ${file.name}: ${error.message}`);
+  }
+
+  const { data } = supabase.storage.from(THEME_IMAGE_BUCKET).getPublicUrl(objectPath);
+  const publicUrl = String(data.publicUrl || '').trim();
+  if (!publicUrl) {
+    throw new Error(`Image upload succeeded but no public URL was returned for ${file.name}.`);
+  }
+  return publicUrl;
 }
 
 function normalizeGender(value: any): ProductGender {
@@ -1185,6 +1234,7 @@ function mapProductRowToAppProduct(p: any): Product {
     onSale: Boolean(p.on_sale ?? p.On_Sale ?? p.onSale),
     colors,
     color: colors.length ? colors.join(', ') : undefined,
+    createdAt: p.created_at ?? p.createdAt ?? undefined,
   };
 }
 
@@ -1239,6 +1289,7 @@ export async function getProducts(): Promise<Product[]> {
     const saved = localStorage.getItem('flex_products');
     const products: Product[] = saved ? JSON.parse(saved) : [];
     const reservations = readLocalReservations().filter((row) => row.status === 'active' && new Date(row.expiresAt).getTime() > Date.now());
+    // Local fallback stores tagIds directly on each product object (no join table needed).
     return normalizeLocalProductStockFromReservations(
       products,
       reservations.map((row) => ({ productId: row.productId, size: row.size, quantity: row.quantity }))
@@ -1255,6 +1306,7 @@ export async function getProducts(): Promise<Product[]> {
     const transformed = (data || []).map((p: any) => mapProductRowToAppProduct(p));
 
     await subtractActiveReservationsFromProducts(transformed);
+    await attachProductTags(transformed);
 
     // Keep fallback cache aligned with database to avoid stale rollback on refresh.
     localStorage.setItem('flex_products', JSON.stringify(transformed));
@@ -1680,6 +1732,8 @@ export async function saveProduct(product: Product): Promise<void> {
     // Colors are now saved as part of the main payload above.
     // No follow-up PATCH needed.
     console.log('[saveProduct] Product saved successfully with colors:', colors);
+
+    await syncProductTags(productId, product.tagIds);
   } catch (error) {
     console.error('Error saving product (full):', error);
     throw error;
@@ -2077,7 +2131,13 @@ export async function saveOrder(order: Order): Promise<void> {
       try {
         await commitCheckoutReservations(normalizedOrder.id, reservationIds);
       } catch (reservationError) {
-        await supabase.from('orders').delete().eq('id', normalizedOrder.id);
+        // Orders are admin-only to DELETE directly once RLS is locked down (see migration 016),
+        // so the rollback for a failed checkout goes through a narrow SECURITY DEFINER RPC that
+        // only ever deletes a still-pending order by its own id.
+        const { error: cleanupError } = await supabase.rpc('cleanup_failed_checkout_order', { p_order_id: normalizedOrder.id });
+        if (cleanupError) {
+          console.warn('Unable to clean up failed checkout order:', cleanupError);
+        }
         throw reservationError;
       }
     }
@@ -2620,4 +2680,599 @@ function restoreLocalOrderStockFromItems(product: Product, items: Order['items']
     nextProduct = applyLocalProductStockDelta(nextProduct, item.size, item.quantity);
   }
   return nextProduct;
+}
+
+// ==================== EDIT THEME: ANNOUNCEMENTS / HERO SLIDES / HOMEPAGE SECTIONS ====================
+
+const LOCAL_ANNOUNCEMENTS_KEY = 'flex_announcements';
+const LOCAL_HERO_SLIDES_KEY = 'flex_hero_slides';
+const LOCAL_HOMEPAGE_SECTIONS_KEY = 'flex_homepage_sections';
+
+const DEFAULT_HOMEPAGE_SECTIONS: HomepageSectionSetting[] = [
+  { id: 'featured_products', sectionKey: 'featured_products', title: 'Featured Products', subtitle: 'Hand-picked gear from the current catalog', isVisible: true, sortOrder: 0 },
+  { id: 'new_arrivals', sectionKey: 'new_arrivals', title: 'New Arrivals', subtitle: 'The latest additions to Flex Fits', isVisible: true, sortOrder: 1 },
+  { id: 'best_sellers', sectionKey: 'best_sellers', title: 'Best Sellers', subtitle: 'Customer favorites', isVisible: true, sortOrder: 2 },
+  { id: 'sale_collection', sectionKey: 'sale_collection', title: 'Sale Collection', subtitle: 'Limited-time discounted gear', isVisible: true, sortOrder: 3 },
+  { id: 'brand_highlights', sectionKey: 'brand_highlights', title: 'Brand Highlights', subtitle: 'Shop by your favorite brand', isVisible: false, sortOrder: 4 },
+];
+
+function readLocalJsonArray<T>(key: string): T[] {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalJsonArray<T>(key: string, rows: T[]): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(rows));
+  } catch {
+    // Ignore localStorage failures to avoid breaking the theme editor.
+  }
+}
+
+function generateLocalId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function rowToAnnouncement(row: any): Announcement {
+  return {
+    id: String(row.id),
+    text: String(row.text || ''),
+    linkUrl: row.link_url ?? row.linkUrl ?? null,
+    isActive: Boolean(row.is_active ?? row.isActive ?? true),
+    sortOrder: Math.max(0, Math.floor(Number(row.sort_order ?? row.sortOrder ?? 0))),
+    createdAt: row.created_at ?? row.createdAt,
+    updatedAt: row.updated_at ?? row.updatedAt,
+  };
+}
+
+function rowToHeroSlide(row: any): HeroSlide {
+  return {
+    id: String(row.id),
+    title: row.title ?? null,
+    subtitle: row.subtitle ?? null,
+    desktopImageUrl: String(row.desktop_image_url ?? row.desktopImageUrl ?? ''),
+    mobileImageUrl: row.mobile_image_url ?? row.mobileImageUrl ?? null,
+    buttonText: row.button_text ?? row.buttonText ?? null,
+    buttonLink: row.button_link ?? row.buttonLink ?? null,
+    isActive: Boolean(row.is_active ?? row.isActive ?? true),
+    sortOrder: Math.max(0, Math.floor(Number(row.sort_order ?? row.sortOrder ?? 0))),
+    createdAt: row.created_at ?? row.createdAt,
+    updatedAt: row.updated_at ?? row.updatedAt,
+  };
+}
+
+function rowToHomepageSectionSetting(row: any): HomepageSectionSetting {
+  return {
+    id: String(row.id),
+    sectionKey: String(row.section_key ?? row.sectionKey ?? ''),
+    title: String(row.title || ''),
+    subtitle: row.subtitle ?? null,
+    isVisible: Boolean(row.is_visible ?? row.isVisible ?? true),
+    sortOrder: Math.max(0, Math.floor(Number(row.sort_order ?? row.sortOrder ?? 0))),
+    tagId: row.tag_id ?? row.tagId ?? null,
+    createdAt: row.created_at ?? row.createdAt,
+    updatedAt: row.updated_at ?? row.updatedAt,
+  };
+}
+
+function rowToTag(row: any): Tag {
+  return {
+    id: String(row.id),
+    name: String(row.name || ''),
+    slug: String(row.slug || ''),
+    createdAt: row.created_at ?? row.createdAt,
+  };
+}
+
+function slugifyTagName(name: string): string {
+  return String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60) || `tag-${Date.now()}`;
+}
+
+function sortBySortOrder<T extends { sortOrder: number }>(rows: T[]): T[] {
+  return [...rows].sort((a, b) => a.sortOrder - b.sortOrder);
+}
+
+// ---- Announcements ----
+
+export async function getAnnouncements(): Promise<Announcement[]> {
+  if (!supabase) {
+    return sortBySortOrder(readLocalJsonArray<Announcement>(LOCAL_ANNOUNCEMENTS_KEY));
+  }
+  const { data, error } = await supabase.from('announcements').select('*').order('sort_order', { ascending: true });
+  if (error) throw error;
+  return (data || []).map(rowToAnnouncement);
+}
+
+export async function getActiveAnnouncements(): Promise<Announcement[]> {
+  const all = await getAnnouncements();
+  return all.filter((a) => a.isActive);
+}
+
+export async function createAnnouncement(input: { text: string; linkUrl?: string | null }): Promise<Announcement> {
+  const text = String(input.text || '').trim();
+  if (!text) throw new Error('Announcement text is required.');
+  const linkUrl = String(input.linkUrl || '').trim() || null;
+
+  if (!supabase) {
+    const rows = readLocalJsonArray<Announcement>(LOCAL_ANNOUNCEMENTS_KEY);
+    const nextSortOrder = rows.length > 0 ? Math.max(...rows.map((r) => r.sortOrder)) + 1 : 0;
+    const created: Announcement = {
+      id: generateLocalId('ann'),
+      text,
+      linkUrl,
+      isActive: true,
+      sortOrder: nextSortOrder,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    writeLocalJsonArray(LOCAL_ANNOUNCEMENTS_KEY, [...rows, created]);
+    return created;
+  }
+
+  const { data: existing } = await supabase.from('announcements').select('sort_order').order('sort_order', { ascending: false }).limit(1);
+  const nextSortOrder = existing && existing.length > 0 ? Math.max(0, Number((existing[0] as any).sort_order || 0)) + 1 : 0;
+
+  const { data, error } = await supabase
+    .from('announcements')
+    .insert({ text, link_url: linkUrl, is_active: true, sort_order: nextSortOrder })
+    .select('*')
+    .single();
+  if (error) throw error;
+  return rowToAnnouncement(data);
+}
+
+export async function updateAnnouncement(id: string, patch: Partial<Pick<Announcement, 'text' | 'linkUrl' | 'isActive' | 'sortOrder'>>): Promise<void> {
+  if (patch.text !== undefined && !String(patch.text || '').trim()) {
+    throw new Error('Announcement text is required.');
+  }
+
+  if (!supabase) {
+    const rows = readLocalJsonArray<Announcement>(LOCAL_ANNOUNCEMENTS_KEY);
+    const next = rows.map((row) => row.id === id ? {
+      ...row,
+      ...(patch.text !== undefined ? { text: String(patch.text).trim() } : {}),
+      ...(patch.linkUrl !== undefined ? { linkUrl: patch.linkUrl || null } : {}),
+      ...(patch.isActive !== undefined ? { isActive: patch.isActive } : {}),
+      ...(patch.sortOrder !== undefined ? { sortOrder: patch.sortOrder } : {}),
+      updatedAt: new Date().toISOString(),
+    } : row);
+    writeLocalJsonArray(LOCAL_ANNOUNCEMENTS_KEY, next);
+    return;
+  }
+
+  const payload: Record<string, unknown> = {};
+  if (patch.text !== undefined) payload.text = String(patch.text).trim();
+  if (patch.linkUrl !== undefined) payload.link_url = patch.linkUrl || null;
+  if (patch.isActive !== undefined) payload.is_active = patch.isActive;
+  if (patch.sortOrder !== undefined) payload.sort_order = patch.sortOrder;
+
+  const { error } = await supabase.from('announcements').update(payload).eq('id', id);
+  if (error) throw error;
+}
+
+export async function deleteAnnouncement(id: string): Promise<void> {
+  if (!supabase) {
+    const rows = readLocalJsonArray<Announcement>(LOCAL_ANNOUNCEMENTS_KEY);
+    writeLocalJsonArray(LOCAL_ANNOUNCEMENTS_KEY, rows.filter((row) => row.id !== id));
+    return;
+  }
+  const { error } = await supabase.from('announcements').delete().eq('id', id);
+  if (error) throw error;
+}
+
+export async function reorderAnnouncements(orderedIds: string[]): Promise<void> {
+  if (!supabase) {
+    const rows = readLocalJsonArray<Announcement>(LOCAL_ANNOUNCEMENTS_KEY);
+    const indexById = new Map(orderedIds.map((id, index) => [id, index]));
+    const next = rows.map((row) => indexById.has(row.id) ? { ...row, sortOrder: indexById.get(row.id) as number } : row);
+    writeLocalJsonArray(LOCAL_ANNOUNCEMENTS_KEY, next);
+    return;
+  }
+  await Promise.all(orderedIds.map((id, index) => supabase.from('announcements').update({ sort_order: index }).eq('id', id)));
+}
+
+// ---- Hero Slides ----
+
+export async function getHeroSlides(): Promise<HeroSlide[]> {
+  if (!supabase) {
+    return sortBySortOrder(readLocalJsonArray<HeroSlide>(LOCAL_HERO_SLIDES_KEY));
+  }
+  const { data, error } = await supabase.from('hero_slides').select('*').order('sort_order', { ascending: true });
+  if (error) throw error;
+  return (data || []).map(rowToHeroSlide);
+}
+
+export async function getActiveHeroSlides(): Promise<HeroSlide[]> {
+  const all = await getHeroSlides();
+  return all.filter((s) => s.isActive);
+}
+
+export async function createHeroSlide(input: {
+  title?: string | null;
+  subtitle?: string | null;
+  desktopImageUrl: string;
+  mobileImageUrl?: string | null;
+  buttonText?: string | null;
+  buttonLink?: string | null;
+}): Promise<HeroSlide> {
+  const desktopImageUrl = String(input.desktopImageUrl || '').trim();
+  if (!desktopImageUrl) throw new Error('Desktop image URL is required.');
+  const buttonText = String(input.buttonText || '').trim() || null;
+  const buttonLink = String(input.buttonLink || '').trim() || null;
+  if (buttonText && !buttonLink) throw new Error('Button link is required when button text is set.');
+  if (buttonLink && !buttonText) throw new Error('Button text is required when button link is set.');
+
+  const base = {
+    title: String(input.title || '').trim() || null,
+    subtitle: String(input.subtitle || '').trim() || null,
+    desktopImageUrl,
+    mobileImageUrl: String(input.mobileImageUrl || '').trim() || null,
+    buttonText,
+    buttonLink,
+  };
+
+  if (!supabase) {
+    const rows = readLocalJsonArray<HeroSlide>(LOCAL_HERO_SLIDES_KEY);
+    const nextSortOrder = rows.length > 0 ? Math.max(...rows.map((r) => r.sortOrder)) + 1 : 0;
+    const created: HeroSlide = {
+      id: generateLocalId('hero'),
+      ...base,
+      isActive: true,
+      sortOrder: nextSortOrder,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    writeLocalJsonArray(LOCAL_HERO_SLIDES_KEY, [...rows, created]);
+    return created;
+  }
+
+  const { data: existing } = await supabase.from('hero_slides').select('sort_order').order('sort_order', { ascending: false }).limit(1);
+  const nextSortOrder = existing && existing.length > 0 ? Math.max(0, Number((existing[0] as any).sort_order || 0)) + 1 : 0;
+
+  const { data, error } = await supabase
+    .from('hero_slides')
+    .insert({
+      title: base.title,
+      subtitle: base.subtitle,
+      desktop_image_url: base.desktopImageUrl,
+      mobile_image_url: base.mobileImageUrl,
+      button_text: base.buttonText,
+      button_link: base.buttonLink,
+      is_active: true,
+      sort_order: nextSortOrder,
+    })
+    .select('*')
+    .single();
+  if (error) throw error;
+  return rowToHeroSlide(data);
+}
+
+export async function updateHeroSlide(id: string, patch: Partial<{
+  title: string | null;
+  subtitle: string | null;
+  desktopImageUrl: string;
+  mobileImageUrl: string | null;
+  buttonText: string | null;
+  buttonLink: string | null;
+  isActive: boolean;
+  sortOrder: number;
+}>): Promise<void> {
+  if (patch.desktopImageUrl !== undefined && !String(patch.desktopImageUrl || '').trim()) {
+    throw new Error('Desktop image URL is required.');
+  }
+  const nextButtonText = patch.buttonText !== undefined ? String(patch.buttonText || '').trim() || null : undefined;
+  const nextButtonLink = patch.buttonLink !== undefined ? String(patch.buttonLink || '').trim() || null : undefined;
+  // Callers (the theme editor form) always submit buttonText and buttonLink together, so
+  // when both are present in the same patch we can validate the pair directly.
+  if (nextButtonText !== undefined && nextButtonLink !== undefined) {
+    if (nextButtonText && !nextButtonLink) throw new Error('Button link is required when button text is set.');
+    if (nextButtonLink && !nextButtonText) throw new Error('Button text is required when button link is set.');
+  }
+
+  if (!supabase) {
+    const rows = readLocalJsonArray<HeroSlide>(LOCAL_HERO_SLIDES_KEY);
+    const next = rows.map((row) => row.id === id ? {
+      ...row,
+      ...(patch.title !== undefined ? { title: patch.title } : {}),
+      ...(patch.subtitle !== undefined ? { subtitle: patch.subtitle } : {}),
+      ...(patch.desktopImageUrl !== undefined ? { desktopImageUrl: String(patch.desktopImageUrl).trim() } : {}),
+      ...(patch.mobileImageUrl !== undefined ? { mobileImageUrl: patch.mobileImageUrl } : {}),
+      ...(patch.buttonText !== undefined ? { buttonText: nextButtonText } : {}),
+      ...(patch.buttonLink !== undefined ? { buttonLink: nextButtonLink } : {}),
+      ...(patch.isActive !== undefined ? { isActive: patch.isActive } : {}),
+      ...(patch.sortOrder !== undefined ? { sortOrder: patch.sortOrder } : {}),
+      updatedAt: new Date().toISOString(),
+    } : row);
+    writeLocalJsonArray(LOCAL_HERO_SLIDES_KEY, next);
+    return;
+  }
+
+  const payload: Record<string, unknown> = {};
+  if (patch.title !== undefined) payload.title = patch.title;
+  if (patch.subtitle !== undefined) payload.subtitle = patch.subtitle;
+  if (patch.desktopImageUrl !== undefined) payload.desktop_image_url = String(patch.desktopImageUrl).trim();
+  if (patch.mobileImageUrl !== undefined) payload.mobile_image_url = patch.mobileImageUrl;
+  if (patch.buttonText !== undefined) payload.button_text = nextButtonText;
+  if (patch.buttonLink !== undefined) payload.button_link = nextButtonLink;
+  if (patch.isActive !== undefined) payload.is_active = patch.isActive;
+  if (patch.sortOrder !== undefined) payload.sort_order = patch.sortOrder;
+
+  const { error } = await supabase.from('hero_slides').update(payload).eq('id', id);
+  if (error) throw error;
+}
+
+export async function deleteHeroSlide(id: string): Promise<void> {
+  if (!supabase) {
+    const rows = readLocalJsonArray<HeroSlide>(LOCAL_HERO_SLIDES_KEY);
+    writeLocalJsonArray(LOCAL_HERO_SLIDES_KEY, rows.filter((row) => row.id !== id));
+    return;
+  }
+  const { error } = await supabase.from('hero_slides').delete().eq('id', id);
+  if (error) throw error;
+}
+
+export async function reorderHeroSlides(orderedIds: string[]): Promise<void> {
+  if (!supabase) {
+    const rows = readLocalJsonArray<HeroSlide>(LOCAL_HERO_SLIDES_KEY);
+    const indexById = new Map(orderedIds.map((id, index) => [id, index]));
+    const next = rows.map((row) => indexById.has(row.id) ? { ...row, sortOrder: indexById.get(row.id) as number } : row);
+    writeLocalJsonArray(LOCAL_HERO_SLIDES_KEY, next);
+    return;
+  }
+  await Promise.all(orderedIds.map((id, index) => supabase.from('hero_slides').update({ sort_order: index }).eq('id', id)));
+}
+
+// ---- Homepage Section Settings ----
+
+export async function getHomepageSectionSettings(): Promise<HomepageSectionSetting[]> {
+  if (!supabase) {
+    const rows = readLocalJsonArray<HomepageSectionSetting>(LOCAL_HOMEPAGE_SECTIONS_KEY);
+    if (rows.length === 0) {
+      writeLocalJsonArray(LOCAL_HOMEPAGE_SECTIONS_KEY, DEFAULT_HOMEPAGE_SECTIONS);
+      return sortBySortOrder(DEFAULT_HOMEPAGE_SECTIONS);
+    }
+    return sortBySortOrder(rows);
+  }
+  const { data, error } = await supabase.from('homepage_section_settings').select('*').order('sort_order', { ascending: true });
+  if (error) throw error;
+  return (data || []).map(rowToHomepageSectionSetting);
+}
+
+export async function getVisibleHomepageSectionSettings(): Promise<HomepageSectionSetting[]> {
+  const all = await getHomepageSectionSettings();
+  return all.filter((s) => s.isVisible);
+}
+
+export async function updateHomepageSectionSetting(id: string, patch: Partial<Pick<HomepageSectionSetting, 'title' | 'subtitle' | 'isVisible' | 'sortOrder' | 'tagId'>>): Promise<void> {
+  if (patch.title !== undefined && !String(patch.title || '').trim()) {
+    throw new Error('Section title is required.');
+  }
+
+  if (!supabase) {
+    const rows = readLocalJsonArray<HomepageSectionSetting>(LOCAL_HOMEPAGE_SECTIONS_KEY);
+    const source = rows.length > 0 ? rows : DEFAULT_HOMEPAGE_SECTIONS;
+    const next = source.map((row) => row.id === id ? {
+      ...row,
+      ...(patch.title !== undefined ? { title: String(patch.title).trim() } : {}),
+      ...(patch.subtitle !== undefined ? { subtitle: patch.subtitle } : {}),
+      ...(patch.isVisible !== undefined ? { isVisible: patch.isVisible } : {}),
+      ...(patch.sortOrder !== undefined ? { sortOrder: patch.sortOrder } : {}),
+      ...(patch.tagId !== undefined ? { tagId: patch.tagId } : {}),
+      updatedAt: new Date().toISOString(),
+    } : row);
+    writeLocalJsonArray(LOCAL_HOMEPAGE_SECTIONS_KEY, next);
+    return;
+  }
+
+  const payload: Record<string, unknown> = {};
+  if (patch.title !== undefined) payload.title = String(patch.title).trim();
+  if (patch.subtitle !== undefined) payload.subtitle = patch.subtitle;
+  if (patch.isVisible !== undefined) payload.is_visible = patch.isVisible;
+  if (patch.sortOrder !== undefined) payload.sort_order = patch.sortOrder;
+  if (patch.tagId !== undefined) payload.tag_id = patch.tagId;
+
+  const { error } = await supabase.from('homepage_section_settings').update(payload).eq('id', id);
+  if (error) throw error;
+}
+
+export async function createHomepageSection(input: { title: string; subtitle?: string | null; tagId: string }): Promise<HomepageSectionSetting> {
+  const title = String(input.title || '').trim();
+  if (!title) throw new Error('Section title is required.');
+  if (!String(input.tagId || '').trim()) throw new Error('Select a tag for this section.');
+
+  const sectionKey = `tag-${slugifyTagName(title)}-${Date.now().toString(36)}`;
+
+  if (!supabase) {
+    const rows = readLocalJsonArray<HomepageSectionSetting>(LOCAL_HOMEPAGE_SECTIONS_KEY);
+    const source = rows.length > 0 ? rows : DEFAULT_HOMEPAGE_SECTIONS;
+    const nextSortOrder = source.length > 0 ? Math.max(...source.map((r) => r.sortOrder)) + 1 : 0;
+    const created: HomepageSectionSetting = {
+      id: generateLocalId('section'),
+      sectionKey,
+      title,
+      subtitle: input.subtitle?.trim() || null,
+      isVisible: true,
+      sortOrder: nextSortOrder,
+      tagId: input.tagId,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    writeLocalJsonArray(LOCAL_HOMEPAGE_SECTIONS_KEY, [...source, created]);
+    return created;
+  }
+
+  const { data: existing } = await supabase.from('homepage_section_settings').select('sort_order').order('sort_order', { ascending: false }).limit(1);
+  const nextSortOrder = existing && existing.length > 0 ? Math.max(0, Number((existing[0] as any).sort_order || 0)) + 1 : 0;
+
+  const { data, error } = await supabase
+    .from('homepage_section_settings')
+    .insert({
+      section_key: sectionKey,
+      title,
+      subtitle: input.subtitle?.trim() || null,
+      is_visible: true,
+      sort_order: nextSortOrder,
+      tag_id: input.tagId,
+    })
+    .select('*')
+    .single();
+  if (error) throw error;
+  return rowToHomepageSectionSetting(data);
+}
+
+export async function deleteHomepageSection(id: string): Promise<void> {
+  if (!supabase) {
+    const rows = readLocalJsonArray<HomepageSectionSetting>(LOCAL_HOMEPAGE_SECTIONS_KEY);
+    const source = rows.length > 0 ? rows : DEFAULT_HOMEPAGE_SECTIONS;
+    writeLocalJsonArray(LOCAL_HOMEPAGE_SECTIONS_KEY, source.filter((row) => row.id !== id));
+    return;
+  }
+  const { error } = await supabase.from('homepage_section_settings').delete().eq('id', id);
+  if (error) throw error;
+}
+
+export async function reorderHomepageSections(orderedIds: string[]): Promise<void> {
+  if (!supabase) {
+    const rows = readLocalJsonArray<HomepageSectionSetting>(LOCAL_HOMEPAGE_SECTIONS_KEY);
+    const source = rows.length > 0 ? rows : DEFAULT_HOMEPAGE_SECTIONS;
+    const indexById = new Map(orderedIds.map((id, index) => [id, index]));
+    const next = source.map((row) => indexById.has(row.id) ? { ...row, sortOrder: indexById.get(row.id) as number } : row);
+    writeLocalJsonArray(LOCAL_HOMEPAGE_SECTIONS_KEY, next);
+    return;
+  }
+  await Promise.all(orderedIds.map((id, index) => supabase.from('homepage_section_settings').update({ sort_order: index }).eq('id', id)));
+}
+
+// ==================== TAGS ====================
+
+const LOCAL_TAGS_KEY = 'flex_tags';
+
+export async function getTags(): Promise<Tag[]> {
+  if (!supabase) {
+    return readLocalJsonArray<Tag>(LOCAL_TAGS_KEY).sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+  }
+  const { data, error } = await supabase.from('tags').select('*').order('name', { ascending: true });
+  if (error) throw error;
+  return (data || []).map(rowToTag);
+}
+
+export async function createTag(name: string): Promise<Tag> {
+  const trimmed = String(name || '').trim();
+  if (!trimmed) throw new Error('Tag name is required.');
+  const slug = slugifyTagName(trimmed);
+
+  if (!supabase) {
+    const rows = readLocalJsonArray<Tag>(LOCAL_TAGS_KEY);
+    if (rows.some((row) => row.name.toLowerCase() === trimmed.toLowerCase())) {
+      throw new Error(`A tag named "${trimmed}" already exists.`);
+    }
+    const created: Tag = { id: generateLocalId('tag'), name: trimmed, slug, createdAt: new Date().toISOString() };
+    writeLocalJsonArray(LOCAL_TAGS_KEY, [...rows, created]);
+    return created;
+  }
+
+  const { data: existing } = await supabase.from('tags').select('id').ilike('name', trimmed).maybeSingle();
+  if (existing) throw new Error(`A tag named "${trimmed}" already exists.`);
+
+  const { data, error } = await supabase.from('tags').insert({ name: trimmed, slug }).select('*').single();
+  if (error) {
+    if (error.code === '23505') throw new Error(`A tag named "${trimmed}" already exists.`);
+    throw error;
+  }
+  return rowToTag(data);
+}
+
+export async function updateTag(id: string, name: string): Promise<void> {
+  const trimmed = String(name || '').trim();
+  if (!trimmed) throw new Error('Tag name is required.');
+  const slug = slugifyTagName(trimmed);
+
+  if (!supabase) {
+    const rows = readLocalJsonArray<Tag>(LOCAL_TAGS_KEY);
+    if (rows.some((row) => row.id !== id && row.name.toLowerCase() === trimmed.toLowerCase())) {
+      throw new Error(`A tag named "${trimmed}" already exists.`);
+    }
+    writeLocalJsonArray(LOCAL_TAGS_KEY, rows.map((row) => row.id === id ? { ...row, name: trimmed, slug } : row));
+    return;
+  }
+
+  const { data: existing } = await supabase.from('tags').select('id').ilike('name', trimmed).neq('id', id).maybeSingle();
+  if (existing) throw new Error(`A tag named "${trimmed}" already exists.`);
+
+  const { error } = await supabase.from('tags').update({ name: trimmed, slug }).eq('id', id);
+  if (error) {
+    if (error.code === '23505') throw new Error(`A tag named "${trimmed}" already exists.`);
+    throw error;
+  }
+}
+
+export async function deleteTag(id: string): Promise<void> {
+  if (!supabase) {
+    const rows = readLocalJsonArray<Tag>(LOCAL_TAGS_KEY);
+    writeLocalJsonArray(LOCAL_TAGS_KEY, rows.filter((row) => row.id !== id));
+    // Also detach this tag from any locally-stored products and tag-linked sections.
+    const saved = localStorage.getItem('flex_products');
+    if (saved) {
+      const products: Product[] = JSON.parse(saved);
+      localStorage.setItem('flex_products', JSON.stringify(products.map((p) => ({ ...p, tagIds: (p.tagIds || []).filter((t) => t !== id) }))));
+    }
+    const sections = readLocalJsonArray<HomepageSectionSetting>(LOCAL_HOMEPAGE_SECTIONS_KEY);
+    if (sections.length > 0) {
+      writeLocalJsonArray(LOCAL_HOMEPAGE_SECTIONS_KEY, sections.map((s) => s.tagId === id ? { ...s, tagId: null } : s));
+    }
+    return;
+  }
+  // product_tags rows cascade-delete; homepage_section_settings.tag_id is ON DELETE SET NULL.
+  const { error } = await supabase.from('tags').delete().eq('id', id);
+  if (error) throw error;
+}
+
+async function attachProductTags(products: Product[]): Promise<void> {
+  if (!supabase || products.length === 0) return;
+  try {
+    const { data, error } = await supabase.from('product_tags').select('product_id, tag_id');
+    if (error) throw error;
+
+    const tagIdsByProduct = new Map<string, string[]>();
+    for (const row of data || []) {
+      const productId = String((row as any).product_id || '').trim();
+      const tagId = String((row as any).tag_id || '').trim();
+      if (!productId || !tagId) continue;
+      const existing = tagIdsByProduct.get(productId) || [];
+      existing.push(tagId);
+      tagIdsByProduct.set(productId, existing);
+    }
+
+    for (const product of products) {
+      product.tagIds = tagIdsByProduct.get(String(product.Product_ID || '').trim()) || [];
+    }
+  } catch (error) {
+    console.warn('Unable to attach product tags (continuing without them):', error);
+  }
+}
+
+async function syncProductTags(productId: string, tagIds: string[] | undefined): Promise<void> {
+  if (!supabase) return;
+  const normalized = Array.from(new Set((tagIds || []).map((id) => String(id || '').trim()).filter(Boolean)));
+
+  const { error: deleteError } = await supabase.from('product_tags').delete().eq('product_id', productId);
+  if (deleteError) throw deleteError;
+
+  if (normalized.length === 0) return;
+
+  const { error: insertError } = await supabase
+    .from('product_tags')
+    .insert(normalized.map((tagId) => ({ product_id: productId, tag_id: tagId })));
+  if (insertError) throw insertError;
 }

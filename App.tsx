@@ -1,11 +1,17 @@
 
 import React, { useState, useEffect, useMemo, useRef, useCallback, useDeferredValue } from 'react';
-import { ShoppingBag, User, Search, Filter, Trash2, Plus, LogOut, ChevronRight, CheckCircle, Package, BarChart3, Menu, X, Star, ExternalLink, Edit2, Upload, Phone, MapPin, Truck, Check, Mail, List, Layers, Info } from 'lucide-react';
-import { Category, Product, ProductGender, ProductSizeStock, Order, CartItem, FinancialMetric, FinancialTotals, View } from './types';
+import { ShoppingBag, User, Search, Filter, Trash2, Plus, LogOut, ChevronRight, CheckCircle, Package, BarChart3, Menu, X, Star, ExternalLink, Edit2, Upload, Download, Phone, MapPin, Truck, Check, Mail, List, Layers, Info, Palette, MessageCircle, Tag as TagIcon } from 'lucide-react';
+import * as XLSX from 'xlsx';
+import { Category, Product, ProductGender, ProductSizeStock, Order, CartItem, FinancialMetric, FinancialTotals, View, Tag } from './types';
 import { INITIAL_PRODUCTS, ADMIN_CREDENTIALS, ADMIN_USER, ADMIN_PASS, LEBANON_LOCATIONS, SIZE_OPTIONS } from './constants';
 import { getProductRecommendation } from './services/gemini';
-import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals, reserveCartLine, releaseCartLineReservation, cleanupExpiredReservations, extendExpiredReservation, getProductColorTokens, uploadProductImagesToStorage, normalizeOrderStatus } from './services/database';
+import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals, reserveCartLine, releaseCartLineReservation, cleanupExpiredReservations, extendExpiredReservation, getProductColorTokens, uploadProductImagesToStorage, normalizeOrderStatus, getTags } from './services/database';
 import { supabase } from './services/supabase';
+import AnnouncementBar from './components/AnnouncementBar';
+import HeroBannerSlider from './components/HeroBannerSlider';
+import HomepageSections from './components/HomepageSections';
+import EditThemePanel from './components/EditThemePanel';
+import TagsManagerPanel from './components/TagsManagerPanel';
 
 const BRAND_LOGO_SRC = '/flex-logo.JPG';
 const DELIVERY_FEE = 5;
@@ -13,6 +19,7 @@ const GENDER_OPTIONS: ProductGender[] = ['Men', 'Women', 'Unisex'];
 const NUMERIC_SIZE_FILTER_OPTIONS = Array.from({ length: 16 }, (_, i) => String(35 + i));
 const CLOTHING_SIZE_FILTER_OPTIONS = ['S', 'M', 'L', 'XL'];
 const CART_STORAGE_KEY = 'flex_cart';
+const ADMIN_AUTH_STORAGE_KEY = 'flex_admin_auth';
 
 function ColorTagInput({
   value,
@@ -114,9 +121,12 @@ function getInitialCartState(): CartItem[] {
 
 function routeFromPathname(pathname: string): { view: View; productId: string | null } {
   const normalized = String(pathname || '/').trim();
-  const lower = normalized.toLowerCase();
+  const normalizedPath = normalized.length > 1 && normalized.endsWith('/')
+    ? normalized.slice(0, -1)
+    : normalized;
+  const lower = normalizedPath.toLowerCase();
   if (lower.startsWith('/product/')) {
-    const productId = decodeURIComponent(normalized.slice('/product/'.length)).trim();
+    const productId = decodeURIComponent(normalizedPath.slice('/product/'.length)).trim();
     return { view: 'product', productId: productId || null };
   }
   if (lower === '/admin') return { view: 'admin', productId: null };
@@ -310,6 +320,33 @@ function getProductStockTotals(product: Product): { stock: number; sold: number;
   return { stock, sold, left: Math.max(0, stock - sold) };
 }
 
+/**
+ * Bulk-edit "Stock" field sets how many are currently available (left), leaving sold history
+ * untouched. For size-based products, the new left-total is distributed evenly across the
+ * product's existing sizes; each size's stock is recomputed as sold + its share of left, so it
+ * can never dip below what's already sold.
+ */
+function buildBulkStockUpdate(product: Product, newPiecesLeft: number): { initialStock: number; pieces: number; sizeStock?: ProductSizeStock[] } {
+  const existingSizeStock = normalizeSizeStockEntries(product);
+  if (existingSizeStock.length === 0) {
+    const sold = Math.max(0, Math.floor(Number(product.sold || 0)));
+    return { initialStock: sold + newPiecesLeft, pieces: newPiecesLeft };
+  }
+
+  const sizes = existingSizeStock.map((entry) => entry.size);
+  const soldBySize = existingSizeStock.map((entry) => Math.max(0, Math.floor(Number(entry.sold || 0))));
+  const nextSizeStock: ProductSizeStock[] = sizes.map((size, index) => {
+    const left = Math.floor(newPiecesLeft / sizes.length) + (index < newPiecesLeft % sizes.length ? 1 : 0);
+    return { size, stock: soldBySize[index] + left, sold: soldBySize[index], left };
+  });
+
+  return {
+    initialStock: nextSizeStock.reduce((sum, entry) => sum + entry.stock, 0),
+    pieces: nextSizeStock.reduce((sum, entry) => sum + entry.left, 0),
+    sizeStock: nextSizeStock,
+  };
+}
+
 function getProductImages(product: Product): string[] {
   const images = Array.isArray(product.images) && product.images.length > 0 ? product.images : [product.image];
   return Array.from(new Set(images.map((image) => String(image || '').trim()).filter(Boolean)));
@@ -333,7 +370,9 @@ function isValidDataImageUrl(value: string): boolean {
 function isRenderableImageSrc(value: string): boolean {
   if (!value) return false;
   if (/^https?:\/\//i.test(value)) return true;
-  if (/^\/[\w./%+-]+$/i.test(value)) return true;
+  // Bounded length keeps this from matching base64 fragments (thousands of chars, no "=" padding
+  // in some encodings) that happen to satisfy this character class otherwise.
+  if (value.length <= 200 && /^\/[\w./%+-]+$/i.test(value)) return true;
   return isValidDataImageUrl(value);
 }
 
@@ -573,7 +612,17 @@ const App: React.FC = () => {
   const [products, setProducts] = useState<Product[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
   const [cart, setCart] = useState<CartItem[]>(() => getInitialCartState());
-  const [isAdmin, setIsAdmin] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(() => {
+    // When Supabase is configured, real admin state comes from a Supabase Auth session
+    // (resolved asynchronously below) rather than this synchronous localStorage flag, which
+    // only backs the dev-only fallback login used when Supabase isn't configured at all.
+    if (supabase) return false;
+    try {
+      return localStorage.getItem(ADMIN_AUTH_STORAGE_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
   const [searchQuery, setSearchQuery] = useState('');
   const deferredSearchQuery = useDeferredValue(searchQuery);
   const [filterCategory, setFilterCategory] = useState<Category | 'All'>('All');
@@ -582,6 +631,7 @@ const App: React.FC = () => {
   const [selectedColorFilters, setSelectedColorFilters] = useState<string[]>([]);
   const [selectedBrands, setSelectedBrands] = useState<string[]>([]);
   const [hideSoldOutItems, setHideSoldOutItems] = useState<boolean>(false);
+  const [showOnSaleOnly, setShowOnSaleOnly] = useState<boolean>(false);
   const [selectedGenders, setSelectedGenders] = useState<ProductGender[]>([]);
   const [isCategoryFilterExpanded, setIsCategoryFilterExpanded] = useState<boolean>(true);
   const [isColorFilterExpanded, setIsColorFilterExpanded] = useState<boolean>(true);
@@ -691,12 +741,6 @@ const App: React.FC = () => {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'order_items' }, () => {
         void refreshLiveState();
       })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'product_financial_metrics' }, () => {
-        void refreshLiveState();
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'financial_dashboard_totals' }, () => {
-        void refreshLiveState();
-      })
       .subscribe((status) => {
         if (status === 'SUBSCRIBED') {
           void refreshLiveState();
@@ -707,6 +751,31 @@ const App: React.FC = () => {
       void client.removeChannel(channel);
     };
   }, [refreshLiveState]);
+
+  // Admin status is derived from a real Supabase Auth session (not just a client-side flag) so
+  // that RLS policies can actually trust it. Dev-only fallback (no Supabase configured) keeps
+  // using the hardcoded-credential flow inside AdminPanel's login screen below.
+  useEffect(() => {
+    if (!supabase) return;
+    const client = supabase;
+
+    client.auth.getSession().then(({ data }) => {
+      setIsAdmin(!!data.session);
+    });
+
+    const { data: authListener } = client.auth.onAuthStateChange((_event, session) => {
+      setIsAdmin(!!session);
+    });
+
+    return () => {
+      authListener.subscription.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    void refreshLiveState();
+  }, [isAdmin, refreshLiveState]);
 
   useEffect(() => {
     const syncFromVisibility = () => {
@@ -747,6 +816,21 @@ const App: React.FC = () => {
       // Ignore storage issues to avoid interrupting cart flow.
     }
   }, [cart]);
+
+  useEffect(() => {
+    // Only the dev-only fallback (no Supabase configured) needs this; with Supabase configured,
+    // supabase-js already persists its own session, and isAdmin tracks that session directly.
+    if (supabase) return;
+    try {
+      if (isAdmin) {
+        localStorage.setItem(ADMIN_AUTH_STORAGE_KEY, '1');
+      } else {
+        localStorage.removeItem(ADMIN_AUTH_STORAGE_KEY);
+      }
+    } catch {
+      // Ignore storage errors to avoid interrupting admin flow.
+    }
+  }, [isAdmin]);
 
   useEffect(() => {
     if (cartNotice.trim() === '') return;
@@ -939,9 +1023,9 @@ const App: React.FC = () => {
         selectedBrands.includes(getProductBrandLabel(p));
 
       const matchesCategory = filterCategory === 'All' || p.category === filterCategory;
-      return matchesSearch && matchesColors && matchesCategory && matchesPrice && matchesSize && matchesGender && matchesBrand && !(hideSoldOutItems && isSoldOut);
+      return matchesSearch && matchesColors && matchesCategory && matchesPrice && matchesSize && matchesGender && matchesBrand && !(hideSoldOutItems && isSoldOut) && !(showOnSaleOnly && !p.onSale);
     });
-  }, [products, deferredSearchQuery, filterCategory, maxPrice, selectedSizeFilters, selectedGenders, selectedColorFilters, selectedBrands, hideSoldOutItems]);
+  }, [products, deferredSearchQuery, filterCategory, maxPrice, selectedSizeFilters, selectedGenders, selectedColorFilters, selectedBrands, hideSoldOutItems, showOnSaleOnly]);
 
   const activeProduct = useMemo(
     () => products.find((product) => product.Product_ID === selectedProductId) || null,
@@ -1600,7 +1684,7 @@ const App: React.FC = () => {
           </div>
         )}
       </div>
-      <div className="pt-4 border-t-2 border-gray-50">
+      <div className="pt-4 border-t-2 border-gray-50 space-y-2">
         <label className="flex items-center gap-2.5 p-2.5 border rounded-xl bg-white text-[9px] font-black uppercase tracking-wider cursor-pointer">
           <input
             type="checkbox"
@@ -1610,1486 +1694,19 @@ const App: React.FC = () => {
           />
           <span>Hide Sold Out Items</span>
         </label>
+        <label className="flex items-center gap-2.5 p-2.5 border rounded-xl bg-white text-[9px] font-black uppercase tracking-wider cursor-pointer">
+          <input
+            type="checkbox"
+            checked={showOnSaleOnly}
+            onChange={(e) => setShowOnSaleOnly(e.target.checked)}
+            className="h-3.5 w-3.5 accent-orange-600"
+          />
+          <span>Sale Items Only</span>
+        </label>
       </div>
     </>
   );
 
-  const AdminPanel = () => {
-    type InventorySection = 'All' | Category | 'ComingSoon';
-    const [user, setUser] = useState('');
-    const [pass, setPass] = useState('');
-    const [activeTab, setActiveTab] = useState<'orders' | 'add' | 'inventory' | 'financials'>('inventory');
-    const [editMode, setEditMode] = useState<Product | null>(null);
-    const [uploadedImageFiles, setUploadedImageFiles] = useState<File[]>([]);
-    const [uploadedImagePreviews, setUploadedImagePreviews] = useState<string[]>([]);
-    const [imageValidationErrors, setImageValidationErrors] = useState<string[]>([]);
-    const [isUploadingImages, setIsUploadingImages] = useState(false);
-    const [formCategory, setFormCategory] = useState<Category>(Category.SHOES);
-    const [selectedSizes, setSelectedSizes] = useState<string[]>([]);
-    const [brandName, setBrandName] = useState('');
-    const [productName, setProductName] = useState('');
-    const [formColors, setFormColors] = useState<string>('');
-    const [formImagesText, setFormImagesText] = useState<string>('');
-    const [formSizeStock, setFormSizeStock] = useState<ProductSizeStock[]>([]);
-    const [formStock, setFormStock] = useState<number | ''>('');
-    const [formSold, setFormSold] = useState<number | ''>('');
-    const [inventorySection, setInventorySection] = useState<InventorySection>('All');
-    const [inventorySort, setInventorySort] = useState<{ col: 'Product_ID' | 'productName' | 'category'; dir: 'asc' | 'desc' } | null>(null);
-    const [financialMetrics, setFinancialMetrics] = useState<FinancialMetric[]>([]);
-    const [financialTotals, setFinancialTotals] = useState<FinancialTotals | null>(null);
-    const [dispatchingOrderIds, setDispatchingOrderIds] = useState<Set<string>>(new Set());
-    const dispatchingOrderIdsRef = useRef<Set<string>>(new Set());
-    const [cancelingOrderIds, setCancelingOrderIds] = useState<Set<string>>(new Set());
-    const cancelingOrderIdsRef = useRef<Set<string>>(new Set());
-    const [inventoryPage, setInventoryPage] = useState(1);
-    const inventoryPageSize = 20;
-    const fileRef = useRef<HTMLInputElement>(null);
-    const isShoesCategory = formCategory === Category.SHOES;
-
-    const cycleSort = (col: 'Product_ID' | 'productName' | 'category') => {
-      setInventorySort(prev =>
-        prev?.col !== col || !prev ? { col, dir: 'asc' }
-        : prev.dir === 'asc' ? { col, dir: 'desc' }
-        : null
-      );
-    };
-
-    const splitDisplayName = (fullName: string) => {
-      const normalized = (fullName || '').trim();
-      if (!normalized) return { brand: '', product: '' };
-
-      if (normalized.includes(' - ')) {
-        const [brand, ...rest] = normalized.split(' - ');
-        return { brand: brand.trim(), product: rest.join(' - ').trim() };
-      }
-
-      const parts = normalized.split(' ');
-      if (parts.length <= 1) return { brand: normalized, product: '' };
-      return { brand: parts[0], product: parts.slice(1).join(' ') };
-    };
-
-    const generateNextProductId = () => {
-      const maxExisting = products.reduce((max, p) => {
-        const match = /^FF-(\d{3,4})$/i.exec(String(p.Product_ID || ''));
-        if (!match) return max;
-        return Math.max(max, Number(match[1]));
-      }, 100);
-      return `FF-${Math.min(9999, maxExisting + 1)}`;
-    };
-
-    // adminColorSuggestions removed — colors now use a simple comma-separated text input.
-
-    useEffect(() => {
-      if (editMode) {
-        setUploadedImageFiles([]);
-        setUploadedImagePreviews([]);
-        setImageValidationErrors([]);
-        setFormCategory(editMode.category);
-        setSelectedSizes(editMode.sizes);
-        const parsed = splitDisplayName(editMode.name);
-        setBrandName(editMode.brandName || parsed.brand);
-        setProductName(editMode.productName || parsed.product);
-        setFormColors((Array.isArray(editMode.colors) && editMode.colors.length > 0 ? editMode.colors : getProductColorTokens(editMode)).join(', '));
-        setFormImagesText((getProductImages(editMode) || []).join(', '));
-        setFormSizeStock(buildEditableSizeStock(editMode));
-        setFormStock(editMode.initialStock ?? '');
-        setFormSold(editMode.sold ?? 0);
-        setActiveTab('add');
-      } else {
-        setUploadedImageFiles([]);
-        setUploadedImagePreviews([]);
-        setImageValidationErrors([]);
-        setSelectedSizes([]);
-        setBrandName('');
-        setProductName('');
-        setFormColors('');
-        setFormImagesText('');
-        setFormSizeStock([]);
-        setFormStock('');
-        setFormSold('');
-      }
-    }, [editMode]);
-
-    useEffect(() => {
-      setFormSizeStock((prev) => {
-        const next = selectedSizes.map((size) => {
-          const existing = prev.find((entry) => entry.size === size);
-          return existing || { size, stock: 0, left: 0, sold: 0 };
-        });
-        return next;
-      });
-    }, [selectedSizes]);
-
-    useEffect(() => {
-      if (!isAdmin) return;
-
-      const timeout = window.setTimeout(() => {
-        void (async () => {
-          try {
-            const metrics = await recalculateFinancialMetrics();
-            setFinancialMetrics(metrics);
-            const totals = await getFinancialDashboardTotals();
-            setFinancialTotals(totals);
-          } catch (error) {
-            console.error('Error syncing financial metrics:', error);
-          }
-        })();
-      }, 450);
-
-      return () => {
-        window.clearTimeout(timeout);
-      };
-    }, [isAdmin, orders]);
-
-    useEffect(() => {
-      return () => {
-        for (const preview of uploadedImagePreviews) {
-          if (preview.startsWith('blob:')) {
-            URL.revokeObjectURL(preview);
-          }
-        }
-      };
-    }, [uploadedImagePreviews]);
-
-    const displayFinancialMetrics = useMemo<FinancialMetric[]>(() => {
-      if (financialMetrics.length > 0) {
-        return financialMetrics;
-      }
-
-      return products.map((product) => {
-        const totals = getProductStockTotals(product);
-        const itemPrice = Number(product.price || 0);
-        const itemCost = Number(product.cost || 0);
-        const normalizedName = String(product.productName || '').trim()
-          || splitDisplayName(product.name).product
-          || String(product.name || '').trim()
-          || product.Product_ID;
-
-        return {
-          productId: product.Product_ID,
-          productName: normalizedName,
-          itemsSold: totals.sold,
-          itemPrice,
-          itemCost,
-          revenue: totals.sold * itemPrice,
-          netProfit: totals.sold * (itemPrice - itemCost),
-          calculatedAt: new Date().toISOString(),
-        };
-      });
-    }, [financialMetrics, products]);
-
-    const fallbackRevenue = displayFinancialMetrics.reduce((acc, row) => acc + row.revenue, 0);
-    const fallbackProfit = displayFinancialMetrics.reduce((acc, row) => acc + row.netProfit, 0);
-    const totalSalesValue = financialTotals?.totalRevenue ?? fallbackRevenue;
-    const profit = financialTotals?.totalNetProfit ?? fallbackProfit;
-
-    const inventorySections: InventorySection[] = ['All', ...Object.values(Category), 'ComingSoon'];
-    const inventoryProducts = useMemo(() => {
-      let list = inventorySection === 'All' ? products
-        : inventorySection === 'ComingSoon' ? products.filter(p => /t-?shirt|hoodie/i.test(p.type))
-        : products.filter(p => p.category === inventorySection);
-      if (inventorySort) {
-        const { col, dir } = inventorySort;
-        list = [...list].sort((a, b) => {
-          const va = col === 'Product_ID' ? a.Product_ID : col === 'productName' ? (a.productName || a.name) : a.category;
-          const vb = col === 'Product_ID' ? b.Product_ID : col === 'productName' ? (b.productName || b.name) : b.category;
-          const cmp = va.localeCompare(vb, undefined, { numeric: true, sensitivity: 'base' });
-          return dir === 'asc' ? cmp : -cmp;
-        });
-      }
-      return list;
-    }, [products, inventorySection, inventorySort]);
-
-    useEffect(() => {
-      setInventoryPage(1);
-    }, [inventorySection, inventorySort, products.length]);
-
-    const inventoryTotalPages = Math.max(1, Math.ceil(inventoryProducts.length / inventoryPageSize));
-    const pagedInventoryProducts = useMemo(() => {
-      const start = (inventoryPage - 1) * inventoryPageSize;
-      return inventoryProducts.slice(start, start + inventoryPageSize);
-    }, [inventoryProducts, inventoryPage, inventoryPageSize]);
-
-    const beginOrderDispatch = (orderId: string): boolean => {
-      const normalized = String(orderId || '').trim();
-      if (!normalized) return false;
-      if (dispatchingOrderIdsRef.current.has(normalized)) return false;
-      const next = new Set(dispatchingOrderIdsRef.current);
-      next.add(normalized);
-      dispatchingOrderIdsRef.current = next;
-      setDispatchingOrderIds(next);
-      return true;
-    };
-
-    const endOrderDispatch = (orderId: string): void => {
-      const normalized = String(orderId || '').trim();
-      if (!normalized || !dispatchingOrderIdsRef.current.has(normalized)) return;
-      const next = new Set(dispatchingOrderIdsRef.current);
-      next.delete(normalized);
-      dispatchingOrderIdsRef.current = next;
-      setDispatchingOrderIds(next);
-    };
-
-    const beginOrderCancel = (orderId: string): boolean => {
-      const normalized = String(orderId || '').trim();
-      if (!normalized) return false;
-      if (cancelingOrderIdsRef.current.has(normalized)) return false;
-      const next = new Set(cancelingOrderIdsRef.current);
-      next.add(normalized);
-      cancelingOrderIdsRef.current = next;
-      setCancelingOrderIds(next);
-      return true;
-    };
-
-    const endOrderCancel = (orderId: string): void => {
-      const normalized = String(orderId || '').trim();
-      if (!normalized || !cancelingOrderIdsRef.current.has(normalized)) return;
-      const next = new Set(cancelingOrderIdsRef.current);
-      next.delete(normalized);
-      cancelingOrderIdsRef.current = next;
-      setCancelingOrderIds(next);
-    };
-
-    if (!isAdmin) {
-      return (
-        <div className="min-h-[60vh] flex items-center justify-center p-4">
-          <div className="bg-white p-8 rounded-3xl shadow-xl w-full max-w-md border">
-            <h2 className="text-xl font-black mb-6 text-center uppercase tracking-widest">Admin Authorization</h2>
-            <input type="text" placeholder="Admin Username" className="w-full mb-4 p-3 bg-gray-50 rounded-xl border focus:ring-2 focus:ring-orange-500 transition-all outline-none" value={user} onChange={e => setUser(e.target.value)} />
-            <input type="password" placeholder="Password" className="w-full mb-6 p-3 bg-gray-50 rounded-xl border focus:ring-2 focus:ring-orange-500 transition-all outline-none" value={pass} onChange={e => setPass(e.target.value)} />
-            <button onClick={() => {
-              const isValidLogin = ADMIN_CREDENTIALS.some((credential) => credential.username === user && credential.password === pass);
-              if (isValidLogin) setIsAdmin(true);
-              else alert('Access Denied: Incorrect Credentials');
-            }} className="w-full bg-black text-white py-4 rounded-xl font-bold hover:bg-orange-600 transition-all uppercase tracking-widest">Login</button>
-          </div>
-        </div>
-      );
-    }
-
-    const toggleSize = (size: string) => {
-      setSelectedSizes(prev => prev.includes(size) ? prev.filter(s => s !== size) : [...prev, size]);
-    };
-
-    const parseImageUrlTokens = (raw: string): string[] => {
-      const source = String(raw || '').trim();
-      if (!source) return [];
-
-      const tokens: string[] = [];
-      let pendingDataPrefix: string | null = null;
-
-      for (const part of source.split(',')) {
-        const trimmed = String(part || '').trim();
-        if (!trimmed) continue;
-
-        if (pendingDataPrefix) {
-          tokens.push(`${pendingDataPrefix},${trimmed}`);
-          pendingDataPrefix = null;
-          continue;
-        }
-
-        if (/^data:image\/[a-z0-9.+-]+;base64$/i.test(trimmed)) {
-          pendingDataPrefix = trimmed;
-          continue;
-        }
-
-        tokens.push(trimmed);
-      }
-
-      if (pendingDataPrefix) {
-        tokens.push(pendingDataPrefix);
-      }
-
-      return Array.from(new Set(tokens));
-    };
-
-    const validateImageUrl = (url: string): Promise<boolean> => {
-      return new Promise((resolve) => {
-        const candidate = String(url || '').trim();
-        if (isValidDataImageUrl(candidate)) {
-          resolve(true);
-          return;
-        }
-
-        if (/^\/[\w./%+-]+$/i.test(candidate)) {
-          resolve(true);
-          return;
-        }
-
-        if (!/^https?:\/\//i.test(candidate)) {
-          resolve(false);
-          return;
-        }
-
-        const image = new Image();
-        const timeout = window.setTimeout(() => {
-          image.src = '';
-          resolve(false);
-        }, 4000);
-        image.onload = () => {
-          window.clearTimeout(timeout);
-          resolve(true);
-        };
-        image.onerror = () => {
-          window.clearTimeout(timeout);
-          resolve(false);
-        };
-        image.src = candidate;
-      });
-    };
-
-    const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
-      const files = Array.from(e.target.files || []);
-      if (files.length === 0) return;
-
-      const validFiles: File[] = [];
-      const errors: string[] = [];
-
-      for (const file of files) {
-        if (Number(file.size || 0) <= 0) {
-          errors.push(`${file.name}: empty file.`);
-          continue;
-        }
-
-        if (file.size > 50 * 1024 * 1024) {
-          errors.push(`${file.name}: exceeds 50MB limit.`);
-          continue;
-        }
-
-        const type = String(file.type || '').toLowerCase();
-        if (!['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(type)) {
-          errors.push(`${file.name}: unsupported format.`);
-          continue;
-        }
-
-        validFiles.push(file);
-      }
-
-      if (errors.length > 0) {
-        setImageValidationErrors(errors);
-      }
-
-      if (validFiles.length === 0) {
-        e.target.value = '';
-        return;
-      }
-
-      setUploadedImageFiles((prev) => [...prev, ...validFiles]);
-      const objectUrls = validFiles.map((file) => URL.createObjectURL(file));
-      setUploadedImagePreviews((prev) => [...prev, ...objectUrls]);
-      e.target.value = '';
-    };
-
-    const saveProduct = async (e: React.FormEvent<HTMLFormElement>) => {
-      e.preventDefault();
-      const formEl = e.currentTarget;
-      if (selectedSizes.length === 0) {
-        alert("Select at least one size for this product.");
-        return;
-      }
-      const normalizedBrand = brandName.trim();
-      const normalizedProduct = productName.trim();
-      if (!normalizedBrand || !normalizedProduct) {
-        alert('Please fill both Brand Name and Product Name.');
-        return;
-      }
-      const fd = new FormData(formEl);
-      // DEBUG: Log colors state and product ID before building payload
-      console.log('[saveProduct] formColors text:', formColors);
-      console.log('[saveProduct] editMode?.Product_ID:', editMode?.Product_ID);
-
-      const productId = editMode?.Product_ID || generateNextProductId();
-      console.log('[saveProduct] Resolved productId:', productId, '| isEdit:', !!editMode);
-
-      // Parse comma-separated text into a clean string[] for the DB text[] column
-      const colorTokens: string[] = Array.from(
-        new Set(
-          formColors
-            .split(',')
-            .map((c) => c.trim().toLowerCase())
-            .filter(Boolean)
-        )
-      );
-      console.log('[saveProduct] colorTokens to save:', colorTokens);
-
-      const urlImages = parseImageUrlTokens(formImagesText);
-      setImageValidationErrors([]);
-
-      const validationResults = await Promise.all(
-        urlImages.map(async (candidate) => ({
-          candidate,
-          isValid: await validateImageUrl(candidate),
-        }))
-      );
-      const invalidUrls = validationResults.filter((entry) => !entry.isValid).map((entry) => entry.candidate);
-
-      if (invalidUrls.length > 0) {
-        setImageValidationErrors(invalidUrls.map((url) => `Invalid or unreachable image URL: ${url}`));
-        alert('Fix invalid image URLs before saving this product.');
-        return;
-      }
-
-      let uploadedUrls: string[] = [];
-      if (uploadedImageFiles.length > 0) {
-        setIsUploadingImages(true);
-        try {
-          uploadedUrls = await uploadProductImagesToStorage(editMode?.Product_ID || productId, uploadedImageFiles);
-        } finally {
-          setIsUploadingImages(false);
-        }
-      }
-
-      const parsedImages = Array.from(new Set([...uploadedUrls, ...urlImages]));
-      if (parsedImages.length === 0) {
-        alert('Add at least one valid image (upload or URL).');
-        return;
-      }
-      const normalizedSizeStock = selectedSizes.map((size) => {
-        const existing = formSizeStock.find((entry) => entry.size === size);
-        const stockAmount = Math.max(0, Math.floor(Number(existing?.stock ?? 0)));
-        return {
-          size,
-          stock: stockAmount,
-          left: stockAmount,
-          sold: 0,
-        };
-      });
-
-      const explicitSizeStockTotal = normalizedSizeStock.reduce((total, entry) => total + entry.stock, 0);
-      const fallbackStock = Number(formStock);
-      const resolvedStock = explicitSizeStockTotal > 0
-        ? explicitSizeStockTotal
-        : Number.isFinite(fallbackStock) && fallbackStock > 0
-          ? fallbackStock
-          : 0;
-
-      if (resolvedStock <= 0) {
-        alert('Add stock for at least one size before saving this product.');
-        return;
-      }
-
-      const derivedSizeStock = explicitSizeStockTotal > 0
-        ? normalizedSizeStock
-        : selectedSizes.map((size, index) => {
-            const stockAmount = Math.max(0, Math.floor(resolvedStock / selectedSizes.length) + (index < (resolvedStock % selectedSizes.length) ? 1 : 0));
-            return {
-              size,
-              stock: stockAmount,
-              left: stockAmount,
-              sold: 0,
-            };
-          });
-
-      const originalPriceValue = Number(fd.get('original_price'));
-      const isOnSale = Boolean(fd.get('on_sale'));
-
-      const stock = resolvedStock;
-      const itemsSold = Number(formSold === '' ? (editMode?.sold ?? 0) : formSold);
-      const piecesLeft = stock - itemsSold;
-
-      if (!Number.isInteger(stock) || stock < 0 || !Number.isInteger(itemsSold) || itemsSold < 0 || itemsSold > stock) {
-        alert('Stock and items sold must be valid non-negative integers, and items sold cannot exceed stock.');
-        return;
-      }
-      const newP: Product = {
-        Product_ID: productId,
-        name: `${normalizedBrand} - ${normalizedProduct}`,
-        brandName: normalizedBrand,
-        productName: normalizedProduct,
-        gender: normalizeGender(fd.get('gender')),
-        category: formCategory,
-        type: fd.get('type') as string,
-        price: Number(fd.get('price')),
-        cost: Number(fd.get('cost')),
-        initialStock: stock,
-        pieces: piecesLeft,
-        sold: itemsSold,
-        sizes: selectedSizes,
-        sizeStock: derivedSizeStock,
-        description: fd.get('description') as string,
-        image: parsedImages[0] || (fd.get('image') as string) || editMode?.image || '',
-        images: parsedImages,
-        isAuthentic: true,
-        status: (fd.get('status') as string) || 'Active',
-        colors: colorTokens,
-        color: colorTokens.length ? colorTokens.join(', ') : undefined,
-        originalPrice: Number.isFinite(originalPriceValue) && originalPriceValue > 0 ? originalPriceValue : undefined,
-        onSale: isOnSale,
-      };
-      console.log('[saveProduct] Final payload:', JSON.stringify(newP, null, 2));
-      try {
-        await syncProductToDatabase(newP);
-        const refreshedProducts = await getProducts();
-        setProducts(refreshedProducts);
-        setEditMode(null);
-        setUploadedImageFiles([]);
-        setUploadedImagePreviews([]);
-        setFormImagesText('');
-        setImageValidationErrors([]);
-        setFormSizeStock([]);
-        setSelectedSizes([]);
-        setBrandName('');
-        setProductName('');
-        setActiveTab('inventory');
-        setFormColors('');
-        setFormStock('');
-        setFormSold('');
-        formEl.reset();
-      } catch (error: any) {
-        console.error('Error saving product:', error);
-        const msg = error?.message || error?.error_description || JSON.stringify(error);
-        alert(`Failed to save product to database.\n\nError: ${msg}\n\nCheck Supabase dashboard → Table Editor → products → RLS policies.`);
-      }
-    };
-
-    return (
-      <div className="max-w-7xl mx-auto px-4 py-10">
-        <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 bg-white border p-4 rounded-xl gap-3">
-          <div>
-            <p className="text-[10px] font-bold uppercase text-gray-500 mb-1">Admin Dashboard</p>
-            <h2 className="text-lg md:text-xl font-black uppercase text-gray-900">Inventory Control</h2>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <button onClick={() => setActiveTab('inventory')} className={`px-4 py-2 rounded-lg font-bold uppercase text-xs transition-colors flex items-center gap-2 border ${activeTab === 'inventory' ? 'bg-gray-900 text-white border-gray-900' : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50'}`}><Layers size={14} /> Inventory</button>
-            <button onClick={() => setActiveTab('add')} className={`px-4 py-2 rounded-lg font-bold uppercase text-xs transition-colors flex items-center gap-2 border ${activeTab === 'add' ? 'bg-gray-900 text-white border-gray-900' : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50'}`}><Plus size={14} /> Add / Edit</button>
-            <button onClick={() => setActiveTab('orders')} className={`px-4 py-2 rounded-lg font-bold uppercase text-xs transition-colors flex items-center gap-2 border ${activeTab === 'orders' ? 'bg-gray-900 text-white border-gray-900' : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50'}`}><Package size={14} /> Orders</button>
-            <button onClick={() => setActiveTab('financials')} className={`px-4 py-2 rounded-lg font-bold uppercase text-xs transition-colors flex items-center gap-2 border ${activeTab === 'financials' ? 'bg-gray-900 text-white border-gray-900' : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50'}`}><BarChart3 size={14} /> Financials</button>
-            <button onClick={() => setIsAdmin(false)} className="bg-white hover:bg-red-50 text-gray-700 hover:text-red-600 px-3 py-2 rounded-lg transition-colors font-bold flex items-center gap-2 border border-gray-200"><LogOut size={14} /></button>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
-           <div className="bg-white p-4 rounded-xl border">
-             <div className="flex justify-between items-center mb-1">
-               <BarChart3 className="text-gray-500" size={18} />
-               <span className="text-[10px] font-bold uppercase text-gray-500">Total Revenue</span>
-             </div>
-             <p className="text-lg md:text-xl font-black">${totalSalesValue.toLocaleString()}</p>
-           </div>
-           <div className="bg-white p-4 rounded-xl border">
-             <div className="flex justify-between items-center mb-1">
-               <Package className="text-gray-500" size={18} />
-               <span className="text-[10px] font-bold uppercase text-gray-500">Orders Fulfilled</span>
-             </div>
-             <p className="text-lg md:text-xl font-black">{orders.length}</p>
-           </div>
-           <div className="bg-white p-4 rounded-xl border">
-             <div className="flex justify-between items-center mb-1">
-               <Star className="text-gray-500" size={18} />
-               <span className="text-[10px] font-bold uppercase text-gray-500">Net Profit</span>
-             </div>
-             <p className="text-lg md:text-xl font-black text-gray-900">${profit.toLocaleString()}</p>
-           </div>
-        </div>
-
-        {activeTab === 'financials' && (
-          <div className="bg-white border rounded-xl overflow-hidden mb-8">
-            <div className="p-4 border-b bg-gray-50 flex items-center justify-between gap-3">
-              <div>
-                <p className="text-[10px] font-bold uppercase text-gray-500">Financial Breakdown (Database)</p>
-                <h3 className="text-sm md:text-base font-black uppercase text-gray-900">Revenue & Net Profit Per Product</h3>
-              </div>
-              <span className="text-[10px] bg-gray-900 text-white px-3 py-1 rounded-full font-bold uppercase">{displayFinancialMetrics.length} Items</span>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-[11px] min-w-[900px]">
-                <thead className="bg-gray-100 uppercase font-black text-gray-500 border-b">
-                  <tr>
-                    <th className="p-3">Product_ID</th>
-                    <th className="p-3">Name_of_Product</th>
-                    <th className="p-3">Items_Sold</th>
-                    <th className="p-3">Price</th>
-                    <th className="p-3">Cost</th>
-                    <th className="p-3">Revenue (Sold×Price)</th>
-                    <th className="p-3">Net_Profit</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {displayFinancialMetrics.map((row) => (
-                    <tr key={row.productId} className="hover:bg-gray-50 transition-colors">
-                      <td className="p-3 font-bold text-gray-700">{row.productId}</td>
-                      <td className="p-3 font-semibold text-gray-900">{row.productName}</td>
-                      <td className="p-3 text-gray-700">{row.itemsSold}</td>
-                      <td className="p-3 text-gray-700">${row.itemPrice.toFixed(2)}</td>
-                      <td className="p-3 text-gray-700">${row.itemCost.toFixed(2)}</td>
-                      <td className="p-3 font-bold text-gray-900">${row.revenue.toFixed(2)}</td>
-                      <td className={`p-3 font-bold ${row.netProfit >= 0 ? 'text-green-700' : 'text-red-600'}`}>${row.netProfit.toFixed(2)}</td>
-                    </tr>
-                  ))}
-                  {displayFinancialMetrics.length === 0 && (
-                    <tr>
-                      <td colSpan={7} className="p-6 text-center text-gray-500">No products available yet.</td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-            <div className="p-4 border-t bg-gray-50 flex justify-end gap-8">
-              <div className="text-right">
-                <p className="text-[10px] font-bold uppercase text-gray-500">Total Revenue</p>
-                <p className="text-base font-black text-gray-900">${totalSalesValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
-              </div>
-              <div className="text-right">
-                <p className="text-[10px] font-bold uppercase text-gray-500">Total Net Profit</p>
-                <p className={`text-base font-black ${profit >= 0 ? 'text-green-700' : 'text-red-600'}`}>${profit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {activeTab === 'inventory' && (
-          <div className="bg-white rounded-xl border overflow-hidden animate-fade-in-up">
-            <div className="p-4 border-b bg-gray-50 flex flex-col gap-3">
-              <div className="flex justify-between items-center">
-                <div>
-                  <h3 className="font-black uppercase text-sm text-gray-700">Inventory</h3>
-                  <p className="text-[10px] text-gray-500 font-semibold uppercase">All sections connected to database</p>
-                </div>
-                <span className="text-[10px] bg-gray-900 text-white px-3 py-1 rounded-full font-bold uppercase">{inventoryProducts.length} Total</span>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {inventorySections.map(section => {
-                  const label = section === 'ComingSoon' ? 'T-shirts & Hoodies (Soon)' : section;
-                  const count = section === 'All'
-                    ? products.length
-                    : section === 'ComingSoon'
-                      ? products.filter(p => /t-?shirt|hoodie/i.test(p.type)).length
-                      : products.filter(p => p.category === section).length;
-                  return (
-                    <button
-                      key={section}
-                      onClick={() => setInventorySection(section)}
-                      className={`px-3 py-1.5 rounded-md text-xs font-bold border transition-colors ${inventorySection === section ? 'bg-gray-900 text-white border-gray-900' : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50'}`}
-                    >
-                      {label} ({count})
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-[11px] min-w-[1700px]">
-                <thead className="bg-gray-100 uppercase font-black text-gray-500 border-b">
-                  <tr>
-                    <th className="p-3">
-                      <button onClick={() => cycleSort('Product_ID')} className="flex items-center gap-1 hover:text-gray-900 transition-colors">
-                        Product_ID
-                        <span className="text-[10px] leading-none">{inventorySort?.col === 'Product_ID' ? (inventorySort.dir === 'asc' ? '▲' : '▼') : '⇅'}</span>
-                      </button>
-                    </th>
-                    <th className="p-3">Name_of_Brand</th>
-                    <th className="p-3">
-                      <button onClick={() => cycleSort('productName')} className="flex items-center gap-1 hover:text-gray-900 transition-colors">
-                        Name_of_Product
-                        <span className="text-[10px] leading-none">{inventorySort?.col === 'productName' ? (inventorySort.dir === 'asc' ? '▲' : '▼') : '⇅'}</span>
-                      </button>
-                    </th>
-                    <th className="p-3">
-                      <button onClick={() => cycleSort('category')} className="flex items-center gap-1 hover:text-gray-900 transition-colors">
-                        Category
-                        <span className="text-[10px] leading-none">{inventorySort?.col === 'category' ? (inventorySort.dir === 'asc' ? '▲' : '▼') : '⇅'}</span>
-                      </button>
-                    </th>
-                    <th className="p-3">Gender</th>
-                    <th className="p-4">Type</th>
-                    <th className="p-3">SIZE</th>
-                    <th className="p-3">Colors</th>
-                    <th className="p-3">Cost</th>
-                    <th className="p-3">Price</th>
-                    <th className="p-3">Stock</th>
-                    <th className="p-3">Items left (set)</th>
-                    <th className="p-3">Items_Sold</th>
-                    <th className="p-3">Size Breakdown</th>
-                    <th className="p-3">Status</th>
-                    <th className="p-3">Pictures</th>
-                    <th className="p-3">Description</th>
-                    <th className="p-3 text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {pagedInventoryProducts.map(p => {
-                    const totals = getProductStockTotals(p);
-                    const computedLeft = totals.left;
-                    const stockStatus = computedLeft <= 0 ? 'Out of Stock' : computedLeft < 10 ? 'Low Stock' : 'Healthy';
-                    const normalizedStatus = p.status || stockStatus;
-                    const rowColors = getProductColorTokens(p);
-                    const sizeBreakdown = normalizeSizeStockEntries(p);
-                    return (
-                      <tr key={p.Product_ID} className="hover:bg-gray-50 transition-colors">
-                        <td className="p-3 font-bold text-gray-700">{p.Product_ID}</td>
-                        <td className="p-3 font-semibold text-gray-900">{p.brandName || splitDisplayName(p.name).brand || '-'}</td>
-                        <td className="p-3 font-semibold text-gray-900">{p.productName || splitDisplayName(p.name).product || '-'}</td>
-                        <td className="p-3 text-gray-700">{p.category}</td>
-                        <td className="p-3 text-gray-700">{normalizeGender(p.gender)}</td>
-                        <td className="p-3 text-gray-700">{p.type}</td>
-                        <td className="p-3 text-gray-700">{p.sizes.join(', ') || '-'}</td>
-                        <td className="p-3">
-                          <div className="flex flex-wrap gap-1 max-w-[140px]">
-                            {rowColors.length ? (
-                              rowColors.map((c) => (
-                                <span key={c} className="inline-block bg-orange-50 text-orange-800 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase">
-                                  {c}
-                                </span>
-                              ))
-                            ) : (
-                              <span className="text-gray-400 text-[10px]">—</span>
-                            )}
-                          </div>
-                        </td>
-                        <td className="p-3 text-gray-700">${p.cost}</td>
-                        <td className="p-3 font-bold text-gray-900">${p.price}</td>
-                        <td className="p-3 text-gray-700">{totals.stock}</td>
-                        <td className="p-3 font-bold text-orange-600">
-                          {computedLeft}
-                        </td>
-                        <td className="p-3 text-blue-600 font-bold">{totals.sold}</td>
-                        <td className="p-3 text-gray-700">
-                          {sizeBreakdown.length > 0 ? (
-                            <div className="flex flex-col gap-1">
-                              {sizeBreakdown.map((entry) => (
-                                <span key={`${p.Product_ID}-${entry.size}`} className="text-[10px] font-bold">
-                                  {entry.size}: {entry.left} left
-                                </span>
-                              ))}
-                            </div>
-                          ) : (
-                            <span className="text-[10px] text-gray-400">-</span>
-                          )}
-                        </td>
-                        <td className="p-3">
-                          <span className={`px-2 py-1 rounded text-[10px] font-bold uppercase ${normalizedStatus === 'Out of Stock' ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>
-                            {normalizedStatus}
-                          </span>
-                        </td>
-                        <td className="p-3">
-                          <div className="flex items-center gap-2">
-                            <div className="w-9 h-9 rounded border overflow-hidden bg-gray-50 flex items-center justify-center">
-                                <SafeImage src={p.image} className="w-full h-full object-contain p-0.5" alt={p.name} />
-                              </div>
-                            <span className="text-[10px] text-gray-500 max-w-[180px] truncate">{p.image || '-'}</span>
-                          </div>
-                        </td>
-                        <td className="p-3 max-w-[260px]">
-                          <p className="text-[10px] text-gray-600 leading-relaxed line-clamp-3">{p.description || '-'}</p>
-                        </td>
-                        <td className="p-3 text-right">
-                          <div className="flex justify-end gap-1">
-                            <button onClick={() => { setEditMode(p); setUploadedImageFiles([]); setUploadedImagePreviews([]); setImageValidationErrors([]); }} className="p-2 hover:bg-orange-50 text-gray-400 hover:text-orange-600 rounded-lg transition-colors"><Edit2 size={14} /></button>
-                            <button onClick={async () => { 
-                              if(confirm('Permanently erase this asset?')) {
-                                try {
-                                  await deleteProduct(p.Product_ID);
-                                  const refreshedProducts = await getProducts();
-                                  setProducts(refreshedProducts);
-                                } catch (error: any) {
-                                  console.error('Error deleting product:', error);
-                                  const msg = error?.message || 'Failed to delete product. Please try again.';
-                                  alert(msg);
-                                }
-                              }
-                            }} className="p-2 hover:bg-red-50 text-gray-400 hover:text-red-600 rounded-lg transition-colors"><Trash2 size={14} /></button>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                  {pagedInventoryProducts.length === 0 && (
-                    <tr>
-                      <td colSpan={17} className="p-6 text-center text-gray-500 font-semibold">
-                        {inventorySection === 'ComingSoon'
-                          ? 'No T-shirt or Hoodie products found yet. Add items with type containing "tshirt", "t-shirt", or "hoodie".'
-                          : 'No products in this section.'}
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-            {inventoryProducts.length > inventoryPageSize && (
-              <div className="px-4 py-3 border-t bg-gray-50 flex items-center justify-between">
-                <p className="text-[10px] font-black uppercase tracking-wider text-gray-500">Page {inventoryPage} / {inventoryTotalPages}</p>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={inventoryPage <= 1}
-                    onClick={() => setInventoryPage((prev) => Math.max(1, prev - 1))}
-                    className="px-3 py-1.5 text-[10px] font-black uppercase rounded-lg border border-gray-200 text-gray-600 disabled:opacity-40"
-                  >
-                    Prev
-                  </button>
-                  <button
-                    type="button"
-                    disabled={inventoryPage >= inventoryTotalPages}
-                    onClick={() => setInventoryPage((prev) => Math.min(inventoryTotalPages, prev + 1))}
-                    className="px-3 py-1.5 text-[10px] font-black uppercase rounded-lg border border-gray-200 text-gray-600 disabled:opacity-40"
-                  >
-                    Next
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-
-        {activeTab === 'add' && (
-          <div className="max-w-4xl mx-auto bg-white p-6 rounded-2xl shadow-xl border animate-fade-in-up">
-            <h3 className="font-black mb-6 uppercase flex items-center gap-2 text-lg italic text-black">
-              {editMode ? <Edit2 size={24} className="text-orange-600" /> : <Plus size={24} className="text-orange-600" />} {editMode ? 'Update Existing Asset' : 'Create New Authentic Asset'}
-            </h3>
-            <form onSubmit={saveProduct} className="grid grid-cols-1 md:grid-cols-2 gap-8">
-              <div className="space-y-6">
-                <div>
-                  <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Product_ID</label>
-                  <input
-                    value={editMode?.Product_ID || generateNextProductId()}
-                    readOnly
-                    className="w-full p-4 bg-gray-100 border rounded-2xl text-sm font-bold text-gray-600 outline-none"
-                  />
-                </div>
-                <div>
-                  <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Naming</label>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    <input
-                      name="brandName"
-                      value={brandName}
-                      onChange={(e) => setBrandName(e.target.value)}
-                      placeholder="Brand Name"
-                      className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold focus:ring-2 focus:ring-orange-500 outline-none"
-                      required
-                    />
-                    <input
-                      name="productName"
-                      value={productName}
-                      onChange={(e) => setProductName(e.target.value)}
-                      placeholder="Product Name"
-                      className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold focus:ring-2 focus:ring-orange-500 outline-none"
-                      required
-                    />
-                  </div>
-                </div>
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Category</label>
-                    <select value={formCategory} onChange={(e) => {setFormCategory(e.target.value as Category); setSelectedSizes([]);}} className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none">
-                      {Object.values(Category).map(c => <option key={c} value={c}>{c}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Gender</label>
-                    <select name="gender" defaultValue={editMode?.gender || 'Unisex'} className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none">
-                      {GENDER_OPTIONS.map((g) => <option key={g} value={g}>{g}</option>)}
-                    </select>
-                  </div>
-                </div>
-                <div className="grid grid-cols-1 gap-4">
-                  <div>
-                    <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Type/Style</label>
-                    <input name="type" defaultValue={editMode?.type} placeholder="Casual, Vintage..." className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" required />
-                    <label className="text-[10px] font-black uppercase text-gray-400 ml-1 mt-4 block">Colors (tags)</label>
-                    <input
-                      type="text"
-                      value={formColors}
-                      onChange={(e) => setFormColors(e.target.value)}
-                      placeholder="e.g. orange, black, white"
-                      className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold focus:ring-2 focus:ring-orange-500 outline-none"
-                    />
-                  </div>
-                </div>
-                <div>
-                  <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Economics</label>
-                  <div className="grid grid-cols-2 gap-4">
-                    <input name="cost" type="number" step="0.01" defaultValue={editMode?.cost} placeholder="Cost ($)" className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" required />
-                    <input name="price" type="number" step="0.01" defaultValue={editMode?.price} placeholder="Price ($)" className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" required />
-                  </div>
-                </div>
-                <div>
-                  <label className="text-[10px] font-black uppercase text-gray-400 ml-1 block mb-2">Size Stock</label>
-                  <div className="space-y-2 p-3 rounded-2xl bg-gray-50 border">
-                    {selectedSizes.length === 0 ? (
-                      <p className="text-[10px] text-gray-400 font-semibold">Select sizes first to configure stock per size.</p>
-                    ) : (
-                      selectedSizes.map((size) => {
-                        const current = formSizeStock.find((entry) => entry.size === size)?.stock ?? 0;
-                        return (
-                          <div key={size} className="flex items-center gap-3">
-                            <span className="w-16 text-[10px] font-black uppercase tracking-wider text-gray-500">{size}</span>
-                            <input
-                              type="number"
-                              min="0"
-                              value={current}
-                              onChange={(event) => {
-                                const nextStock = Math.max(0, Math.floor(Number(event.target.value || 0)));
-                                setFormSizeStock((prev) => prev.map((entry) => entry.size === size ? { ...entry, stock: nextStock } : entry));
-                              }}
-                              className="flex-1 p-3 bg-white border rounded-xl text-sm font-bold outline-none"
-                              placeholder="0"
-                            />
-                          </div>
-                        );
-                      })
-                    )}
-                  </div>
-                  <div className="mt-3 p-4 rounded-xl bg-orange-50 border border-orange-100 flex items-center justify-between">
-                    <span className="text-[10px] font-black uppercase tracking-wider text-orange-600/70">Calculated Final Inventory</span>
-                    <span className="text-xl font-black text-orange-600">{formSizeStock.reduce((total, entry) => total + Math.max(0, Number(entry.stock || 0)), 0)} pieces left</span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="space-y-6">
-                <div>
-                  <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Asset Description</label>
-                  <textarea name="description" defaultValue={editMode?.description} placeholder="Enter full product details and authenticity notes..." rows={4} className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold focus:ring-2 focus:ring-orange-500 outline-none" required></textarea>
-                </div>
-                <div>
-                  <label className="text-[10px] font-black uppercase text-gray-400 ml-1 block mb-2">Sale Pricing</label>
-                  <div className="grid grid-cols-2 gap-4">
-                    <input name="original_price" type="number" step="0.01" defaultValue={editMode?.originalPrice ?? ''} placeholder="Original Price" className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" />
-                    <label className="flex items-center gap-2 px-4 py-3 bg-gray-50 border rounded-2xl text-sm font-bold text-gray-600">
-                      <input name="on_sale" type="checkbox" defaultChecked={Boolean(editMode?.onSale)} className="h-4 w-4 accent-orange-600" />
-                      On Sale
-                    </label>
-                  </div>
-                </div>
-                <div>
-                  <label className="text-[10px] font-black uppercase text-gray-400 ml-1 block mb-2">Variant Selection ({formCategory})</label>
-                  <div className="mb-2 flex items-center justify-between">
-                    <p className="text-[10px] font-bold uppercase text-gray-500 tracking-wider">{SIZE_OPTIONS[formCategory].length} Checkboxes</p>
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setSelectedSizes([...SIZE_OPTIONS[formCategory]])}
-                        className="px-2.5 py-1 text-[9px] font-black uppercase rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-100"
-                      >
-                        Select All
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setSelectedSizes([])}
-                        className="px-2.5 py-1 text-[9px] font-black uppercase rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-100"
-                      >
-                        Clear
-                      </button>
-                    </div>
-                  </div>
-                  <div className={`grid ${isShoesCategory ? 'grid-cols-4 md:grid-cols-6' : 'grid-cols-4'} gap-1.5 max-h-64 overflow-y-auto p-2 bg-gray-50 border rounded-2xl shadow-inner`}>
-                    {SIZE_OPTIONS[formCategory].map((size) => (
-                      <label key={size} className={`flex items-center justify-center p-2 border rounded-xl text-[9px] cursor-pointer transition-all font-black select-none min-h-9 ${selectedSizes.includes(size) ? 'bg-orange-600 text-white border-orange-600' : 'bg-white border-gray-100 text-gray-500 hover:border-orange-500'}`}>
-                        <input type="checkbox" checked={selectedSizes.includes(size)} onChange={() => toggleSize(size)} className="hidden" />
-                        {size}
-                      </label>
-                    ))}
-                  </div>
-                  {isShoesCategory && (
-                    <p className="mt-2 text-[10px] text-gray-500 font-semibold">
-                      Shoe matrix includes 35 to 50 with variants: base, (1/3), (1/2), (2/3).
-                    </p>
-                  )}
-                </div>
-                <div>
-                  <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Status</label>
-                  <select name="status" defaultValue={editMode?.status || 'Active'} className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none">
-                    <option value="Active">Active</option>
-                    <option value="Discontinued">Discontinued</option>
-                    <option value="Out of Stock">Out of Stock</option>
-                    <option value="Coming Soon">Coming Soon</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Asset Photography</label>
-                  <div className="flex gap-2">
-                    <button type="button" onClick={() => fileRef.current?.click()} className="flex-1 bg-gray-100 py-3 rounded-2xl text-[10px] font-black flex items-center justify-center gap-2 hover:bg-gray-200 uppercase tracking-widest"><Upload size={14} /> Picture</button>
-                    <input name="image" placeholder="Primary image URL" defaultValue={editMode?.image} className="flex-[2] p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" />
-                    <input type="file" ref={fileRef} hidden accept="image/*" multiple onChange={handleFile} />
-                  </div>
-                  <textarea
-                    name="images"
-                    value={formImagesText}
-                    onChange={(event) => setFormImagesText(event.target.value)}
-                    placeholder="Additional image URLs separated by commas"
-                    rows={3}
-                    className="mt-2 w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold focus:ring-2 focus:ring-orange-500 outline-none"
-                  />
-                  {parseImageUrlTokens(formImagesText).length > 0 && (
-                    <div className="mt-2 grid grid-cols-4 gap-2">
-                      {parseImageUrlTokens(formImagesText).map((url, index) => (
-                        <div key={url + index} className="relative rounded-xl border overflow-hidden bg-gray-50 aspect-square">
-                          <SafeImage src={url} alt={`URL preview ${index + 1}`} className="w-full h-full object-cover" />
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const next = parseImageUrlTokens(formImagesText).filter((_, urlIndex) => urlIndex !== index);
-                              setFormImagesText(next.join(', '));
-                            }}
-                            className="absolute top-1 right-1 w-5 h-5 rounded-full bg-black/70 text-white text-[10px]"
-                            aria-label="Remove URL image"
-                          >
-                            x
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  {uploadedImagePreviews.length > 0 && (
-                    <div className="mt-2 grid grid-cols-4 gap-2">
-                      {uploadedImagePreviews.map((preview, index) => (
-                        <div key={preview + index} className="relative rounded-xl border overflow-hidden bg-gray-50 aspect-square">
-                          <SafeImage src={preview} alt={`Upload preview ${index + 1}`} className="w-full h-full object-cover" />
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setUploadedImageFiles((prev) => prev.filter((_, fileIndex) => fileIndex !== index));
-                              setUploadedImagePreviews((prev) => {
-                                const target = prev[index];
-                                if (target && target.startsWith('blob:')) URL.revokeObjectURL(target);
-                                return prev.filter((_, previewIndex) => previewIndex !== index);
-                              });
-                            }}
-                            className="absolute top-1 right-1 w-5 h-5 rounded-full bg-black/70 text-white text-[10px]"
-                            aria-label="Remove uploaded image"
-                          >
-                            x
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  {imageValidationErrors.length > 0 && (
-                    <div className="mt-2 p-2 rounded-xl border border-red-200 bg-red-50 space-y-1">
-                      {imageValidationErrors.map((errorText) => (
-                        <p key={errorText} className="text-[10px] font-bold text-red-700">{errorText}</p>
-                      ))}
-                    </div>
-                  )}
-                  {isUploadingImages && (
-                    <p className="mt-2 text-[10px] font-black uppercase text-orange-600 tracking-wider">Uploading images...</p>
-                  )}
-                </div>
-                <div className="flex gap-4 pt-4">
-                  <button type="submit" className="flex-1 bg-orange-600 text-white py-3 rounded-xl font-black uppercase tracking-widest hover:bg-orange-700 hover:scale-[1.02] transition-all shadow-xl shadow-orange-600/20 text-sm">{editMode ? 'Commit Changes' : 'Publish Asset'}</button>
-                  {editMode && <button type="button" onClick={() => {setEditMode(null); setUploadedImageFiles([]); setUploadedImagePreviews([]); setImageValidationErrors([]); setFormImagesText(''); setFormSizeStock([]); setBrandName(''); setProductName(''); setActiveTab('inventory');}} className="px-8 bg-gray-100 rounded-3xl font-black uppercase text-[10px] tracking-widest">Cancel</button>}
-                </div>
-              </div>
-            </form>
-          </div>
-        )}
-
-        {activeTab === 'orders' && (
-          <div className="space-y-6 animate-fade-in-up">
-            {orders.length === 0 ? (
-              <div className="text-center py-16 bg-white rounded-2xl border border-dashed text-gray-300 font-black uppercase italic tracking-[0.2em] text-sm">No Distribution Records Found</div>
-            ) : orders.map(o => (
-              <div key={o.id} className="p-4 border rounded-2xl bg-white hover:shadow-2xl transition-all flex flex-col md:flex-row justify-between gap-4 border-gray-100">
-                <div className="flex-1">
-                  {(() => {
-                    const normalizedStatus = normalizeOrderStatus(o.status);
-                    const statusLabel = normalizedStatus === 'dispatched' ? 'dispatched' : normalizedStatus;
-                    const statusClasses = normalizedStatus === 'pending'
-                      ? 'bg-orange-100 text-orange-600'
-                      : normalizedStatus === 'dispatched'
-                        ? 'bg-blue-100 text-blue-600'
-                        : normalizedStatus === 'canceled'
-                          ? 'bg-red-100 text-red-700'
-                          : 'bg-green-100 text-green-700';
-                    return (
-                  <div className="flex items-center gap-4 mb-6">
-                    <span className="font-black uppercase text-2xl tracking-tighter italic text-black">{o.customerName}</span>
-                    <span className={`text-[9px] px-5 py-2 rounded-full font-black uppercase tracking-[0.2em] ${statusClasses}`}>{statusLabel}</span>
-                  </div>
-                    );
-                  })()}
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-8">
-                    <p className="flex items-center gap-2 bg-gray-50 p-3 rounded-2xl border text-[10px] font-black uppercase text-gray-500"><Phone size={14} className="text-orange-600" /> {o.customerPhone}</p>
-                    <p className="flex items-center gap-2 bg-gray-50 p-3 rounded-2xl border text-[10px] font-black uppercase text-gray-500"><Mail size={14} className="text-orange-600" /> {o.customerEmail}</p>
-                    <p className="flex items-center gap-2 bg-gray-50 p-3 rounded-2xl border text-[10px] font-black uppercase text-gray-500 sm:col-span-3"><MapPin size={14} className="text-orange-600" /> {o.governorate}, {o.district}, {o.village} — {o.addressDetails}</p>
-                  </div>
-                  <div className="space-y-3">
-                    {o.items.map((it, idx) => {
-                      const orderItemImage = products.find((p) => p.Product_ID === it.productId)?.image || (it as any).image || BRAND_LOGO_SRC;
-                      return (
-                      <div key={idx} className="flex justify-between items-center text-xs bg-gray-50 p-4 rounded-2xl border border-gray-100">
-                        <div className="flex items-center gap-4">
-                          <div className="w-10 h-10 rounded-xl border bg-white overflow-hidden flex items-center justify-center">
-                            <SafeImage src={orderItemImage} alt={it.productName} className="w-full h-full object-contain p-1" />
-                          </div>
-                          <div>
-                            <p className="font-black uppercase italic tracking-tighter text-black">{it.productName}</p>
-                            <p className="text-[9px] font-bold text-gray-400 uppercase tracking-widest">Product_ID: {it.productId}</p>
-                            <p className="text-[9px] font-bold text-gray-400 uppercase tracking-widest">Variant: {it.size}</p>
-                          </div>
-                        </div>
-                        <span className="text-orange-600 font-black italic text-base">x{it.quantity}</span>
-                      </div>
-                    )})}
-                  </div>
-                </div>
-                <div className="flex flex-col items-end justify-between md:min-w-[180px] bg-black text-white p-4 rounded-2xl shadow-2xl">
-                  <div className="text-right">
-                    <p className="text-[9px] text-orange-500 font-black uppercase tracking-widest mb-1 italic">Settlement Total</p>
-                    <p className="text-2xl font-black italic tracking-tighter text-white">${o.total.toFixed(2)}</p>
-                    <p className="text-[8px] text-gray-500 mt-1 font-bold uppercase">{new Date(o.date).toLocaleDateString()}</p>
-                  </div>
-                  <div className="flex flex-col gap-2 w-full mt-4">
-                    <button
-                      type="button"
-                      disabled={normalizeOrderStatus(o.status) !== 'pending' || dispatchingOrderIds.has(o.id) || cancelingOrderIds.has(o.id)}
-                      onClick={async () => {
-                        if (normalizeOrderStatus(o.status) !== 'pending') return;
-                        if (!beginOrderDispatch(o.id)) return;
-
-                        let dispatchSucceeded = false;
-                        try {
-                          await updateOrderStatus(o.id, 'dispatched');
-                          dispatchSucceeded = true;
-
-                          // Keep the UI consistent even if refresh fails after a successful dispatch.
-                          setOrders((prev) => prev.map((order) => (
-                            order.id === o.id ? { ...order, status: 'dispatched' } : order
-                          )));
-
-                          try {
-                            const [refreshedOrders, refreshedProducts, refreshedMetrics, refreshedTotals] = await Promise.all([
-                              getOrders(),
-                              getProducts(),
-                              recalculateFinancialMetrics(),
-                              getFinancialDashboardTotals(),
-                            ]);
-                            setOrders(refreshedOrders);
-                            setProducts(refreshedProducts);
-                            setFinancialMetrics(refreshedMetrics);
-                            setFinancialTotals(refreshedTotals);
-                          } catch (refreshError) {
-                            console.error('Dispatch succeeded but refresh failed:', refreshError);
-                          }
-                        } catch (error) {
-                          console.error('Error updating order status:', error);
-                          const message = error instanceof Error
-                            ? error.message
-                            : String((error as any)?.message || (error as any)?.details || (error as any)?.hint || 'Failed to dispatch order. Please try again.');
-                          alert(message);
-                        } finally {
-                          endOrderDispatch(o.id);
-                          if (!dispatchSucceeded) {
-                            // Nothing else required: pending orders become clickable again after lock is released.
-                          }
-                        }
-                      }}
-                      className={`w-full px-6 py-4 rounded-2xl text-[11px] font-black uppercase tracking-widest transition-all shadow-xl ${normalizeOrderStatus(o.status) === 'pending' && !dispatchingOrderIds.has(o.id) && !cancelingOrderIds.has(o.id) ? 'bg-orange-600 text-white hover:bg-orange-700 shadow-orange-600/20' : 'bg-gray-200 text-gray-500 cursor-not-allowed shadow-transparent'}`}
-                    >
-                      {dispatchingOrderIds.has(o.id)
-                        ? 'Dispatching...'
-                        : normalizeOrderStatus(o.status) === 'dispatched'
-                          ? 'Dispatched'
-                          : 'Dispatch Order'}
-                    </button>
-                    <button
-                      type="button"
-                      disabled={normalizeOrderStatus(o.status) === 'canceled' || cancelingOrderIds.has(o.id) || dispatchingOrderIds.has(o.id)}
-                      onClick={async () => {
-                        if (normalizeOrderStatus(o.status) === 'canceled') return;
-                        if (!beginOrderCancel(o.id)) return;
-
-                        try {
-                          await updateOrderStatus(o.id, 'canceled');
-                          setOrders((prev) => prev.map((order) => (
-                            order.id === o.id ? { ...order, status: 'canceled' } : order
-                          )));
-
-                          try {
-                            const [refreshedOrders, refreshedProducts, refreshedMetrics, refreshedTotals] = await Promise.all([
-                              getOrders(),
-                              getProducts(),
-                              recalculateFinancialMetrics(),
-                              getFinancialDashboardTotals(),
-                            ]);
-                            setOrders(refreshedOrders);
-                            setProducts(refreshedProducts);
-                            setFinancialMetrics(refreshedMetrics);
-                            setFinancialTotals(refreshedTotals);
-                          } catch (refreshError) {
-                            console.error('Cancel succeeded but refresh failed:', refreshError);
-                          }
-                        } catch (error) {
-                          console.error('Error canceling order:', error);
-                          const message = error instanceof Error
-                            ? error.message
-                            : String((error as any)?.message || (error as any)?.details || (error as any)?.hint || 'Failed to cancel order. Please try again.');
-                          alert(message);
-                        } finally {
-                          endOrderCancel(o.id);
-                        }
-                      }}
-                      className={`w-full px-6 py-4 rounded-2xl text-[11px] font-black uppercase tracking-widest transition-all shadow-xl border ${normalizeOrderStatus(o.status) !== 'canceled' && !cancelingOrderIds.has(o.id) && !dispatchingOrderIds.has(o.id) ? 'bg-white text-red-600 border-red-200 hover:bg-red-50 shadow-red-600/10' : 'bg-gray-200 text-gray-500 cursor-not-allowed shadow-transparent border-transparent'}`}
-                    >
-                      {cancelingOrderIds.has(o.id) ? 'Canceling...' : 'Cancel Order'}
-                    </button>
-                    <button onClick={async () => { 
-                      if(confirm('Erase this distribution record?')) {
-                        try {
-                          await deleteOrder(o.id);
-                          const refreshedOrders = await getOrders();
-                          setOrders(refreshedOrders);
-                        } catch (error) {
-                          console.error('Error deleting order:', error);
-                          alert('Failed to delete order. Please try again.');
-                        }
-                      }
-                    }} className="w-full py-2 text-gray-600 hover:text-red-500 text-[10px] font-black uppercase tracking-widest transition-all">Destroy Log</button>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    );
-  };
-
-  const CheckoutView = () => {
-    const [gov, setGov] = useState('');
-    const [dist, setDist] = useState('');
-    const [vill, setVill] = useState('');
-    const [isProcessing, setIsProcessing] = useState(false);
-
-    const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
-      e.preventDefault();
-      setIsProcessing(true);
-      const form = e.currentTarget;
-      const fd = new FormData(form);
-
-      const checkoutItems = [...cart];
-
-      if (checkoutItems.length === 0) {
-        setIsProcessing(false);
-        alert('Your cart is empty.');
-        return;
-      }
-
-      for (const item of checkoutItems) {
-        if (!item.reservationId) {
-          setCart(prev => prev.filter((it) => !(it.Product_ID === item.Product_ID && it.selectedSize === item.selectedSize)));
-          setCartNotice('Some items in your cart have expired.');
-          alert('Some items in your cart have expired');
-          setIsProcessing(false);
-          return;
-        }
-
-        const extension = await extendExpiredReservation(item.reservationId, undefined, 180);
-        if (!extension.ok || !extension.expiresAt) {
-          await releaseCartLineReservation(item.reservationId);
-          setCart(prev => prev.filter((it) => !(it.Product_ID === item.Product_ID && it.selectedSize === item.selectedSize)));
-          setCartNotice('Some items in your cart have expired.');
-          alert('Some items in your cart have expired');
-          setIsProcessing(false);
-          return;
-        }
-
-        item.expiresAt = extension.expiresAt;
-      }
-
-      setCart((prev) => prev.map((item) => {
-        const refreshed = checkoutItems.find((line) => line.Product_ID === item.Product_ID && line.selectedSize === item.selectedSize);
-        return refreshed ? { ...item, expiresAt: refreshed.expiresAt } : item;
-      }));
-
-      const order: Order = {
-        id: `ORD-${Date.now()}`,
-        customerName: fd.get('name') as string,
-        customerEmail: fd.get('email') as string,
-        customerPhone: fd.get('phone') as string,
-        governorate: gov,
-        district: dist,
-        village: vill,
-        addressDetails: fd.get('address') as string,
-        items: checkoutItems.map(i => ({ productId: i.Product_ID, productName: i.productName || i.name, quantity: i.quantity, size: i.selectedSize, price: i.price, reservationId: i.reservationId })),
-        total: checkoutTotal,
-        status: 'pending',
-        date: new Date().toISOString()
-      };
-      
-      try {
-        await syncOrderToDatabase(order);
-        const [refreshedOrders, refreshedProducts] = await Promise.all([
-          getOrders(),
-          getProducts()
-        ]);
-        setOrders(refreshedOrders);
-        setProducts(refreshedProducts);
-        setCart([]);
-        
-        setTimeout(() => {
-          setIsProcessing(false);
-          setView('home');
-          alert('SUCCESS: Your authentic gear has been secured. Our team will contact you shortly.');
-        }, 1200);
-      } catch (error) {
-        console.error('Error processing order:', error);
-        setIsProcessing(false);
-        const message = error instanceof Error ? error.message : 'Failed to process order. Please check your connection and try again.';
-        alert(message);
-      }
-    };
-
-    return (
-        <div className="max-w-3xl mx-auto px-4 py-8 animate-fade-in-up">
-        <div className="text-center mb-8">
-          <h2 className="text-xl md:text-2xl font-black italic tracking-tighter uppercase mb-2">Complete Acquisition</h2>
-          <p className="text-gray-400 font-bold uppercase text-[9px] tracking-[0.2em]">Direct-to-door Logistics Across Lebanon</p>
-        </div>
-        <form onSubmit={handleSubmit} className="bg-white p-6 rounded-3xl border shadow-2xl space-y-6 border-gray-100">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-             <div className="space-y-2">
-                <label className="text-[9px] font-black text-gray-400 uppercase tracking-widest ml-1">Recipient Name</label>
-                <input name="name" required placeholder="Full Name" className="w-full p-3 bg-gray-50 border rounded-2xl focus:ring-2 focus:ring-orange-500 transition-all font-bold text-sm outline-none" />
-             </div>
-             <div className="space-y-2">
-                <label className="text-[9px] font-black text-gray-400 uppercase tracking-widest ml-1">Contact Number</label>
-                <input name="phone" required placeholder="+961" className="w-full p-3 bg-gray-50 border rounded-2xl focus:ring-2 focus:ring-orange-500 transition-all font-bold text-sm outline-none" />
-             </div>
-          </div>
-          <div className="space-y-2">
-             <label className="text-[9px] font-black text-gray-400 uppercase tracking-widest ml-1">Email for Confirmation</label>
-             <input name="email" type="email" required placeholder="email@address.com" className="w-full p-3 bg-gray-50 border rounded-2xl focus:ring-2 focus:ring-orange-500 transition-all font-bold text-sm outline-none" />
-          </div>
-          
-          <div className="space-y-4 p-4 bg-gray-50 rounded-2xl border border-gray-100">
-             <h4 className="font-black text-[10px] uppercase tracking-widest flex items-center gap-2 text-black italic">
-               <Truck size={16} className="text-orange-600" /> Logistics Destination
-             </h4>
-             <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-               <select required value={gov} onChange={e => {setGov(e.target.value); setDist(''); setVill('');}} className="p-3 border rounded-xl bg-white text-[10px] font-black uppercase focus:ring-2 focus:ring-orange-500 transition-all outline-none">
-                 <option value="">Governorate</option>
-                 {Object.keys(LEBANON_LOCATIONS).map(g => <option key={g} value={g}>{g}</option>)}
-               </select>
-               <select required disabled={!gov} value={dist} onChange={e => {setDist(e.target.value); setVill('');}} className="p-3 border rounded-xl bg-white text-[10px] font-black uppercase disabled:opacity-50 focus:ring-2 focus:ring-orange-500 transition-all outline-none">
-                 <option value="">District</option>
-                 {gov && Object.keys(LEBANON_LOCATIONS[gov]).map(d => <option key={d} value={d}>{d}</option>)}
-               </select>
-               <select required disabled={!dist} value={vill} onChange={e => setVill(e.target.value)} className="p-3 border rounded-xl bg-white text-[10px] font-black uppercase disabled:opacity-50 focus:ring-2 focus:ring-orange-500 transition-all outline-none">
-                 <option value="">Village</option>
-                 {gov && dist && LEBANON_LOCATIONS[gov][dist].map(v => <option key={v} value={v}>{v}</option>)}
-               </select>
-             </div>
-             <textarea name="address" required placeholder="Street, Building, Floor... Provide landmarks for faster delivery." className="w-full p-4 bg-white border rounded-xl text-sm font-bold focus:ring-2 focus:ring-orange-500 transition-all outline-none" rows={3}></textarea>
-          </div>
-
-          <div className="pt-6 border-t border-dashed">
-            <div className="space-y-1">
-              <div className="flex justify-between text-[11px] font-bold text-gray-500 uppercase tracking-widest">
-                <span>Items Total</span>
-                <span>${cartTotal.toFixed(2)}</span>
-              </div>
-              <div className="flex justify-between text-[11px] font-bold text-gray-500 uppercase tracking-widest">
-                <span>Delivery</span>
-                <span>${DELIVERY_FEE.toFixed(2)}</span>
-              </div>
-              <div className="flex justify-between pt-2 border-t border-gray-200">
-                <p className="text-[10px] text-gray-400 font-black uppercase tracking-widest">Grand Total</p>
-                <p className="text-2xl font-black text-black italic tracking-tighter">${checkoutTotal.toFixed(2)}</p>
-              </div>
-            </div>
-          </div>
-
-          <button type="submit" disabled={isProcessing} className="w-full bg-orange-600 text-white font-black py-2.5 rounded-xl hover:bg-orange-700 shadow-2xl shadow-orange-600/30 transition-all uppercase tracking-widest text-sm md:text-base flex items-center justify-center gap-2 active:scale-95 disabled:opacity-70">
-            {isProcessing ? 'Verifying Acquisition...' : 'Place Secure Order'}
-          </button>
-        </form>
-      </div>
-    );
-  };
-
-  const CartView = () => {
-    const [nowMs, setNowMs] = useState<number>(Date.now());
-
-    useEffect(() => {
-      if (cart.length === 0) return;
-      const interval = window.setInterval(() => {
-        setNowMs(Date.now());
-      }, 1000);
-      return () => window.clearInterval(interval);
-    }, [cart.length]);
-
-    return (
-    <div className="max-w-6xl mx-auto px-4 py-10 animate-fade-in-up">
-      <h2 className="text-2xl font-black mb-8 uppercase italic tracking-tighter text-center md:text-left">Selected Gear</h2>
-      {cartNotice && (
-        <div className="mb-4 rounded-xl border border-orange-200 bg-orange-50 text-orange-700 px-4 py-3 text-xs font-black uppercase tracking-wider">
-          {cartNotice}
-        </div>
-      )}
-      {cart.length === 0 ? (
-        <div className="text-center py-20 bg-white rounded-3xl border-2 border-dashed border-gray-100 shadow-inner">
-          <ShoppingBag size={60} className="text-gray-100 mx-auto mb-6" />
-          <p className="text-gray-300 font-black uppercase tracking-[0.3em] text-xs mb-8 italic">Your distribution bag is currently empty</p>
-          <button onClick={() => setView('shop')} className="bg-black text-white px-6 py-2.5 rounded-full font-black uppercase tracking-[0.2em] hover:bg-orange-600 transition-all shadow-2xl italic text-sm">Explore Collections</button>
-        </div>
-      ) : (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-10 lg:gap-12">
-          <div className="lg:col-span-2 space-y-8">
-            {cart.map((it, idx) => (
-               <div key={idx} className="flex flex-col sm:flex-row gap-8 p-8 bg-white rounded-[4rem] border shadow-sm hover:shadow-2xl transition-all group border-gray-50">
-                  <div className="w-full sm:w-48 h-64 bg-white rounded-[2.5rem] overflow-hidden shadow-inner flex-shrink-0">
-                    <SafeImage src={it.image} className="w-full h-full object-contain p-2 transition-transform duration-700 group-hover:scale-[1.03]" alt={it.name} />
-                  </div>
-                 <div className="flex-1 flex flex-col justify-between py-4">
-                   <div className="flex justify-between items-start">
-                     <div>
-                       <h4 className="font-black text-2xl uppercase italic tracking-tighter mb-2 text-black">{it.productName || it.name}</h4>
-                       <div className="flex items-center gap-2 mb-4">
-                         <span className="text-[10px] font-black uppercase text-orange-600 tracking-widest px-3 py-1 bg-orange-50 rounded-full">{it.type}</span>
-                         <span className="text-[10px] font-black uppercase text-gray-400 tracking-widest px-3 py-1 bg-gray-50 rounded-full border border-gray-100">{it.category}</span>
-                       </div>
-                     </div>
-                    <button onClick={() => void removeFromCart(it.Product_ID, it.selectedSize)} className="p-3 bg-gray-50 text-gray-200 hover:text-red-500 hover:bg-red-50 rounded-2xl transition-all">
-                        <Trash2 size={24} />
-                     </button>
-                   </div>
-                   <div className="flex flex-wrap items-center gap-4">
-                      <span className="text-[10px] font-black bg-black text-white px-5 py-2 rounded-2xl uppercase tracking-widest italic border border-black shadow-lg">Size: {it.selectedSize}</span>
-                      <span className="text-[10px] font-black bg-white text-gray-900 px-5 py-2 rounded-2xl uppercase tracking-widest italic border-2 border-gray-100">Qty: {it.quantity}</span>
-                     <span className={`text-[10px] font-black px-5 py-2 rounded-2xl uppercase tracking-widest italic border-2 ${getRemainingMs(it, nowMs) > 0 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-red-50 text-red-700 border-red-200'}`}>
-                      {getRemainingMs(it, nowMs) > 0 ? `${formatRemaining(getRemainingMs(it, nowMs))} remaining` : 'Expired'}
-                     </span>
-                   </div>
-                   <div className="flex justify-end pt-6 border-t border-gray-50 mt-8">
-                     <span className="font-black text-4xl text-black italic tracking-tighter">${(it.price * it.quantity).toFixed(2)}</span>
-                   </div>
-                 </div>
-               </div>
-            ))}
-          </div>
-          <div className="bg-black text-white p-8 rounded-3xl shadow-3xl h-fit sticky top-24 border-4 border-white/5 overflow-hidden">
-            <div className="absolute top-0 right-0 w-40 h-40 bg-orange-600/10 rounded-full -translate-y-20 translate-x-20 blur-3xl"></div>
-            <h3 className="font-black mb-10 uppercase tracking-[0.4em] text-[11px] text-orange-500 italic relative">Acquisition Totals</h3>
-            <div className="space-y-6 mb-12 relative">
-               <div className="flex justify-between font-bold text-gray-400 uppercase text-[11px] tracking-widest">
-                 <span>Retail Value</span>
-                 <span className="text-white">${cartTotal.toFixed(2)}</span>
-               </div>
-               <div className="flex justify-between font-bold text-gray-400 uppercase text-[11px] tracking-widest">
-                 <span>Delivery</span>
-                 <span className="text-white">${DELIVERY_FEE.toFixed(2)}</span>
-               </div>
-               <div className="pt-10 border-t border-white/10 flex justify-between items-end">
-                 <div>
-                   <span className="text-[10px] text-gray-500 font-black uppercase block mb-2 italic">Grand Total Acquisition</span>
-                   <span className="text-5xl font-black italic tracking-tighter text-orange-600">${checkoutTotal.toFixed(2)}</span>
-                 </div>
-               </div>
-            </div>
-            <button onClick={() => setView('checkout')} className="w-full bg-white text-black font-black py-3.5 rounded-2xl uppercase tracking-widest hover:bg-orange-600 hover:text-white transition-all shadow-2xl text-sm md:text-base italic active:scale-95">
-              Secure Checkout
-            </button>
-            <div className="mt-12 space-y-4 relative">
-              <div className="flex items-center gap-3 text-[10px] text-gray-500 font-black uppercase tracking-[0.3em]"><Check size={16} className="text-orange-500" /> Authenticity Verified</div>
-              <div className="flex items-center gap-3 text-[10px] text-gray-500 font-black uppercase tracking-[0.3em]"><Check size={16} className="text-orange-500" /> Cash Payment Accepted</div>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-    );
-  };
 
   const Footer = () => (
     <footer className="bg-black text-white pt-12 pb-6 mt-16 border-t-2 border-orange-600 overflow-hidden">
@@ -3166,6 +1783,7 @@ const App: React.FC = () => {
 
   return (
     <div className="min-h-screen bg-gray-50 selection:bg-orange-500 selection:text-white">
+      {view !== 'admin' && <AnnouncementBar />}
       <nav className="sticky top-0 z-50 bg-white border-b border-gray-200 shadow-sm">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center h-16 md:h-[72px]">
@@ -3213,26 +1831,26 @@ const App: React.FC = () => {
       <main className="min-h-[80vh]">
         {view === 'home' && (
           <div className="space-y-0">
-            <div className="relative h-screen bg-black flex items-center justify-center overflow-hidden">
-              <img 
-                src="https://images.unsplash.com/photo-1556906781-9a412961c28c?auto=format&fit=crop&q=80&w=2000" 
-                className="absolute inset-0 w-full h-full object-cover opacity-60 scale-105 animate-slow-zoom" 
-                alt="Original Style" 
-              />
-              <div className="absolute inset-0 bg-gradient-to-t from-black via-transparent to-black/40"></div>
-              <div className="relative text-center px-6 max-w-6xl z-10 pb-40">
-                 <div className="inline-block px-8 py-3 bg-orange-600/20 backdrop-blur-md rounded-full border border-orange-600/30 mb-10 animate-fade-in-up">
-                    <span className="text-orange-500 font-black uppercase tracking-[0.6em] text-[11px] italic">Authenticity Is Our Signature</span>
-                 </div>
-                 <h1 className="text-4xl md:text-6xl font-black text-white mb-8 tracking-tighter italic leading-tight drop-shadow-2xl animate-fade-in-up delay-100">
-                    PURELY <br/><span className="text-orange-600">ORIGINAL</span>
-                 </h1>
-                 <div className="flex flex-col sm:flex-row gap-4 justify-center animate-fade-in-up delay-200">
-                   <button onClick={() => {setView('shop'); window.scrollTo(0,0);}} className="bg-orange-600 text-white px-8 py-3 rounded-full font-black text-base hover:bg-white hover:text-black transition-all hover:scale-105 shadow-2xl shadow-orange-600/40 uppercase tracking-widest italic active:scale-95">Enter Store</button>
-                   <a href="https://t.me/flexfitsbot" target="_blank" rel="noreferrer" className="inline-flex items-center justify-center bg-white/10 backdrop-blur-xl text-white border-2 border-white/20 px-8 py-3 rounded-full font-black text-base hover:bg-white hover:text-black transition-all uppercase tracking-widest italic active:scale-105">FlexFits Bot</a>
-                 </div>
-              </div>
-            </div>
+            <a
+              href="https://t.me/flexfitsbot"
+              target="_blank"
+              rel="noreferrer"
+              aria-label="Chat with Flex Fits support on Telegram"
+              title="Chat with us on Telegram"
+              className="fixed bottom-6 right-6 z-40 flex items-center justify-center w-14 h-14 rounded-full bg-orange-600 text-white shadow-2xl shadow-orange-600/40 hover:bg-orange-700 hover:scale-110 transition-all"
+            >
+              <MessageCircle size={26} />
+            </a>
+
+            <HeroBannerSlider setView={setView} />
+
+            <HomepageSections
+              products={products}
+              setView={setView}
+              openProduct={openProductPage}
+              setSelectedBrands={setSelectedBrands}
+              setShowOnSaleOnly={setShowOnSaleOnly}
+            />
 
             <div className="bg-white py-20 border-y-4 border-gray-50">
               <div className="max-w-7xl mx-auto px-4 md:px-8 grid grid-cols-1 md:grid-cols-2 gap-8 md:gap-16">
@@ -3452,7 +2070,7 @@ const App: React.FC = () => {
                   Classification
                 </span>
                 <span className="text-[10px] font-black uppercase text-orange-600 tracking-widest">
-                  {selectedGenders.length + selectedSizeFilters.length + selectedColorFilters.length + (hideSoldOutItems ? 1 : 0) + (filterCategory !== 'All' ? 1 : 0) + (maxPrice !== 150 ? 1 : 0)} Active
+                  {selectedGenders.length + selectedSizeFilters.length + selectedColorFilters.length + (hideSoldOutItems ? 1 : 0) + (showOnSaleOnly ? 1 : 0) + (filterCategory !== 'All' ? 1 : 0) + (maxPrice !== 150 ? 1 : 0)} Active
                 </span>
               </button>
             </div>
@@ -3601,9 +2219,33 @@ const App: React.FC = () => {
           </div>
         )}
 
-        {view === 'admin' && <AdminPanel />}
-        {view === 'cart' && <CartView />}
-        {view === 'checkout' && <CheckoutView />}
+        {view === 'admin' && <AdminPanel
+          products={products}
+          orders={orders}
+          isAdmin={isAdmin}
+          isLoading={isLoading}
+          setIsAdmin={setIsAdmin}
+          setProducts={setProducts}
+          setOrders={setOrders}
+          syncProductToDatabase={syncProductToDatabase}
+        />}
+        {view === 'cart' && <CartView
+          cart={cart}
+          setView={setView}
+          cartNotice={cartNotice}
+          removeFromCart={removeFromCart}
+          getRemainingMs={getRemainingMs}
+          formatRemaining={formatRemaining}
+        />}
+        {view === 'checkout' && <CheckoutView
+          cart={cart}
+          setCart={setCart}
+          setCartNotice={setCartNotice}
+          setOrders={setOrders}
+          setProducts={setProducts}
+          setView={setView}
+          syncOrderToDatabase={syncOrderToDatabase}
+        />}
       </main>
       <Footer />
       
@@ -3644,4 +2286,2687 @@ const App: React.FC = () => {
   );
 };
 
+
+interface AdminPanelProps {
+  products: Product[];
+  orders: Order[];
+  isAdmin: boolean;
+  isLoading: boolean;
+  setIsAdmin: React.Dispatch<React.SetStateAction<boolean>>;
+  setProducts: React.Dispatch<React.SetStateAction<Product[]>>;
+  setOrders: React.Dispatch<React.SetStateAction<Order[]>>;
+  syncProductToDatabase: (product: Product) => Promise<void>;
+}
+
+interface CheckoutViewProps {
+  cart: CartItem[];
+  setCart: React.Dispatch<React.SetStateAction<CartItem[]>>;
+  setCartNotice: React.Dispatch<React.SetStateAction<string>>;
+  setOrders: React.Dispatch<React.SetStateAction<Order[]>>;
+  setProducts: React.Dispatch<React.SetStateAction<Product[]>>;
+  setView: React.Dispatch<React.SetStateAction<View>>;
+  syncOrderToDatabase: (order: Order) => Promise<void>;
+}
+
+interface CartViewProps {
+  cart: CartItem[];
+  setView: React.Dispatch<React.SetStateAction<View>>;
+  cartNotice: string;
+  removeFromCart: (productId: string, size: string) => Promise<void>;
+  getRemainingMs: (item: CartItem, nowMs: number) => number;
+  formatRemaining: (ms: number) => string;
+}
+
+function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProducts, setOrders, syncProductToDatabase }: AdminPanelProps) {
+  type InventorySection = 'All' | Category | 'ComingSoon';
+  type AdminTab = 'orders' | 'add' | 'inventory' | 'financials' | 'theme' | 'tags';
+  type BulkRowDraft = {
+    price: string;
+    originalPrice: string;
+    discount: string;
+    onSale: boolean;
+    status: string;
+    stock: string;
+  };
+  type ImportPreviewRow = {
+    rowNumber: number;
+    sku: string;
+    productName: string;
+    category: string;
+    price: number;
+    stock: number;
+    errors: string[];
+    payload?: Product;
+    duplicateSku?: boolean;
+  };
+  type ImportSummary = {
+    imported: number;
+    updated: number;
+    skipped: number;
+    errors: number;
+  };
+  const [user, setUser] = useState('');
+  const [pass, setPass] = useState('');
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [loginError, setLoginError] = useState('');
+  const [activeTab, setActiveTab] = useState<AdminTab>('inventory');
+  const [editMode, setEditMode] = useState<Product | null>(null);
+  const [uploadedImageFiles, setUploadedImageFiles] = useState<File[]>([]);
+  const [uploadedImagePreviews, setUploadedImagePreviews] = useState<string[]>([]);
+  const [imageValidationErrors, setImageValidationErrors] = useState<string[]>([]);
+  const [isUploadingImages, setIsUploadingImages] = useState(false);
+  const [formCategory, setFormCategory] = useState<Category>(Category.SHOES);
+  const [selectedSizes, setSelectedSizes] = useState<string[]>([]);
+  const [brandName, setBrandName] = useState('');
+  const [productName, setProductName] = useState('');
+  const [formColors, setFormColors] = useState<string>('');
+  const [formImagesText, setFormImagesText] = useState<string>('');
+  const [formSizeStock, setFormSizeStock] = useState<ProductSizeStock[]>([]);
+  const [formStock, setFormStock] = useState<number | ''>('');
+  const [formSold, setFormSold] = useState<number | ''>('');
+  const [allTags, setAllTags] = useState<Tag[]>([]);
+  const [formTagIds, setFormTagIds] = useState<string[]>([]);
+  const [inventorySection, setInventorySection] = useState<InventorySection>('All');
+  const [inventorySearchQuery, setInventorySearchQuery] = useState('');
+  const [inventorySort, setInventorySort] = useState<{ col: 'Product_ID' | 'productName' | 'category'; dir: 'asc' | 'desc' } | null>(null);
+  const [financialMetrics, setFinancialMetrics] = useState<FinancialMetric[]>([]);
+  const [financialTotals, setFinancialTotals] = useState<FinancialTotals | null>(null);
+  const [dispatchingOrderIds, setDispatchingOrderIds] = useState<Set<string>>(new Set());
+  const dispatchingOrderIdsRef = useRef<Set<string>>(new Set());
+  const [cancelingOrderIds, setCancelingOrderIds] = useState<Set<string>>(new Set());
+  const cancelingOrderIdsRef = useRef<Set<string>>(new Set());
+  const [inventoryPage, setInventoryPage] = useState(1);
+  const inventoryPageSize = 20;
+  const fileRef = useRef<HTMLInputElement>(null);
+  const importFileRef = useRef<HTMLInputElement>(null);
+  const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
+  const [ordersActionError, setOrdersActionError] = useState<string | null>(null);
+  const [importPreviewRows, setImportPreviewRows] = useState<ImportPreviewRow[]>([]);
+  const [importErrors, setImportErrors] = useState<string[]>([]);
+  const [importSummary, setImportSummary] = useState<ImportSummary | null>(null);
+  const [isImporting, setIsImporting] = useState(false);
+  const [importFileName, setImportFileName] = useState('');
+  const [duplicateBehavior, setDuplicateBehavior] = useState<'update' | 'skip'>('update');
+  const [isImportPanelOpen, setIsImportPanelOpen] = useState(false);
+  const [selectedProductIds, setSelectedProductIds] = useState<Set<string>>(new Set());
+  const [isBulkEditOpen, setIsBulkEditOpen] = useState(false);
+  const [isBulkSaving, setIsBulkSaving] = useState(false);
+  const [bulkEditDrafts, setBulkEditDrafts] = useState<Record<string, BulkRowDraft>>({});
+  const [bulkEditErrors, setBulkEditErrors] = useState<Record<string, string>>({});
+  const isShoesCategory = formCategory === Category.SHOES;
+
+  const cycleSort = (col: 'Product_ID' | 'productName' | 'category') => {
+    setInventorySort(prev =>
+      prev?.col !== col || !prev ? { col, dir: 'asc' }
+      : prev.dir === 'asc' ? { col, dir: 'desc' }
+      : null
+    );
+  };
+
+  const splitDisplayName = (fullName: string) => {
+    const normalized = (fullName || '').trim();
+    if (!normalized) return { brand: '', product: '' };
+
+    if (normalized.includes(' - ')) {
+      const [brand, ...rest] = normalized.split(' - ');
+      return { brand: brand.trim(), product: rest.join(' - ').trim() };
+    }
+
+    const parts = normalized.split(' ');
+    if (parts.length <= 1) return { brand: normalized, product: '' };
+    return { brand: parts[0], product: parts.slice(1).join(' ') };
+  };
+
+  const generateNextProductId = () => {
+    const maxExisting = products.reduce((max, p) => {
+      const match = /^FF-(\d{3,4})$/i.exec(String(p.Product_ID || ''));
+      if (!match) return max;
+      return Math.max(max, Number(match[1]));
+    }, 100);
+    return `FF-${Math.min(9999, maxExisting + 1)}`;
+  };
+
+  // adminColorSuggestions removed — colors now use a simple comma-separated text input.
+
+  useEffect(() => {
+    if (editMode) {
+      setUploadedImageFiles([]);
+      setUploadedImagePreviews([]);
+      setImageValidationErrors([]);
+      setFormCategory(editMode.category);
+      setSelectedSizes(editMode.sizes);
+      const parsed = splitDisplayName(editMode.name);
+      setBrandName(editMode.brandName || parsed.brand);
+      setProductName(editMode.productName || parsed.product);
+      setFormColors((Array.isArray(editMode.colors) && editMode.colors.length > 0 ? editMode.colors : getProductColorTokens(editMode)).join(', '));
+      setFormImagesText((getProductImages(editMode) || []).join(', '));
+      setFormSizeStock(buildEditableSizeStock(editMode));
+      setFormStock(editMode.initialStock ?? '');
+      setFormSold(editMode.sold ?? 0);
+      setFormTagIds(editMode.tagIds || []);
+      setActiveTab('add');
+    } else {
+      setUploadedImageFiles([]);
+      setUploadedImagePreviews([]);
+      setImageValidationErrors([]);
+      setSelectedSizes([]);
+      setBrandName('');
+      setProductName('');
+      setFormColors('');
+      setFormImagesText('');
+      setFormSizeStock([]);
+      setFormStock('');
+      setFormSold('');
+      setFormTagIds([]);
+    }
+  }, [editMode]);
+
+  useEffect(() => {
+    setFormSizeStock((prev) => {
+      const next = selectedSizes.map((size) => {
+        const existing = prev.find((entry) => entry.size === size);
+        return existing || { size, stock: 0, left: 0, sold: 0 };
+      });
+      return next;
+    });
+  }, [selectedSizes]);
+
+  useEffect(() => {
+    if (!isAdmin) return;
+
+    const timeout = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const metrics = await recalculateFinancialMetrics();
+          setFinancialMetrics(metrics);
+          const totals = await getFinancialDashboardTotals();
+          setFinancialTotals(totals);
+        } catch (error) {
+          console.error('Error syncing financial metrics:', error);
+        }
+      })();
+    }, 450);
+
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [isAdmin, orders]);
+
+  useEffect(() => {
+    return () => {
+      for (const preview of uploadedImagePreviews) {
+        if (preview.startsWith('blob:')) {
+          URL.revokeObjectURL(preview);
+        }
+      }
+    };
+  }, [uploadedImagePreviews]);
+
+  const displayFinancialMetrics = useMemo<FinancialMetric[]>(() => {
+    if (financialMetrics.length > 0) {
+      return financialMetrics;
+    }
+
+    return products.map((product) => {
+      const totals = getProductStockTotals(product);
+      const itemPrice = Number(product.price || 0);
+      const itemCost = Number(product.cost || 0);
+      const normalizedName = String(product.productName || '').trim()
+        || splitDisplayName(product.name).product
+        || String(product.name || '').trim()
+        || product.Product_ID;
+
+      return {
+        productId: product.Product_ID,
+        productName: normalizedName,
+        itemsSold: totals.sold,
+        itemPrice,
+        itemCost,
+        revenue: totals.sold * itemPrice,
+        netProfit: totals.sold * (itemPrice - itemCost),
+        calculatedAt: new Date().toISOString(),
+      };
+    });
+  }, [financialMetrics, products]);
+
+  const fallbackRevenue = displayFinancialMetrics.reduce((acc, row) => acc + row.revenue, 0);
+  const fallbackProfit = displayFinancialMetrics.reduce((acc, row) => acc + row.netProfit, 0);
+  const totalSalesValue = financialTotals?.totalRevenue ?? fallbackRevenue;
+  const profit = financialTotals?.totalNetProfit ?? fallbackProfit;
+
+  const inventorySections: InventorySection[] = ['All', ...Object.values(Category), 'ComingSoon'];
+  const inventoryProducts = useMemo(() => {
+    let list = inventorySection === 'All' ? products
+      : inventorySection === 'ComingSoon' ? products.filter(p => /t-?shirt|hoodie/i.test(p.type))
+      : products.filter(p => p.category === inventorySection);
+    const q = inventorySearchQuery.trim().toLowerCase();
+    if (q) {
+      list = list.filter((p) => {
+        const brand = getProductBrandLabel(p);
+        return (
+          p.Product_ID.toLowerCase().includes(q) ||
+          (p.productName || p.name).toLowerCase().includes(q) ||
+          brand.toLowerCase().includes(q) ||
+          String(p.type || '').toLowerCase().includes(q) ||
+          String(p.category || '').toLowerCase().includes(q)
+        );
+      });
+    }
+    if (inventorySort) {
+      const { col, dir } = inventorySort;
+      list = [...list].sort((a, b) => {
+        const va = col === 'Product_ID' ? a.Product_ID : col === 'productName' ? (a.productName || a.name) : a.category;
+        const vb = col === 'Product_ID' ? b.Product_ID : col === 'productName' ? (b.productName || b.name) : b.category;
+        const cmp = va.localeCompare(vb, undefined, { numeric: true, sensitivity: 'base' });
+        return dir === 'asc' ? cmp : -cmp;
+      });
+    }
+    return list;
+  }, [products, inventorySection, inventorySearchQuery, inventorySort]);
+
+  useEffect(() => {
+    setInventoryPage(1);
+  }, [inventorySection, inventorySearchQuery, inventorySort, products.length]);
+
+  const inventoryTotalPages = Math.max(1, Math.ceil(inventoryProducts.length / inventoryPageSize));
+  const pagedInventoryProducts = useMemo(() => {
+    const start = (inventoryPage - 1) * inventoryPageSize;
+    return inventoryProducts.slice(start, start + inventoryPageSize);
+  }, [inventoryProducts, inventoryPage, inventoryPageSize]);
+
+  const importableRows = useMemo(
+    () => importPreviewRows.filter((row) => row.errors.length === 0 && row.payload),
+    [importPreviewRows]
+  );
+
+  const isAllCurrentPageSelected = pagedInventoryProducts.length > 0
+    && pagedInventoryProducts.every((p) => selectedProductIds.has(p.Product_ID));
+
+  const toggleProductSelected = (productId: string) => {
+    setSelectedProductIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(productId)) next.delete(productId);
+      else next.add(productId);
+      return next;
+    });
+  };
+
+  const toggleSelectAllCurrentPage = () => {
+    setSelectedProductIds((prev) => {
+      const next = new Set(prev);
+      if (isAllCurrentPageSelected) {
+        for (const p of pagedInventoryProducts) next.delete(p.Product_ID);
+      } else {
+        for (const p of pagedInventoryProducts) next.add(p.Product_ID);
+      }
+      return next;
+    });
+  };
+
+  const clearSelection = () => setSelectedProductIds(new Set());
+
+  const handleBulkDelete = async () => {
+    const ids = Array.from(selectedProductIds);
+    if (ids.length === 0) return;
+    if (!confirm(`Permanently erase ${ids.length} selected asset${ids.length > 1 ? 's' : ''}? This cannot be undone.`)) {
+      return;
+    }
+    setIsBulkSaving(true);
+    try {
+      for (const id of ids) {
+        await deleteProduct(id);
+      }
+      const refreshedProducts = await getProducts();
+      setProducts(refreshedProducts);
+      clearSelection();
+    } catch (error: any) {
+      console.error('Error bulk deleting products:', error);
+      alert(error?.message || 'Failed to delete some selected products. Please try again.');
+    } finally {
+      setIsBulkSaving(false);
+    }
+  };
+
+  const openBulkEdit = () => {
+    if (selectedProductIds.size === 0) return;
+    const targets = products.filter((p) => selectedProductIds.has(p.Product_ID));
+    const drafts: Record<string, BulkRowDraft> = {};
+    for (const product of targets) {
+      const totals = getProductStockTotals(product);
+      drafts[product.Product_ID] = {
+        price: String(product.price ?? ''),
+        originalPrice: product.originalPrice != null ? String(product.originalPrice) : '',
+        discount: '',
+        onSale: Boolean(product.onSale),
+        status: product.status || 'Active',
+        stock: String(totals.left),
+      };
+    }
+    setBulkEditDrafts(drafts);
+    setBulkEditErrors({});
+    setIsBulkEditOpen(true);
+  };
+
+  const updateBulkDraft = (productId: string, patch: Partial<BulkRowDraft>) => {
+    setBulkEditDrafts((prev) => {
+      const current = prev[productId];
+      if (!current) return prev;
+      return { ...prev, [productId]: { ...current, ...patch } };
+    });
+  };
+
+  const applyBulkDiscount = (product: Product, discountText: string) => {
+    setBulkEditDrafts((prev) => {
+      const current = prev[product.Product_ID];
+      if (!current) return prev;
+      const next: BulkRowDraft = { ...current, discount: discountText };
+      const discountNum = Number(discountText);
+      if (discountText.trim() && Number.isFinite(discountNum) && discountNum >= 0 && discountNum <= 100) {
+        const base = Number(current.originalPrice || product.originalPrice || product.price || 0);
+        if (base > 0) {
+          next.originalPrice = String(base);
+          next.price = String(Math.max(0, Math.round(base * (1 - discountNum / 100) * 100) / 100));
+        }
+      }
+      return { ...prev, [product.Product_ID]: next };
+    });
+  };
+
+  const validateBulkRow = (draft: BulkRowDraft): string | null => {
+    const price = Number(draft.price);
+    if (!draft.price.trim() || !Number.isFinite(price) || price < 0) {
+      return 'Price must be a valid non-negative number.';
+    }
+    if (draft.originalPrice.trim()) {
+      const originalPrice = Number(draft.originalPrice);
+      if (!Number.isFinite(originalPrice) || originalPrice < 0) {
+        return 'Original price must be a valid non-negative number.';
+      }
+    }
+    if (draft.discount.trim()) {
+      const discount = Number(draft.discount);
+      if (!Number.isFinite(discount) || discount < 0 || discount > 100) {
+        return 'Discount must be a percentage between 0 and 100.';
+      }
+    }
+    const stock = Number(draft.stock);
+    if (!draft.stock.trim() || !Number.isInteger(stock) || stock < 0) {
+      return 'Stock must be a valid non-negative whole number.';
+    }
+    return null;
+  };
+
+  const handleBulkEditSaveAll = async () => {
+    const targets = products.filter((p) => selectedProductIds.has(p.Product_ID));
+    if (targets.length === 0) return;
+
+    const nextErrors: Record<string, string> = {};
+    for (const product of targets) {
+      const draft = bulkEditDrafts[product.Product_ID];
+      const error = draft ? validateBulkRow(draft) : 'Missing edits for this product.';
+      if (error) nextErrors[product.Product_ID] = error;
+    }
+    setBulkEditErrors(nextErrors);
+    if (Object.keys(nextErrors).length > 0) {
+      alert('Fix the highlighted rows before saving.');
+      return;
+    }
+
+    setIsBulkSaving(true);
+    try {
+      for (const product of targets) {
+        const draft = bulkEditDrafts[product.Product_ID];
+        if (!draft) continue;
+        const next: Product = { ...product };
+        next.price = Number(draft.price);
+        next.originalPrice = draft.originalPrice.trim() ? Number(draft.originalPrice) : undefined;
+        next.onSale = draft.onSale;
+        next.status = draft.status;
+        const stockUpdate = buildBulkStockUpdate(product, Math.floor(Number(draft.stock)));
+        next.initialStock = stockUpdate.initialStock;
+        next.pieces = stockUpdate.pieces;
+        if (stockUpdate.sizeStock) next.sizeStock = stockUpdate.sizeStock;
+        await syncProductToDatabase(next);
+      }
+      const refreshedProducts = await getProducts();
+      setProducts(refreshedProducts);
+      setIsBulkEditOpen(false);
+      setBulkEditDrafts({});
+      setBulkEditErrors({});
+      clearSelection();
+    } catch (error: any) {
+      console.error('Error applying bulk edit:', error);
+      alert(error?.message || 'Failed to apply bulk edit to some products. Please try again.');
+    } finally {
+      setIsBulkSaving(false);
+    }
+  };
+
+  const beginOrderDispatch = (orderId: string): boolean => {
+    const normalized = String(orderId || '').trim();
+    if (!normalized) return false;
+    if (dispatchingOrderIdsRef.current.has(normalized)) return false;
+    const next = new Set(dispatchingOrderIdsRef.current);
+    next.add(normalized);
+    dispatchingOrderIdsRef.current = next;
+    setDispatchingOrderIds(next);
+    return true;
+  };
+
+  const endOrderDispatch = (orderId: string): void => {
+    const normalized = String(orderId || '').trim();
+    if (!normalized || !dispatchingOrderIdsRef.current.has(normalized)) return;
+    const next = new Set(dispatchingOrderIdsRef.current);
+    next.delete(normalized);
+    dispatchingOrderIdsRef.current = next;
+    setDispatchingOrderIds(next);
+  };
+
+  const beginOrderCancel = (orderId: string): boolean => {
+    const normalized = String(orderId || '').trim();
+    if (!normalized) return false;
+    if (cancelingOrderIdsRef.current.has(normalized)) return false;
+    const next = new Set(cancelingOrderIdsRef.current);
+    next.add(normalized);
+    cancelingOrderIdsRef.current = next;
+    setCancelingOrderIds(next);
+    return true;
+  };
+
+  const endOrderCancel = (orderId: string): void => {
+    const normalized = String(orderId || '').trim();
+    if (!normalized || !cancelingOrderIdsRef.current.has(normalized)) return;
+    const next = new Set(cancelingOrderIdsRef.current);
+    next.delete(normalized);
+    cancelingOrderIdsRef.current = next;
+    setCancelingOrderIds(next);
+  };
+
+  const adminNavItems: { key: AdminTab; label: string; icon: React.ComponentType<{ size?: number }> }[] = [
+    { key: 'inventory', label: 'Inventory', icon: Layers },
+    { key: 'add', label: 'Add/Edit', icon: Plus },
+    { key: 'orders', label: 'Orders', icon: Package },
+    { key: 'financials', label: 'Financials', icon: BarChart3 },
+    { key: 'theme', label: 'Edit Theme', icon: Palette },
+    { key: 'tags', label: 'Tags', icon: TagIcon },
+  ];
+
+  const selectedOrder = useMemo(
+    () => orders.find((order) => order.id === selectedOrderId) || null,
+    [orders, selectedOrderId]
+  );
+
+  useEffect(() => {
+    if (activeTab !== 'orders') {
+      setSelectedOrderId(null);
+      setOrdersActionError(null);
+    }
+    if (activeTab !== 'inventory') {
+      setIsImportPanelOpen(false);
+      setIsBulkEditOpen(false);
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== 'add' && activeTab !== 'tags') return;
+    let isCancelled = false;
+    getTags()
+      .then((rows) => { if (!isCancelled) setAllTags(rows); })
+      .catch((error) => console.error('Error loading tags for product form:', error));
+    return () => { isCancelled = true; };
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (!isImportPanelOpen) {
+      setImportSummary(null);
+    }
+  }, [isImportPanelOpen]);
+
+  if (!isAdmin) {
+    const handleLogin = async () => {
+      setLoginError('');
+      setIsLoggingIn(true);
+      try {
+        if (supabase) {
+          const { error } = await supabase.auth.signInWithPassword({ email: user.trim(), password: pass });
+          if (error) {
+            setLoginError('Access denied: incorrect email or password.');
+            return;
+          }
+          setIsAdmin(true);
+        } else {
+          // Dev-only fallback: used solely when Supabase isn't configured (local dev without
+          // env vars). The deployed site always has Supabase configured, so this branch never
+          // runs in production.
+          const isValidLogin = ADMIN_CREDENTIALS.some((credential) => credential.username === user && credential.password === pass);
+          if (isValidLogin) setIsAdmin(true);
+          else setLoginError('Access denied: incorrect credentials.');
+        }
+      } finally {
+        setIsLoggingIn(false);
+      }
+    };
+
+    return (
+      <div className="min-h-[60vh] flex items-center justify-center p-4">
+        <div className="bg-white p-8 rounded-3xl shadow-xl w-full max-w-md border">
+          <h2 className="text-xl font-black mb-6 text-center uppercase tracking-widest">Admin Authorization</h2>
+          {loginError && (
+            <div className="mb-4 bg-red-50 border border-red-200 text-red-700 px-4 py-2.5 rounded-xl text-[11px] font-bold uppercase tracking-wide">
+              {loginError}
+            </div>
+          )}
+          <input type="email" placeholder="Admin Email" className="w-full mb-4 p-3 bg-gray-50 rounded-xl border focus:ring-2 focus:ring-orange-500 transition-all outline-none" value={user} onChange={e => setUser(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void handleLogin(); }} />
+          <input type="password" placeholder="Password" className="w-full mb-6 p-3 bg-gray-50 rounded-xl border focus:ring-2 focus:ring-orange-500 transition-all outline-none" value={pass} onChange={e => setPass(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void handleLogin(); }} />
+          <button disabled={isLoggingIn} onClick={() => void handleLogin()} className="w-full bg-black text-white py-4 rounded-xl font-bold hover:bg-orange-600 transition-all uppercase tracking-widest disabled:opacity-50">
+            {isLoggingIn ? 'Logging in...' : 'Login'}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const toggleSize = (size: string) => {
+    setSelectedSizes(prev => prev.includes(size) ? prev.filter(s => s !== size) : [...prev, size]);
+  };
+
+  const parseImageUrlTokens = (raw: string): string[] => {
+    const source = String(raw || '').trim();
+    if (!source) return [];
+
+    const tokens: string[] = [];
+    let pendingDataPrefix: string | null = null;
+
+    for (const part of source.split(',')) {
+      const trimmed = String(part || '').trim();
+      if (!trimmed) continue;
+
+      if (pendingDataPrefix) {
+        tokens.push(`${pendingDataPrefix},${trimmed}`);
+        pendingDataPrefix = null;
+        continue;
+      }
+
+      if (/^data:image\/[a-z0-9.+-]+;base64$/i.test(trimmed)) {
+        pendingDataPrefix = trimmed;
+        continue;
+      }
+
+      tokens.push(trimmed);
+    }
+
+    if (pendingDataPrefix) {
+      tokens.push(pendingDataPrefix);
+    }
+
+    return Array.from(new Set(tokens));
+  };
+
+  const validateImageUrl = (url: string): Promise<boolean> => {
+    return new Promise((resolve) => {
+      const candidate = String(url || '').trim();
+      if (isValidDataImageUrl(candidate)) {
+        resolve(true);
+        return;
+      }
+
+      // Bounded length keeps this from matching base64 fragments that happen to satisfy this
+      // character class otherwise (real local asset paths are always short).
+      if (candidate.length <= 200 && /^\/[\w./%+-]+$/i.test(candidate)) {
+        resolve(true);
+        return;
+      }
+
+      if (!/^https?:\/\//i.test(candidate)) {
+        resolve(false);
+        return;
+      }
+
+      const image = new Image();
+      const timeout = window.setTimeout(() => {
+        image.src = '';
+        resolve(false);
+      }, 4000);
+      image.onload = () => {
+        window.clearTimeout(timeout);
+        resolve(true);
+      };
+      image.onerror = () => {
+        window.clearTimeout(timeout);
+        resolve(false);
+      };
+      image.src = candidate;
+    });
+  };
+
+  const normalizeImportKey = (value: string) =>
+    String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+
+  const buildNormalizedRow = (row: Record<string, unknown>) => {
+    const normalized: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(row)) {
+      normalized[normalizeImportKey(key)] = value;
+    }
+    return normalized;
+  };
+
+  const getImportValue = (row: Record<string, unknown>, keys: string[]) => {
+    const normalizedRow = buildNormalizedRow(row);
+    for (const key of keys) {
+      const normalizedKey = normalizeImportKey(key);
+      if (Object.prototype.hasOwnProperty.call(normalizedRow, normalizedKey)) {
+        return normalizedRow[normalizedKey];
+      }
+    }
+    return '';
+  };
+
+  const parseDelimitedList = (value: unknown): string[] =>
+    String(value || '')
+      .split(/[,|;]+/)
+      .map((token) => token.trim())
+      .filter(Boolean);
+
+  const parseNumberField = (value: unknown): number => {
+    const parsed = Number(String(value ?? '').trim());
+    return Number.isFinite(parsed) ? parsed : NaN;
+  };
+
+  const parseSizeStockEntries = (value: unknown): ProductSizeStock[] => {
+    const tokens = parseDelimitedList(value);
+    const entries: ProductSizeStock[] = [];
+    for (const token of tokens) {
+      const match = token.match(/^(.+):\s*(\d+)$/);
+      if (!match) continue;
+      const size = match[1].trim();
+      const stock = Math.max(0, Math.floor(Number(match[2])));
+      if (!size || !Number.isFinite(stock)) continue;
+      entries.push({ size, stock, left: stock, sold: 0 });
+    }
+    return entries;
+  };
+
+  const normalizeCategoryToken = (value: unknown): Category | null => {
+    const normalized = String(value || '').trim().toLowerCase();
+    const match = Object.values(Category).find((c) => c.toLowerCase() === normalized);
+    return match || null;
+  };
+
+  const getOrderPaymentStatus = (order: Order): string => {
+    const raw = (order as any).paymentStatus || (order as any).payment_status || (order as any).payment;
+    return raw ? String(raw) : 'N/A';
+  };
+
+  const resetImportState = () => {
+    setImportPreviewRows([]);
+    setImportErrors([]);
+    setImportSummary(null);
+    setImportFileName('');
+  };
+
+  const handleImportFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || []);
+    if (files.length === 0) return;
+    const file = files[0];
+
+    resetImportState();
+
+    const name = String(file.name || '').toLowerCase();
+    const allowedExtensions = ['.xlsx', '.xls', '.csv'];
+    if (!allowedExtensions.some((ext) => name.endsWith(ext))) {
+      setImportErrors([`Unsupported file type: ${file.name}`]);
+      event.target.value = '';
+      return;
+    }
+
+    try {
+      const buffer = await file.arrayBuffer();
+      const workbook = XLSX.read(buffer, { type: 'array' });
+      const sheetName = workbook.SheetNames[0];
+      if (!sheetName) {
+        setImportErrors(['No worksheets found in the file.']);
+        event.target.value = '';
+        return;
+      }
+
+      const sheet = workbook.Sheets[sheetName];
+      const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' });
+      if (rawRows.length === 0) {
+        setImportErrors(['No data rows detected.']);
+        event.target.value = '';
+        return;
+      }
+
+      const existingSkuSet = new Set(products.map((p) => String(p.Product_ID || '').trim().toLowerCase()));
+      const seenSkus = new Set<string>();
+      const previewRows: ImportPreviewRow[] = rawRows.map((row, index) => {
+        const errors: string[] = [];
+        const rowNumber = index + 2;
+
+        const sku = String(getImportValue(row, ['sku', 'product_id', 'product id', 'code', 'productid', 'Product_ID'])).trim();
+        if (!sku) errors.push('Missing SKU/Product ID.');
+
+        const brandValue = String(getImportValue(row, ['brand', 'brand_name', 'brandname'])).trim();
+        const productValue = String(getImportValue(row, ['product', 'product_name', 'productname', 'name'])).trim();
+        let resolvedBrand = brandValue;
+        let resolvedProduct = productValue;
+        if (!resolvedBrand || !resolvedProduct) {
+          const combined = brandValue || productValue;
+          if (combined) {
+            const split = splitDisplayName(combined);
+            resolvedBrand = resolvedBrand || split.brand;
+            resolvedProduct = resolvedProduct || split.product;
+          }
+        }
+        if (!resolvedProduct) errors.push('Missing product name.');
+
+        const categoryValue = normalizeCategoryToken(getImportValue(row, ['category', 'Category']));
+        if (!categoryValue) errors.push('Invalid or missing category.');
+
+        const typeValue = String(getImportValue(row, ['type', 'style'])).trim();
+        if (!typeValue) errors.push('Missing type/style.');
+
+        const priceValue = parseNumberField(getImportValue(row, ['price', 'Price']));
+        if (!Number.isFinite(priceValue) || priceValue < 0) errors.push('Invalid price.');
+
+        const costValue = parseNumberField(getImportValue(row, ['cost', 'Cost']));
+        const resolvedCost = Number.isFinite(costValue) ? costValue : 0;
+
+        const sizeStockValue = parseSizeStockEntries(getImportValue(row, ['size_stock', 'size stock', 'sizestock']));
+        const sizesValue = sizeStockValue.length > 0
+          ? sizeStockValue.map((entry) => entry.size)
+          : parseDelimitedList(getImportValue(row, ['sizes', 'size', 'variants', 'options']));
+
+        if (sizesValue.length === 0) errors.push('Missing sizes/options.');
+
+        const stockValue = parseNumberField(getImportValue(row, ['stock', 'quantity', 'qty', 'items_left', 'itemsleft']));
+        const computedStock = sizeStockValue.length > 0
+          ? sizeStockValue.reduce((total, entry) => total + entry.stock, 0)
+          : stockValue;
+
+        if (!Number.isFinite(computedStock) || computedStock < 0) errors.push('Invalid stock/quantity.');
+
+        const descriptionValue = String(getImportValue(row, ['description', 'details', 'desc'])).trim();
+        if (!descriptionValue) errors.push('Missing description.');
+
+        const imageTokens = parseDelimitedList(getImportValue(row, ['images', 'image', 'image_urls', 'imageurls', 'pictures']));
+        const normalizedImages = imageTokens.length > 0 ? imageTokens : [BRAND_LOGO_SRC];
+
+        const statusValue = String(getImportValue(row, ['status', 'availability'])).trim() || 'Active';
+        const genderValue = normalizeGender(getImportValue(row, ['gender', 'Gender']));
+        const colorTokens = parseDelimitedList(getImportValue(row, ['colors', 'color'])).map((c) => c.toLowerCase());
+
+        const originalPriceValue = parseNumberField(getImportValue(row, ['original_price', 'original price', 'compare_at']));
+        const onSaleRaw = String(getImportValue(row, ['on_sale', 'onsale', 'sale'])).trim().toLowerCase();
+        const onSaleValue = ['true', 'yes', '1'].includes(onSaleRaw);
+
+        const skuKey = sku.toLowerCase();
+        if (skuKey && seenSkus.has(skuKey)) {
+          errors.push('Duplicate SKU in import file.');
+        }
+        if (skuKey) seenSkus.add(skuKey);
+
+        const duplicateSku = skuKey ? existingSkuSet.has(skuKey) : false;
+
+        const stockTotal = Number.isFinite(computedStock) ? Math.floor(computedStock) : 0;
+        const sizeStockPayload = sizeStockValue.length > 0
+          ? sizeStockValue
+          : sizesValue.map((size, idx) => {
+              const base = Math.floor(stockTotal / sizesValue.length);
+              const extra = idx < (stockTotal % sizesValue.length) ? 1 : 0;
+              const stock = Math.max(0, base + extra);
+              return { size, stock, left: stock, sold: 0 };
+            });
+
+        const nameValue = resolvedBrand && resolvedProduct
+          ? `${resolvedBrand} - ${resolvedProduct}`
+          : resolvedProduct || resolvedBrand || sku;
+
+        const payload = (!errors.length && categoryValue)
+          ? {
+              Product_ID: sku,
+              name: nameValue,
+              brandName: resolvedBrand || splitDisplayName(nameValue).brand || resolvedBrand,
+              productName: resolvedProduct || splitDisplayName(nameValue).product || resolvedProduct,
+              gender: genderValue,
+              category: categoryValue,
+              type: typeValue,
+              price: Number(priceValue),
+              cost: resolvedCost,
+              initialStock: stockTotal,
+              pieces: stockTotal,
+              sold: 0,
+              sizes: sizesValue,
+              sizeStock: sizeStockPayload,
+              description: descriptionValue,
+              image: normalizedImages[0] || BRAND_LOGO_SRC,
+              images: normalizedImages,
+              isAuthentic: true,
+              status: statusValue,
+              colors: colorTokens.length ? colorTokens : undefined,
+              color: colorTokens.length ? colorTokens.join(', ') : undefined,
+              originalPrice: Number.isFinite(originalPriceValue) ? originalPriceValue : undefined,
+              onSale: onSaleValue,
+            }
+          : undefined;
+
+        return {
+          rowNumber,
+          sku,
+          productName: resolvedProduct || nameValue,
+          category: categoryValue || '',
+          price: Number.isFinite(priceValue) ? priceValue : 0,
+          stock: Number.isFinite(computedStock) ? Math.floor(computedStock) : 0,
+          errors,
+          payload,
+          duplicateSku,
+        };
+      });
+
+      setImportPreviewRows(previewRows);
+      setImportFileName(file.name);
+    } catch (error: any) {
+      setImportErrors([`Failed to parse file: ${error?.message || 'Unknown error'}`]);
+    } finally {
+      event.target.value = '';
+    }
+  };
+
+  const downloadBlob = (blob: Blob, fileName: string) => {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const buildImportTemplateRows = () => ([
+    {
+      sku: 'FF-0101',
+      brand: 'Flex',
+      product_name: 'Court Runner',
+      category: 'Shoes',
+      type: 'Running',
+      gender: 'Unisex',
+      price: 120,
+      cost: 70,
+      stock: 12,
+      sizes: '40, 41, 42',
+      size_stock: '40:4 | 41:4 | 42:4',
+      description: 'Authentic court runner with premium finish.',
+      images: 'https://example.com/image-1.jpg, https://example.com/image-2.jpg',
+      status: 'Active',
+      colors: 'black, white',
+      original_price: 140,
+      on_sale: true,
+    },
+  ]);
+
+  const handleDownloadTemplate = (format: 'csv' | 'xlsx') => {
+    const rows = buildImportTemplateRows();
+    const worksheet = XLSX.utils.json_to_sheet(rows);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Template');
+
+    if (format === 'csv') {
+      const csv = XLSX.utils.sheet_to_csv(worksheet);
+      downloadBlob(new Blob([csv], { type: 'text/csv;charset=utf-8;' }), 'inventory-template.csv');
+      return;
+    }
+
+    const output = XLSX.write(workbook, { type: 'array', bookType: 'xlsx' });
+    downloadBlob(new Blob([output], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), 'inventory-template.xlsx');
+  };
+
+  const handleExportInventory = (format: 'csv' | 'xlsx') => {
+    const exportProducts = selectedProductIds.size > 0
+      ? products.filter((product) => selectedProductIds.has(product.Product_ID))
+      : products;
+    const rows = exportProducts.map((product) => {
+      const totals = getProductStockTotals(product);
+      const sizeStock = normalizeSizeStockEntries(product);
+      return {
+        sku: product.Product_ID,
+        brand: product.brandName || splitDisplayName(product.name).brand,
+        product_name: product.productName || splitDisplayName(product.name).product,
+        category: product.category,
+        type: product.type,
+        gender: normalizeGender(product.gender),
+        price: product.price,
+        cost: product.cost,
+        stock: totals.stock,
+        sizes: (product.sizes || []).join(', '),
+        size_stock: sizeStock.length > 0
+          ? sizeStock.map((entry) => `${entry.size}:${entry.stock}`).join(' | ')
+          : '',
+        description: product.description,
+        images: (getProductImages(product) || []).join(', '),
+        status: product.status || '',
+        colors: (getProductColorTokens(product) || []).join(', '),
+        original_price: product.originalPrice ?? '',
+        on_sale: Boolean(product.onSale),
+      };
+    });
+
+    const worksheet = XLSX.utils.json_to_sheet(rows);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Inventory');
+
+    if (format === 'csv') {
+      const csv = XLSX.utils.sheet_to_csv(worksheet);
+      downloadBlob(new Blob([csv], { type: 'text/csv;charset=utf-8;' }), 'inventory-export.csv');
+      return;
+    }
+
+    const output = XLSX.write(workbook, { type: 'array', bookType: 'xlsx' });
+    downloadBlob(new Blob([output], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), 'inventory-export.xlsx');
+  };
+
+  const handleConfirmImport = async () => {
+    if (importPreviewRows.length === 0) return;
+    setIsImporting(true);
+    setImportSummary(null);
+
+    const existingSkuSet = new Set(products.map((p) => String(p.Product_ID || '').trim().toLowerCase()));
+    const summary: ImportSummary = { imported: 0, updated: 0, skipped: 0, errors: 0 };
+
+    for (const row of importPreviewRows) {
+      if (row.errors.length > 0 || !row.payload) {
+        summary.errors += 1;
+        continue;
+      }
+
+      const skuKey = String(row.sku || '').trim().toLowerCase();
+      if (row.duplicateSku && duplicateBehavior === 'skip') {
+        summary.skipped += 1;
+        continue;
+      }
+
+      try {
+        await syncProductToDatabase(row.payload);
+        if (skuKey && existingSkuSet.has(skuKey)) {
+          summary.updated += 1;
+        } else {
+          summary.imported += 1;
+          if (skuKey) existingSkuSet.add(skuKey);
+        }
+      } catch (error) {
+        console.error('Failed to import product:', row.sku, error);
+        summary.errors += 1;
+      }
+    }
+
+    try {
+      const refreshedProducts = await getProducts();
+      setProducts(refreshedProducts);
+    } catch (refreshError) {
+      console.error('Failed to refresh products after import:', refreshError);
+    }
+
+    setImportSummary(summary);
+    setIsImporting(false);
+  };
+
+  const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+
+    const validFiles: File[] = [];
+    const errors: string[] = [];
+
+    for (const file of files) {
+      if (Number(file.size || 0) <= 0) {
+        errors.push(`${file.name}: empty file.`);
+        continue;
+      }
+
+      if (file.size > 50 * 1024 * 1024) {
+        errors.push(`${file.name}: exceeds 50MB limit.`);
+        continue;
+      }
+
+      const type = String(file.type || '').toLowerCase();
+      if (!['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(type)) {
+        errors.push(`${file.name}: unsupported format.`);
+        continue;
+      }
+
+      validFiles.push(file);
+    }
+
+    if (errors.length > 0) {
+      setImageValidationErrors(errors);
+    }
+
+    if (validFiles.length === 0) {
+      e.target.value = '';
+      return;
+    }
+
+    setUploadedImageFiles((prev) => [...prev, ...validFiles]);
+    const objectUrls = validFiles.map((file) => URL.createObjectURL(file));
+    setUploadedImagePreviews((prev) => [...prev, ...objectUrls]);
+    e.target.value = '';
+  };
+
+  const saveProduct = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const formEl = e.currentTarget;
+    if (selectedSizes.length === 0) {
+      alert("Select at least one size for this product.");
+      return;
+    }
+    const normalizedBrand = brandName.trim();
+    const normalizedProduct = productName.trim();
+    if (!normalizedBrand || !normalizedProduct) {
+      alert('Please fill both Brand Name and Product Name.');
+      return;
+    }
+    const fd = new FormData(formEl);
+    // DEBUG: Log colors state and product ID before building payload
+    console.log('[saveProduct] formColors text:', formColors);
+    console.log('[saveProduct] editMode?.Product_ID:', editMode?.Product_ID);
+
+    const productId = editMode?.Product_ID || generateNextProductId();
+    console.log('[saveProduct] Resolved productId:', productId, '| isEdit:', !!editMode);
+
+    // Parse comma-separated text into a clean string[] for the DB text[] column
+    const colorTokens: string[] = Array.from(
+      new Set(
+        formColors
+          .split(',')
+          .map((c) => c.trim().toLowerCase())
+          .filter(Boolean)
+      )
+    );
+    console.log('[saveProduct] colorTokens to save:', colorTokens);
+
+    const urlImages = parseImageUrlTokens(formImagesText);
+    setImageValidationErrors([]);
+
+    const validationResults = await Promise.all(
+      urlImages.map(async (candidate) => ({
+        candidate,
+        isValid: await validateImageUrl(candidate),
+      }))
+    );
+    const invalidUrls = validationResults.filter((entry) => !entry.isValid).map((entry) => entry.candidate);
+
+    if (invalidUrls.length > 0) {
+      setImageValidationErrors(invalidUrls.map((url) => `Invalid or unreachable image URL: ${url}`));
+      alert('Fix invalid image URLs before saving this product.');
+      return;
+    }
+
+    let uploadedUrls: string[] = [];
+    if (uploadedImageFiles.length > 0) {
+      setIsUploadingImages(true);
+      try {
+        uploadedUrls = await uploadProductImagesToStorage(editMode?.Product_ID || productId, uploadedImageFiles);
+      } finally {
+        setIsUploadingImages(false);
+      }
+    }
+
+    const parsedImages = Array.from(new Set([...uploadedUrls, ...urlImages]));
+    if (parsedImages.length === 0) {
+      alert('Add at least one valid image (upload or URL).');
+      return;
+    }
+    const normalizedSizeStock = selectedSizes.map((size) => {
+      const existing = formSizeStock.find((entry) => entry.size === size);
+      const stockAmount = Math.max(0, Math.floor(Number(existing?.stock ?? 0)));
+      return {
+        size,
+        stock: stockAmount,
+        left: stockAmount,
+        sold: 0,
+      };
+    });
+
+    const explicitSizeStockTotal = normalizedSizeStock.reduce((total, entry) => total + entry.stock, 0);
+    const fallbackStock = Number(formStock);
+    const resolvedStock = explicitSizeStockTotal > 0
+      ? explicitSizeStockTotal
+      : Number.isFinite(fallbackStock) && fallbackStock > 0
+        ? fallbackStock
+        : 0;
+
+    if (resolvedStock <= 0) {
+      alert('Add stock for at least one size before saving this product.');
+      return;
+    }
+
+    const derivedSizeStock = explicitSizeStockTotal > 0
+      ? normalizedSizeStock
+      : selectedSizes.map((size, index) => {
+          const stockAmount = Math.max(0, Math.floor(resolvedStock / selectedSizes.length) + (index < (resolvedStock % selectedSizes.length) ? 1 : 0));
+          return {
+            size,
+            stock: stockAmount,
+            left: stockAmount,
+            sold: 0,
+          };
+        });
+
+    const originalPriceValue = Number(fd.get('original_price'));
+    const isOnSale = Boolean(fd.get('on_sale'));
+
+    const stock = resolvedStock;
+    const itemsSold = Number(formSold === '' ? (editMode?.sold ?? 0) : formSold);
+    const piecesLeft = stock - itemsSold;
+
+    if (!Number.isInteger(stock) || stock < 0 || !Number.isInteger(itemsSold) || itemsSold < 0 || itemsSold > stock) {
+      alert('Stock and items sold must be valid non-negative integers, and items sold cannot exceed stock.');
+      return;
+    }
+    const newP: Product = {
+      Product_ID: productId,
+      name: `${normalizedBrand} - ${normalizedProduct}`,
+      brandName: normalizedBrand,
+      productName: normalizedProduct,
+      gender: normalizeGender(fd.get('gender')),
+      category: formCategory,
+      type: fd.get('type') as string,
+      price: Number(fd.get('price')),
+      cost: Number(fd.get('cost')),
+      initialStock: stock,
+      pieces: piecesLeft,
+      sold: itemsSold,
+      sizes: selectedSizes,
+      sizeStock: derivedSizeStock,
+      description: fd.get('description') as string,
+      image: parsedImages[0] || (fd.get('image') as string) || editMode?.image || '',
+      images: parsedImages,
+      isAuthentic: true,
+      status: (fd.get('status') as string) || 'Active',
+      colors: colorTokens,
+      color: colorTokens.length ? colorTokens.join(', ') : undefined,
+      originalPrice: Number.isFinite(originalPriceValue) && originalPriceValue > 0 ? originalPriceValue : undefined,
+      onSale: isOnSale,
+      tagIds: formTagIds,
+    };
+    console.log('[saveProduct] Final payload:', JSON.stringify(newP, null, 2));
+    try {
+      await syncProductToDatabase(newP);
+      const refreshedProducts = await getProducts();
+      setProducts(refreshedProducts);
+      setEditMode(null);
+      setUploadedImageFiles([]);
+      setUploadedImagePreviews([]);
+      setFormImagesText('');
+      setImageValidationErrors([]);
+      setFormSizeStock([]);
+      setSelectedSizes([]);
+      setBrandName('');
+      setProductName('');
+      setActiveTab('inventory');
+      setFormColors('');
+      setFormStock('');
+      setFormSold('');
+      setFormTagIds([]);
+      formEl.reset();
+    } catch (error: any) {
+      console.error('Error saving product:', error);
+      const msg = error?.message || error?.error_description || JSON.stringify(error);
+      alert(`Failed to save product to database.\n\nError: ${msg}\n\nCheck Supabase dashboard → Table Editor → products → RLS policies.`);
+    }
+  };
+
+  if (isBulkEditOpen) {
+    const bulkTargets = products.filter((p) => selectedProductIds.has(p.Product_ID));
+    const closeBulkEdit = () => {
+      setIsBulkEditOpen(false);
+      setBulkEditDrafts({});
+      setBulkEditErrors({});
+    };
+    return (
+      <div className="w-full max-w-[1600px] mx-auto px-4 py-10 min-w-0">
+        <div className="bg-white border rounded-2xl overflow-hidden min-w-0">
+          <div className="p-4 border-b bg-gray-50 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-[10px] font-bold uppercase text-gray-500">Bulk Edit</p>
+              <h2 className="text-lg font-black uppercase text-gray-900">{bulkTargets.length} Product{bulkTargets.length > 1 ? 's' : ''} Selected</h2>
+              <p className="text-[10px] text-gray-500 font-semibold mt-1">Each row is its own product — edit price, discount, stock, and status independently, then save all at once.</p>
+            </div>
+            <div className="flex gap-2 flex-shrink-0">
+              <button
+                type="button"
+                disabled={isBulkSaving}
+                onClick={() => void handleBulkEditSaveAll()}
+                className="bg-orange-600 text-white font-black px-6 py-3 rounded-xl uppercase tracking-widest text-xs hover:bg-orange-700 transition-all disabled:opacity-50"
+              >
+                {isBulkSaving ? 'Saving...' : `Save All (${bulkTargets.length})`}
+              </button>
+              <button
+                type="button"
+                disabled={isBulkSaving}
+                onClick={closeBulkEdit}
+                className="px-5 py-3 rounded-xl border border-gray-200 text-gray-600 font-black uppercase tracking-widest text-xs hover:bg-gray-50 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-[11px] min-w-[1100px]">
+              <thead className="bg-gray-100 uppercase font-black text-gray-500 border-b">
+                <tr>
+                  <th className="p-3">Product</th>
+                  <th className="p-3 whitespace-nowrap">Price ($)</th>
+                  <th className="p-3 whitespace-nowrap">Original Price ($)</th>
+                  <th className="p-3 whitespace-nowrap">Discount (%)</th>
+                  <th className="p-3 whitespace-nowrap">On Sale</th>
+                  <th className="p-3 whitespace-nowrap">Stock (Left)</th>
+                  <th className="p-3 whitespace-nowrap">Status</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {bulkTargets.map((product) => {
+                  const draft = bulkEditDrafts[product.Product_ID];
+                  if (!draft) return null;
+                  const rowError = bulkEditErrors[product.Product_ID];
+                  return (
+                    <tr key={product.Product_ID} className={rowError ? 'bg-red-50/60' : 'hover:bg-gray-50 transition-colors'}>
+                      <td className="p-3 max-w-[260px] align-top">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <div className="w-10 h-10 rounded border overflow-hidden bg-gray-50 flex items-center justify-center flex-shrink-0">
+                            <SafeImage src={product.image} className="w-full h-full object-contain p-0.5" alt={product.name} />
+                          </div>
+                          <div className="min-w-0">
+                            <p className="font-semibold text-gray-900 truncate">{product.productName || product.name}</p>
+                            <p className="text-[9px] text-gray-400 uppercase font-bold truncate">{product.Product_ID}</p>
+                          </div>
+                        </div>
+                        {rowError && <p className="text-[10px] font-bold text-red-600 mt-1.5">{rowError}</p>}
+                      </td>
+                      <td className="p-3 align-top">
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={draft.price}
+                          onChange={(e) => updateBulkDraft(product.Product_ID, { price: e.target.value })}
+                          className="w-24 p-2 bg-gray-50 border rounded-lg text-xs font-bold outline-none focus:ring-2 focus:ring-orange-500"
+                        />
+                      </td>
+                      <td className="p-3 align-top">
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={draft.originalPrice}
+                          onChange={(e) => updateBulkDraft(product.Product_ID, { originalPrice: e.target.value })}
+                          placeholder="None"
+                          className="w-24 p-2 bg-gray-50 border rounded-lg text-xs font-bold outline-none focus:ring-2 focus:ring-orange-500"
+                        />
+                      </td>
+                      <td className="p-3 align-top">
+                        <input
+                          type="number"
+                          min="0"
+                          max="100"
+                          step="1"
+                          value={draft.discount}
+                          onChange={(e) => applyBulkDiscount(product, e.target.value)}
+                          placeholder="—"
+                          className="w-20 p-2 bg-gray-50 border rounded-lg text-xs font-bold outline-none focus:ring-2 focus:ring-orange-500"
+                        />
+                      </td>
+                      <td className="p-3 align-top">
+                        <input
+                          type="checkbox"
+                          checked={draft.onSale}
+                          onChange={(e) => updateBulkDraft(product.Product_ID, { onSale: e.target.checked })}
+                          className="h-4 w-4 accent-orange-600"
+                        />
+                      </td>
+                      <td className="p-3 align-top">
+                        <input
+                          type="number"
+                          min="0"
+                          step="1"
+                          value={draft.stock}
+                          onChange={(e) => updateBulkDraft(product.Product_ID, { stock: e.target.value })}
+                          className="w-20 p-2 bg-gray-50 border rounded-lg text-xs font-bold outline-none focus:ring-2 focus:ring-orange-500"
+                        />
+                      </td>
+                      <td className="p-3 align-top">
+                        <select
+                          value={draft.status}
+                          onChange={(e) => updateBulkDraft(product.Product_ID, { status: e.target.value })}
+                          className="p-2 bg-gray-50 border rounded-lg text-xs font-bold outline-none focus:ring-2 focus:ring-orange-500"
+                        >
+                          <option value="Active">Active</option>
+                          <option value="Discontinued">Discontinued</option>
+                          <option value="Out of Stock">Out of Stock</option>
+                          <option value="Coming Soon">Coming Soon</option>
+                        </select>
+                      </td>
+                    </tr>
+                  );
+                })}
+                {bulkTargets.length === 0 && (
+                  <tr>
+                    <td colSpan={7} className="p-6 text-center text-gray-500 font-semibold">No products selected.</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="p-4 border-t bg-gray-50 flex justify-end gap-2">
+            <button
+              type="button"
+              disabled={isBulkSaving}
+              onClick={() => void handleBulkEditSaveAll()}
+              className="bg-orange-600 text-white font-black px-6 py-3 rounded-xl uppercase tracking-widest text-xs hover:bg-orange-700 transition-all disabled:opacity-50"
+            >
+              {isBulkSaving ? 'Saving...' : `Save All (${bulkTargets.length})`}
+            </button>
+            <button
+              type="button"
+              disabled={isBulkSaving}
+              onClick={closeBulkEdit}
+              className="px-5 py-3 rounded-xl border border-gray-200 text-gray-600 font-black uppercase tracking-widest text-xs hover:bg-gray-50 disabled:opacity-50"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="w-full max-w-[1600px] mx-auto px-4 py-10">
+      <div className="grid grid-cols-1 lg:grid-cols-[240px_1fr] gap-6 min-w-0">
+        <aside className="bg-white border rounded-2xl p-4 h-fit lg:sticky lg:top-6 lg:max-h-[calc(100vh-3rem)] lg:overflow-y-auto min-w-0">
+          <div className="mb-6">
+            <p className="text-[10px] font-bold uppercase text-gray-500 mb-1">Admin Dashboard</p>
+            <h2 className="text-lg font-black uppercase text-gray-900">Inventory Control</h2>
+          </div>
+          <div className="space-y-2">
+            {adminNavItems.map((item) => {
+              const Icon = item.icon;
+              const isActive = activeTab === item.key;
+              return (
+                <button
+                  key={item.key}
+                  onClick={() => setActiveTab(item.key)}
+                  className={`w-full px-3 py-2 rounded-xl font-bold uppercase text-[11px] transition-colors flex items-center gap-2 border ${isActive ? 'bg-gray-900 text-white border-gray-900' : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50'}`}
+                >
+                  <Icon size={14} />
+                  <span>{item.label}</span>
+                </button>
+              );
+            })}
+          </div>
+          <div className="mt-6 pt-4 border-t border-gray-100">
+            <button
+              onClick={() => { if (supabase) void supabase.auth.signOut(); setIsAdmin(false); }}
+              className="w-full bg-white hover:bg-red-50 text-gray-700 hover:text-red-600 px-3 py-2 rounded-xl transition-colors font-bold uppercase text-[11px] flex items-center gap-2 border border-gray-200"
+            >
+              <LogOut size={14} />
+              Log out
+            </button>
+          </div>
+        </aside>
+
+        <div className="space-y-6 min-w-0">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            <div className="bg-white p-4 rounded-xl border min-w-0 overflow-hidden">
+              <div className="flex justify-between items-center mb-1 gap-2">
+                <BarChart3 className="text-gray-500 flex-shrink-0" size={18} />
+                <span className="text-[10px] font-bold uppercase text-gray-500 truncate">Total Revenue</span>
+              </div>
+              <p className="text-lg md:text-xl font-black truncate">${totalSalesValue.toLocaleString()}</p>
+            </div>
+            <div className="bg-white p-4 rounded-xl border min-w-0 overflow-hidden">
+              <div className="flex justify-between items-center mb-1 gap-2">
+                <Package className="text-gray-500 flex-shrink-0" size={18} />
+                <span className="text-[10px] font-bold uppercase text-gray-500 truncate">Orders Fulfilled</span>
+              </div>
+              <p className="text-lg md:text-xl font-black truncate">{orders.length}</p>
+            </div>
+            <div className="bg-white p-4 rounded-xl border min-w-0 overflow-hidden">
+              <div className="flex justify-between items-center mb-1 gap-2">
+                <Star className="text-gray-500 flex-shrink-0" size={18} />
+                <span className="text-[10px] font-bold uppercase text-gray-500 truncate">Net Profit</span>
+              </div>
+              <p className="text-lg md:text-xl font-black text-gray-900 truncate">${profit.toLocaleString()}</p>
+            </div>
+          </div>
+
+      {activeTab === 'financials' && (
+        <div className="bg-white border rounded-xl overflow-hidden mb-8">
+          <div className="p-4 border-b bg-gray-50 flex items-center justify-between gap-3">
+            <div>
+              <p className="text-[10px] font-bold uppercase text-gray-500">Financial Breakdown (Database)</p>
+              <h3 className="text-sm md:text-base font-black uppercase text-gray-900">Revenue & Net Profit Per Product</h3>
+            </div>
+            <span className="text-[10px] bg-gray-900 text-white px-3 py-1 rounded-full font-bold uppercase">{displayFinancialMetrics.length} Items</span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-[11px] min-w-[900px]">
+              <thead className="bg-gray-100 uppercase font-black text-gray-500 border-b">
+                <tr>
+                  <th className="p-3">Product_ID</th>
+                  <th className="p-3">Name_of_Product</th>
+                  <th className="p-3">Items_Sold</th>
+                  <th className="p-3">Price</th>
+                  <th className="p-3">Cost</th>
+                  <th className="p-3">Revenue (Sold×Price)</th>
+                  <th className="p-3">Net_Profit</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {displayFinancialMetrics.map((row) => (
+                  <tr key={row.productId} className="hover:bg-gray-50 transition-colors">
+                    <td className="p-3 font-bold text-gray-700">{row.productId}</td>
+                    <td className="p-3 font-semibold text-gray-900">{row.productName}</td>
+                    <td className="p-3 text-gray-700">{row.itemsSold}</td>
+                    <td className="p-3 text-gray-700">${row.itemPrice.toFixed(2)}</td>
+                    <td className="p-3 text-gray-700">${row.itemCost.toFixed(2)}</td>
+                    <td className="p-3 font-bold text-gray-900">${row.revenue.toFixed(2)}</td>
+                    <td className={`p-3 font-bold ${row.netProfit >= 0 ? 'text-green-700' : 'text-red-600'}`}>${row.netProfit.toFixed(2)}</td>
+                  </tr>
+                ))}
+                {displayFinancialMetrics.length === 0 && (
+                  <tr>
+                    <td colSpan={7} className="p-6 text-center text-gray-500">No products available yet.</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div className="p-4 border-t bg-gray-50 flex justify-end gap-8">
+            <div className="text-right">
+              <p className="text-[10px] font-bold uppercase text-gray-500">Total Revenue</p>
+              <p className="text-base font-black text-gray-900">${totalSalesValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+            </div>
+            <div className="text-right">
+              <p className="text-[10px] font-bold uppercase text-gray-500">Total Net Profit</p>
+              <p className={`text-base font-black ${profit >= 0 ? 'text-green-700' : 'text-red-600'}`}>${profit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'inventory' && (
+        <div className="bg-white rounded-xl border overflow-hidden animate-fade-in-up min-w-0">
+          <div className="p-4 border-b bg-gray-50 flex flex-col gap-3">
+            <div className="flex flex-wrap justify-between items-center gap-2">
+              <div>
+                <h3 className="font-black uppercase text-sm text-gray-700">Inventory</h3>
+                <p className="text-[10px] text-gray-500 font-semibold uppercase">All sections connected to database</p>
+              </div>
+              <span className="text-[10px] bg-gray-900 text-white px-3 py-1 rounded-full font-bold uppercase">{inventoryProducts.length} Total</span>
+            </div>
+            <div className="relative w-full sm:max-w-xs min-w-0">
+              <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+              <input
+                type="text"
+                value={inventorySearchQuery}
+                onChange={(e) => setInventorySearchQuery(e.target.value)}
+                placeholder="Search by ID, name, brand, type..."
+                className="w-full pl-8 pr-8 py-2 bg-white border rounded-lg text-xs font-semibold outline-none focus:ring-2 focus:ring-orange-500 min-w-0"
+              />
+              {inventorySearchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setInventorySearchQuery('')}
+                  aria-label="Clear search"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                >
+                  <X size={14} />
+                </button>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {inventorySections.map(section => {
+                const label = section === 'ComingSoon' ? 'T-shirts & Hoodies (Soon)' : section;
+                const count = section === 'All'
+                  ? products.length
+                  : section === 'ComingSoon'
+                    ? products.filter(p => /t-?shirt|hoodie/i.test(p.type)).length
+                    : products.filter(p => p.category === section).length;
+                return (
+                  <button
+                    key={section}
+                    onClick={() => setInventorySection(section)}
+                    className={`px-3 py-1.5 rounded-md text-xs font-bold border transition-colors ${inventorySection === section ? 'bg-gray-900 text-white border-gray-900' : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50'}`}
+                  >
+                    {label} ({count})
+                  </button>
+                );
+              })}
+            </div>
+            <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-gray-100">
+              {selectedProductIds.size > 0 && (
+                <>
+                  <span className="text-[10px] bg-orange-600 text-white px-3 py-1.5 rounded-full font-black uppercase">{selectedProductIds.size} Selected</span>
+                  <button type="button" onClick={openBulkEdit} className="px-3 py-2 rounded-lg border border-gray-200 text-gray-700 text-[10px] font-black uppercase flex items-center gap-2 hover:bg-gray-50">
+                    <Edit2 size={14} /> Bulk Edit
+                  </button>
+                  <button type="button" disabled={isBulkSaving} onClick={handleBulkDelete} className="px-3 py-2 rounded-lg border border-red-200 text-red-600 text-[10px] font-black uppercase flex items-center gap-2 hover:bg-red-50 disabled:opacity-50">
+                    <Trash2 size={14} /> Delete Selected
+                  </button>
+                  <button type="button" onClick={clearSelection} className="px-3 py-2 rounded-lg border border-gray-200 text-gray-500 text-[10px] font-black uppercase hover:bg-gray-50">
+                    Clear
+                  </button>
+                  <span className="w-px h-5 bg-gray-200" />
+                </>
+              )}
+              <button type="button" onClick={() => setIsImportPanelOpen((prev) => !prev)} className="px-3 py-2 rounded-lg border border-gray-200 text-gray-700 text-[10px] font-black uppercase flex items-center gap-2 hover:bg-gray-50">
+                <Upload size={14} /> {isImportPanelOpen ? 'Close Import' : 'Import'}
+              </button>
+              <button type="button" onClick={() => handleExportInventory('csv')} className="px-3 py-2 rounded-lg border border-gray-200 text-gray-700 text-[10px] font-black uppercase flex items-center gap-2 hover:bg-gray-50">
+                <Download size={14} /> {selectedProductIds.size > 0 ? 'Export Selected CSV' : 'Export All CSV'}
+              </button>
+              <button type="button" onClick={() => handleExportInventory('xlsx')} className="px-3 py-2 rounded-lg border border-gray-200 text-gray-700 text-[10px] font-black uppercase flex items-center gap-2 hover:bg-gray-50">
+                <Download size={14} /> Excel
+              </button>
+            </div>
+          </div>
+
+          {isImportPanelOpen && (
+            <div className="p-4 border-b bg-gray-50/60 space-y-4">
+              <div className="text-xs text-gray-600 space-y-1">
+                <p className="text-[10px] font-black uppercase text-gray-500">Required columns</p>
+                <p>SKU, Product Name, Category, Type, Price, Stock, Sizes, Description.</p>
+                <p className="text-[10px] font-black uppercase text-gray-500 mt-2">Optional columns</p>
+                <p>Brand, Cost, Gender, Status, Images, Colors, Size Stock, Original Price, On Sale.</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button type="button" onClick={() => handleDownloadTemplate('csv')} className="px-3 py-2 rounded-lg border border-gray-200 text-gray-700 text-[10px] font-black uppercase flex items-center gap-2 hover:bg-gray-50">
+                  <Download size={14} /> CSV Template
+                </button>
+                <button type="button" onClick={() => handleDownloadTemplate('xlsx')} className="px-3 py-2 rounded-lg border border-gray-200 text-gray-700 text-[10px] font-black uppercase flex items-center gap-2 hover:bg-gray-50">
+                  <Download size={14} /> Excel Template
+                </button>
+                <button type="button" onClick={() => importFileRef.current?.click()} className="px-3 py-2 rounded-lg border border-gray-200 text-gray-700 text-[10px] font-black uppercase flex items-center gap-2 hover:bg-gray-50">
+                  <Upload size={14} /> Select File
+                </button>
+                <input ref={importFileRef} type="file" accept=".csv,.xls,.xlsx" hidden onChange={handleImportFileChange} />
+              </div>
+
+              {importFileName && (
+                <p className="text-[10px] font-black uppercase text-gray-500">Selected: {importFileName}</p>
+              )}
+
+              <div className="flex flex-col md:flex-row md:items-center gap-3">
+                <label className="text-[10px] font-black uppercase text-gray-500">Duplicate SKU behavior</label>
+                <select
+                  value={duplicateBehavior}
+                  onChange={(e) => setDuplicateBehavior(e.target.value as 'update' | 'skip')}
+                  className="px-3 py-2 rounded-lg border border-gray-200 text-gray-700 text-[10px] font-black uppercase"
+                >
+                  <option value="update">Update existing products</option>
+                  <option value="skip">Skip duplicates</option>
+                </select>
+              </div>
+
+              {importErrors.length > 0 && (
+                <div className="border border-red-200 bg-red-50 rounded-xl p-3 space-y-1">
+                  {importErrors.map((error) => (
+                    <p key={error} className="text-[10px] font-bold text-red-700">{error}</p>
+                  ))}
+                </div>
+              )}
+
+              {importPreviewRows.length > 0 && (
+                <div className="bg-white border rounded-2xl overflow-hidden">
+                  <div className="p-3 border-b bg-gray-50 flex items-center justify-between">
+                    <p className="text-[10px] font-bold uppercase text-gray-500">Preview</p>
+                    <span className="text-[10px] bg-gray-900 text-white px-3 py-1 rounded-full font-bold uppercase">
+                      {importableRows.length} Ready
+                    </span>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-[11px] min-w-[700px]">
+                      <thead className="bg-gray-100 uppercase font-black text-gray-500 border-b">
+                        <tr>
+                          <th className="p-3">Row</th>
+                          <th className="p-3">SKU</th>
+                          <th className="p-3">Product</th>
+                          <th className="p-3">Category</th>
+                          <th className="p-3">Price</th>
+                          <th className="p-3">Stock</th>
+                          <th className="p-3">Status</th>
+                          <th className="p-3">Notes</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y">
+                        {importPreviewRows.slice(0, 50).map((row) => (
+                          <tr key={`${row.rowNumber}-${row.sku}`} className="hover:bg-gray-50">
+                            <td className="p-3 text-gray-600">{row.rowNumber}</td>
+                            <td className="p-3 font-semibold text-gray-900">{row.sku || '-'}</td>
+                            <td className="p-3 text-gray-700 max-w-[160px] truncate">{row.productName || '-'}</td>
+                            <td className="p-3 text-gray-700">{row.category || '-'}</td>
+                            <td className="p-3 text-gray-700">${Number(row.price || 0).toFixed(2)}</td>
+                            <td className="p-3 text-gray-700">{row.stock}</td>
+                            <td className="p-3">
+                              {row.errors.length > 0 ? (
+                                <span className="px-2 py-1 rounded text-[10px] font-bold uppercase bg-red-100 text-red-700">Invalid</span>
+                              ) : row.duplicateSku ? (
+                                <span className="px-2 py-1 rounded text-[10px] font-bold uppercase bg-amber-100 text-amber-700">Duplicate</span>
+                              ) : (
+                                <span className="px-2 py-1 rounded text-[10px] font-bold uppercase bg-green-100 text-green-700">Ready</span>
+                              )}
+                            </td>
+                            <td className="p-3 text-gray-500 max-w-[200px] truncate">
+                              {row.errors.length > 0 ? row.errors.join(' ') : row.duplicateSku ? 'Existing SKU' : 'OK'}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {importPreviewRows.length > 50 && (
+                    <div className="p-3 text-[10px] font-bold uppercase text-gray-500 bg-gray-50 border-t">
+                      Showing first 50 rows. Import will include all valid rows.
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="flex flex-col md:flex-row md:items-center gap-3">
+                <button
+                  type="button"
+                  disabled={importableRows.length === 0 || isImporting}
+                  onClick={handleConfirmImport}
+                  className={`px-6 py-3 rounded-xl text-[11px] font-black uppercase tracking-widest transition-all shadow-xl ${importableRows.length === 0 || isImporting ? 'bg-gray-200 text-gray-500 cursor-not-allowed shadow-transparent' : 'bg-orange-600 text-white hover:bg-orange-700 shadow-orange-600/20'}`}
+                >
+                  {isImporting ? 'Importing...' : `Import ${importableRows.length} Items`}
+                </button>
+                <button
+                  type="button"
+                  onClick={resetImportState}
+                  className="px-4 py-2 rounded-lg border border-gray-200 text-gray-700 text-[10px] font-black uppercase hover:bg-gray-50"
+                >
+                  Clear Preview
+                </button>
+                {importSummary && (
+                  <div className="text-[10px] font-black uppercase text-gray-500">
+                    Imported: {importSummary.imported} · Updated: {importSummary.updated} · Skipped: {importSummary.skipped} · Errors: {importSummary.errors}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-[11px] min-w-[1280px]">
+              <thead className="bg-gray-100 uppercase font-black text-gray-500 border-b">
+                <tr>
+                  <th className="p-3 w-9">
+                    <input
+                      type="checkbox"
+                      checked={isAllCurrentPageSelected}
+                      onChange={toggleSelectAllCurrentPage}
+                      aria-label="Select all products on this page"
+                    />
+                  </th>
+                  <th className="p-3">
+                    <button onClick={() => cycleSort('Product_ID')} className="flex items-center gap-1 hover:text-gray-900 transition-colors whitespace-nowrap">
+                      Product_ID
+                      <span className="text-[10px] leading-none">{inventorySort?.col === 'Product_ID' ? (inventorySort.dir === 'asc' ? '▲' : '▼') : '⇅'}</span>
+                    </button>
+                  </th>
+                  <th className="p-3">
+                    <button onClick={() => cycleSort('productName')} className="flex items-center gap-1 hover:text-gray-900 transition-colors whitespace-nowrap">
+                      Product
+                      <span className="text-[10px] leading-none">{inventorySort?.col === 'productName' ? (inventorySort.dir === 'asc' ? '▲' : '▼') : '⇅'}</span>
+                    </button>
+                  </th>
+                  <th className="p-3 whitespace-nowrap">
+                    <button onClick={() => cycleSort('category')} className="flex items-center gap-1 hover:text-gray-900 transition-colors whitespace-nowrap">
+                      Category
+                      <span className="text-[10px] leading-none">{inventorySort?.col === 'category' ? (inventorySort.dir === 'asc' ? '▲' : '▼') : '⇅'}</span>
+                    </button>
+                  </th>
+                  <th className="p-3 whitespace-nowrap">Type</th>
+                  <th className="p-3 whitespace-nowrap">Sizes</th>
+                  <th className="p-3">Colors</th>
+                  <th className="p-3 whitespace-nowrap">Price</th>
+                  <th className="p-3 whitespace-nowrap">Stock</th>
+                  <th className="p-3 whitespace-nowrap">Status</th>
+                  <th className="p-3">Description</th>
+                  <th className="p-3 text-right whitespace-nowrap">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {pagedInventoryProducts.map(p => {
+                  const totals = getProductStockTotals(p);
+                  const computedLeft = totals.left;
+                  const stockStatus = computedLeft <= 0 ? 'Out of Stock' : computedLeft < 10 ? 'Low Stock' : 'Healthy';
+                  const normalizedStatus = p.status || stockStatus;
+                  const rowColors = getProductColorTokens(p);
+                  return (
+                    <tr key={p.Product_ID} className={`hover:bg-gray-50 transition-colors ${selectedProductIds.has(p.Product_ID) ? 'bg-orange-50/40' : ''}`}>
+                      <td className="p-3">
+                        <input
+                          type="checkbox"
+                          checked={selectedProductIds.has(p.Product_ID)}
+                          onChange={() => toggleProductSelected(p.Product_ID)}
+                          aria-label={`Select ${p.Product_ID}`}
+                        />
+                      </td>
+                      <td className="p-3 font-bold text-gray-700 whitespace-nowrap">{p.Product_ID}</td>
+                      <td className="p-3 max-w-[280px]">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <div className="w-10 h-10 rounded border overflow-hidden bg-gray-50 flex items-center justify-center flex-shrink-0">
+                            <SafeImage src={p.image} className="w-full h-full object-contain p-0.5" alt={p.name} />
+                          </div>
+                          <div className="min-w-0">
+                            <p className="font-semibold text-gray-900 truncate">{p.brandName || splitDisplayName(p.name).brand || '-'} {p.productName || splitDisplayName(p.name).product || ''}</p>
+                            <p className="text-[9px] text-gray-400 uppercase font-bold truncate">{normalizeGender(p.gender)}</p>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="p-3 text-gray-700 whitespace-nowrap">{p.category}</td>
+                      <td className="p-3 text-gray-700 whitespace-nowrap max-w-[160px] truncate">{p.type}</td>
+                      <td className="p-3 text-gray-700 max-w-[160px] truncate">{p.sizes.join(', ') || '-'}</td>
+                      <td className="p-3">
+                        <div className="flex flex-wrap gap-1 max-w-[180px]">
+                          {rowColors.length ? (
+                            rowColors.map((c) => (
+                              <span key={c} className="inline-block bg-orange-50 text-orange-800 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase">
+                                {c}
+                              </span>
+                            ))
+                          ) : (
+                            <span className="text-gray-400 text-[10px]">—</span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="p-3 whitespace-nowrap">
+                        <p className="font-bold text-gray-900">${p.price}</p>
+                        <p className="text-[9px] text-gray-400">cost ${p.cost}</p>
+                      </td>
+                      <td className="p-3 whitespace-nowrap">
+                        <p className="font-bold text-orange-600">{computedLeft} left</p>
+                        <p className="text-[9px] text-blue-600 font-bold">{totals.sold} sold</p>
+                      </td>
+                      <td className="p-3 whitespace-nowrap">
+                        <span className={`px-2 py-1 rounded text-[10px] font-bold uppercase ${normalizedStatus === 'Out of Stock' ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>
+                          {normalizedStatus}
+                        </span>
+                      </td>
+                      <td className="p-3 max-w-[320px]">
+                        <p className="text-[10px] text-gray-600 truncate">{p.description || '-'}</p>
+                      </td>
+                      <td className="p-3 text-right">
+                        <div className="flex justify-end gap-1">
+                          <button onClick={() => { setEditMode(p); setUploadedImageFiles([]); setUploadedImagePreviews([]); setImageValidationErrors([]); }} className="p-2 hover:bg-orange-50 text-gray-400 hover:text-orange-600 rounded-lg transition-colors"><Edit2 size={14} /></button>
+                          <button onClick={async () => {
+                            if(confirm('Permanently erase this asset?')) {
+                              try {
+                                await deleteProduct(p.Product_ID);
+                                const refreshedProducts = await getProducts();
+                                setProducts(refreshedProducts);
+                              } catch (error: any) {
+                                console.error('Error deleting product:', error);
+                                const msg = error?.message || 'Failed to delete product. Please try again.';
+                                alert(msg);
+                              }
+                            }
+                          }} className="p-2 hover:bg-red-50 text-gray-400 hover:text-red-600 rounded-lg transition-colors"><Trash2 size={14} /></button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+                {pagedInventoryProducts.length === 0 && (
+                  <tr>
+                    <td colSpan={12} className="p-6 text-center text-gray-500 font-semibold">
+                      {inventorySection === 'ComingSoon'
+                        ? 'No T-shirt or Hoodie products found yet. Add items with type containing "tshirt", "t-shirt", or "hoodie".'
+                        : 'No products in this section.'}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          {inventoryProducts.length > inventoryPageSize && (
+            <div className="px-4 py-3 border-t bg-gray-50 flex items-center justify-between">
+              <p className="text-[10px] font-black uppercase tracking-wider text-gray-500">Page {inventoryPage} / {inventoryTotalPages}</p>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={inventoryPage <= 1}
+                  onClick={() => setInventoryPage((prev) => Math.max(1, prev - 1))}
+                  className="px-3 py-1.5 text-[10px] font-black uppercase rounded-lg border border-gray-200 text-gray-600 disabled:opacity-40"
+                >
+                  Prev
+                </button>
+                <button
+                  type="button"
+                  disabled={inventoryPage >= inventoryTotalPages}
+                  onClick={() => setInventoryPage((prev) => Math.min(inventoryTotalPages, prev + 1))}
+                  className="px-3 py-1.5 text-[10px] font-black uppercase rounded-lg border border-gray-200 text-gray-600 disabled:opacity-40"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {activeTab === 'add' && (
+        <div className="max-w-4xl mx-auto bg-white p-6 rounded-2xl shadow-xl border animate-fade-in-up">
+          <h3 className="font-black mb-6 uppercase flex items-center gap-2 text-lg italic text-black">
+            {editMode ? <Edit2 size={24} className="text-orange-600" /> : <Plus size={24} className="text-orange-600" />} {editMode ? 'Update Existing Asset' : 'Create New Authentic Asset'}
+          </h3>
+          <form onSubmit={saveProduct} className="grid grid-cols-1 md:grid-cols-2 gap-8">
+            <div className="space-y-6">
+              <div>
+                <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Product_ID</label>
+                <input
+                  value={editMode?.Product_ID || generateNextProductId()}
+                  readOnly
+                  className="w-full p-4 bg-gray-100 border rounded-2xl text-sm font-bold text-gray-600 outline-none"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Naming</label>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <input
+                    name="brandName"
+                    value={brandName}
+                    onChange={(e) => setBrandName(e.target.value)}
+                    placeholder="Brand Name"
+                    className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold focus:ring-2 focus:ring-orange-500 outline-none"
+                    required
+                  />
+                  <input
+                    name="productName"
+                    value={productName}
+                    onChange={(e) => setProductName(e.target.value)}
+                    placeholder="Product Name"
+                    className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold focus:ring-2 focus:ring-orange-500 outline-none"
+                    required
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Category</label>
+                  <select value={formCategory} onChange={(e) => {setFormCategory(e.target.value as Category); setSelectedSizes([]);}} className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none">
+                    {Object.values(Category).map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Gender</label>
+                  <select name="gender" defaultValue={editMode?.gender || 'Unisex'} className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none">
+                    {GENDER_OPTIONS.map((g) => <option key={g} value={g}>{g}</option>)}
+                  </select>
+                </div>
+              </div>
+              <div className="grid grid-cols-1 gap-4">
+                <div>
+                  <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Type/Style</label>
+                  <input name="type" defaultValue={editMode?.type} placeholder="Casual, Vintage..." className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" required />
+                  <label className="text-[10px] font-black uppercase text-gray-400 ml-1 mt-4 block">Colors (tags)</label>
+                  <input
+                    type="text"
+                    value={formColors}
+                    onChange={(e) => setFormColors(e.target.value)}
+                    placeholder="e.g. orange, black, white"
+                    className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold focus:ring-2 focus:ring-orange-500 outline-none"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Economics</label>
+                <div className="grid grid-cols-2 gap-4">
+                  <input name="cost" type="number" step="0.01" defaultValue={editMode?.cost} placeholder="Cost ($)" className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" required />
+                  <input name="price" type="number" step="0.01" defaultValue={editMode?.price} placeholder="Price ($)" className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" required />
+                </div>
+              </div>
+              <div>
+                <label className="text-[10px] font-black uppercase text-gray-400 ml-1 block mb-2">Size Stock</label>
+                <div className="space-y-2 p-3 rounded-2xl bg-gray-50 border">
+                  {selectedSizes.length === 0 ? (
+                    <p className="text-[10px] text-gray-400 font-semibold">Select sizes first to configure stock per size.</p>
+                  ) : (
+                    selectedSizes.map((size) => {
+                      const current = formSizeStock.find((entry) => entry.size === size)?.stock ?? 0;
+                      return (
+                        <div key={size} className="flex items-center gap-3">
+                          <span className="w-16 text-[10px] font-black uppercase tracking-wider text-gray-500">{size}</span>
+                          <input
+                            type="number"
+                            min="0"
+                            value={current}
+                            onChange={(event) => {
+                              const nextStock = Math.max(0, Math.floor(Number(event.target.value || 0)));
+                              setFormSizeStock((prev) => prev.map((entry) => entry.size === size ? { ...entry, stock: nextStock } : entry));
+                            }}
+                            className="flex-1 p-3 bg-white border rounded-xl text-sm font-bold outline-none"
+                            placeholder="0"
+                          />
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+                <div className="mt-3 p-4 rounded-xl bg-orange-50 border border-orange-100 flex items-center justify-between">
+                  <span className="text-[10px] font-black uppercase tracking-wider text-orange-600/70">Calculated Final Inventory</span>
+                  <span className="text-xl font-black text-orange-600">{formSizeStock.reduce((total, entry) => total + Math.max(0, Number(entry.stock || 0)), 0)} pieces left</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-6">
+              <div>
+                <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Asset Description</label>
+                <textarea name="description" defaultValue={editMode?.description} placeholder="Enter full product details and authenticity notes..." rows={4} className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold focus:ring-2 focus:ring-orange-500 outline-none" required></textarea>
+              </div>
+              <div>
+                <label className="text-[10px] font-black uppercase text-gray-400 ml-1 block mb-2">Sale Pricing</label>
+                <div className="grid grid-cols-2 gap-4">
+                  <input name="original_price" type="number" step="0.01" defaultValue={editMode?.originalPrice ?? ''} placeholder="Original Price" className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" />
+                  <label className="flex items-center gap-2 px-4 py-3 bg-gray-50 border rounded-2xl text-sm font-bold text-gray-600">
+                    <input name="on_sale" type="checkbox" defaultChecked={Boolean(editMode?.onSale)} className="h-4 w-4 accent-orange-600" />
+                    On Sale
+                  </label>
+                </div>
+              </div>
+              <div>
+                <label className="text-[10px] font-black uppercase text-gray-400 ml-1 block mb-2">Tags</label>
+                {allTags.length === 0 ? (
+                  <p className="text-[10px] text-gray-400 font-semibold p-3 bg-gray-50 border rounded-2xl">
+                    No tags yet. Create one in the Admin "Tags" section, then come back here to assign it.
+                  </p>
+                ) : (
+                  <div className="flex flex-wrap gap-2 p-3 bg-gray-50 border rounded-2xl">
+                    {allTags.map((tag) => {
+                      const isSelected = formTagIds.includes(tag.id);
+                      return (
+                        <button
+                          key={tag.id}
+                          type="button"
+                          onClick={() => setFormTagIds((prev) => isSelected ? prev.filter((id) => id !== tag.id) : [...prev, tag.id])}
+                          className={`px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-wider border transition-all ${isSelected ? 'bg-orange-600 text-white border-orange-600' : 'bg-white text-gray-600 border-gray-200 hover:border-orange-400'}`}
+                        >
+                          {tag.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+              <div>
+                <label className="text-[10px] font-black uppercase text-gray-400 ml-1 block mb-2">Variant Selection ({formCategory})</label>
+                <div className="mb-2 flex items-center justify-between">
+                  <p className="text-[10px] font-bold uppercase text-gray-500 tracking-wider">{SIZE_OPTIONS[formCategory].length} Checkboxes</p>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedSizes([...SIZE_OPTIONS[formCategory]])}
+                      className="px-2.5 py-1 text-[9px] font-black uppercase rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-100"
+                    >
+                      Select All
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedSizes([])}
+                      className="px-2.5 py-1 text-[9px] font-black uppercase rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-100"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                </div>
+                <div className={`grid ${isShoesCategory ? 'grid-cols-4 md:grid-cols-6' : 'grid-cols-4'} gap-1.5 max-h-64 overflow-y-auto p-2 bg-gray-50 border rounded-2xl shadow-inner`}>
+                  {SIZE_OPTIONS[formCategory].map((size) => (
+                    <label key={size} className={`flex items-center justify-center p-2 border rounded-xl text-[9px] cursor-pointer transition-all font-black select-none min-h-9 ${selectedSizes.includes(size) ? 'bg-orange-600 text-white border-orange-600' : 'bg-white border-gray-100 text-gray-500 hover:border-orange-500'}`}>
+                      <input type="checkbox" checked={selectedSizes.includes(size)} onChange={() => toggleSize(size)} className="hidden" />
+                      {size}
+                    </label>
+                  ))}
+                </div>
+                {isShoesCategory && (
+                  <p className="mt-2 text-[10px] text-gray-500 font-semibold">
+                    Shoe matrix includes 35 to 50 with variants: base, (1/3), (1/2), (2/3).
+                  </p>
+                )}
+              </div>
+              <div>
+                <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Status</label>
+                <select name="status" defaultValue={editMode?.status || 'Active'} className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none">
+                  <option value="Active">Active</option>
+                  <option value="Discontinued">Discontinued</option>
+                  <option value="Out of Stock">Out of Stock</option>
+                  <option value="Coming Soon">Coming Soon</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Asset Photography</label>
+                <div className="flex gap-2">
+                  <button type="button" onClick={() => fileRef.current?.click()} className="flex-1 bg-gray-100 py-3 rounded-2xl text-[10px] font-black flex items-center justify-center gap-2 hover:bg-gray-200 uppercase tracking-widest"><Upload size={14} /> Picture</button>
+                  <input name="image" placeholder="Primary image URL" defaultValue={editMode?.image} className="flex-[2] p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" />
+                  <input type="file" ref={fileRef} hidden accept="image/*" multiple onChange={handleFile} />
+                </div>
+                <textarea
+                  name="images"
+                  value={formImagesText}
+                  onChange={(event) => setFormImagesText(event.target.value)}
+                  placeholder="Additional image URLs separated by commas"
+                  rows={3}
+                  className="mt-2 w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold focus:ring-2 focus:ring-orange-500 outline-none"
+                />
+                {parseImageUrlTokens(formImagesText).length > 0 && (
+                  <div className="mt-2 grid grid-cols-4 gap-2">
+                    {parseImageUrlTokens(formImagesText).map((url, index) => (
+                      <div key={url + index} className="relative rounded-xl border overflow-hidden bg-gray-50 aspect-square">
+                        <SafeImage src={url} alt={`URL preview ${index + 1}`} className="w-full h-full object-cover" />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const next = parseImageUrlTokens(formImagesText).filter((_, urlIndex) => urlIndex !== index);
+                            setFormImagesText(next.join(', '));
+                          }}
+                          className="absolute top-1 right-1 w-5 h-5 rounded-full bg-black/70 text-white text-[10px]"
+                          aria-label="Remove URL image"
+                        >
+                          x
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {uploadedImagePreviews.length > 0 && (
+                  <div className="mt-2 grid grid-cols-4 gap-2">
+                    {uploadedImagePreviews.map((preview, index) => (
+                      <div key={preview + index} className="relative rounded-xl border overflow-hidden bg-gray-50 aspect-square">
+                        <SafeImage src={preview} alt={`Upload preview ${index + 1}`} className="w-full h-full object-cover" />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setUploadedImageFiles((prev) => prev.filter((_, fileIndex) => fileIndex !== index));
+                            setUploadedImagePreviews((prev) => {
+                              const target = prev[index];
+                              if (target && target.startsWith('blob:')) URL.revokeObjectURL(target);
+                              return prev.filter((_, previewIndex) => previewIndex !== index);
+                            });
+                          }}
+                          className="absolute top-1 right-1 w-5 h-5 rounded-full bg-black/70 text-white text-[10px]"
+                          aria-label="Remove uploaded image"
+                        >
+                          x
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {imageValidationErrors.length > 0 && (
+                  <div className="mt-2 p-2 rounded-xl border border-red-200 bg-red-50 space-y-1">
+                    {imageValidationErrors.map((errorText) => (
+                      <p key={errorText} className="text-[10px] font-bold text-red-700">{errorText}</p>
+                    ))}
+                  </div>
+                )}
+                {isUploadingImages && (
+                  <p className="mt-2 text-[10px] font-black uppercase text-orange-600 tracking-wider">Uploading images...</p>
+                )}
+              </div>
+              <div className="flex gap-4 pt-4">
+                <button type="submit" className="flex-1 bg-orange-600 text-white py-3 rounded-xl font-black uppercase tracking-widest hover:bg-orange-700 hover:scale-[1.02] transition-all shadow-xl shadow-orange-600/20 text-sm">{editMode ? 'Commit Changes' : 'Publish Asset'}</button>
+                {editMode && <button type="button" onClick={() => {setEditMode(null); setUploadedImageFiles([]); setUploadedImagePreviews([]); setImageValidationErrors([]); setFormImagesText(''); setFormSizeStock([]); setBrandName(''); setProductName(''); setActiveTab('inventory');}} className="px-8 bg-gray-100 rounded-3xl font-black uppercase text-[10px] tracking-widest">Cancel</button>}
+              </div>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {activeTab === 'orders' && (
+        <div className="space-y-6 animate-fade-in-up">
+          {ordersActionError && (
+            <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-xl text-xs font-bold uppercase tracking-widest">
+              {ordersActionError}
+            </div>
+          )}
+
+          {isLoading ? (
+            <div className="text-center py-16 bg-white rounded-2xl border border-dashed text-gray-400 font-black uppercase tracking-[0.2em] text-sm">
+              Loading orders...
+            </div>
+          ) : orders.length === 0 ? (
+            <div className="text-center py-16 bg-white rounded-2xl border border-dashed text-gray-300 font-black uppercase italic tracking-[0.2em] text-sm">
+              No Distribution Records Found
+            </div>
+          ) : selectedOrder ? (
+            <div className="bg-white border rounded-2xl p-6 space-y-6">
+              <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+                <div>
+                  <p className="text-[10px] font-bold uppercase text-gray-500">Order Details</p>
+                  <h3 className="text-lg font-black uppercase text-gray-900">{selectedOrder.customerName}</h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSelectedOrderId(null)}
+                  className="px-4 py-2 rounded-lg border border-gray-200 text-gray-700 text-[11px] font-black uppercase hover:bg-gray-50"
+                >
+                  Back to Orders
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-6">
+                <div className="space-y-6">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="p-4 rounded-xl border bg-gray-50">
+                      <p className="text-[10px] font-bold uppercase text-gray-500">Order ID</p>
+                      <p className="text-sm font-black text-gray-900 break-all">{selectedOrder.id}</p>
+                    </div>
+                    <div className="p-4 rounded-xl border bg-gray-50">
+                      <p className="text-[10px] font-bold uppercase text-gray-500">Status</p>
+                      <p className="text-sm font-black text-gray-900">{normalizeOrderStatus(selectedOrder.status)}</p>
+                    </div>
+                    <div className="p-4 rounded-xl border bg-gray-50">
+                      <p className="text-[10px] font-bold uppercase text-gray-500">Date</p>
+                      <p className="text-sm font-black text-gray-900">{new Date(selectedOrder.date).toLocaleString()}</p>
+                    </div>
+                    <div className="p-4 rounded-xl border bg-gray-50">
+                      <p className="text-[10px] font-bold uppercase text-gray-500">Payment</p>
+                      <p className="text-sm font-black text-gray-900">{getOrderPaymentStatus(selectedOrder)}</p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="p-4 rounded-xl border">
+                      <p className="text-[10px] font-bold uppercase text-gray-500">Contact</p>
+                      <p className="text-sm font-black text-gray-900">{selectedOrder.customerPhone}</p>
+                      <p className="text-xs text-gray-500">{selectedOrder.customerEmail}</p>
+                    </div>
+                    <div className="p-4 rounded-xl border">
+                      <p className="text-[10px] font-bold uppercase text-gray-500">Shipping</p>
+                      <p className="text-xs text-gray-700">
+                        {selectedOrder.governorate}, {selectedOrder.district}, {selectedOrder.village}
+                      </p>
+                      <p className="text-xs text-gray-700">{selectedOrder.addressDetails}</p>
+                    </div>
+                  </div>
+
+                  <div className="border rounded-xl overflow-hidden">
+                    <div className="px-4 py-3 bg-gray-50 border-b">
+                      <p className="text-[10px] font-bold uppercase text-gray-500">Items</p>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-[11px] min-w-[520px]">
+                        <thead className="bg-white uppercase font-black text-gray-500 border-b">
+                          <tr>
+                            <th className="p-3">Product</th>
+                            <th className="p-3">SKU</th>
+                            <th className="p-3">Size</th>
+                            <th className="p-3">Qty</th>
+                            <th className="p-3">Price</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y">
+                          {selectedOrder.items.map((item, idx) => (
+                            <tr key={`${selectedOrder.id}-${idx}`} className="hover:bg-gray-50">
+                              <td className="p-3 font-semibold text-gray-900">{item.productName}</td>
+                              <td className="p-3 text-gray-600">{item.productId}</td>
+                              <td className="p-3 text-gray-600">{item.size}</td>
+                              <td className="p-3 text-gray-600">{item.quantity}</td>
+                              <td className="p-3 text-gray-600">${Number(item.price || 0).toFixed(2)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-4">
+                  <div className="bg-black text-white p-4 rounded-2xl">
+                    <p className="text-[9px] text-orange-500 font-black uppercase tracking-widest mb-1 italic">Settlement Total</p>
+                    <p className="text-2xl font-black italic tracking-tighter text-white">${selectedOrder.total.toFixed(2)}</p>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <button
+                      type="button"
+                      disabled={normalizeOrderStatus(selectedOrder.status) !== 'pending' || dispatchingOrderIds.has(selectedOrder.id) || cancelingOrderIds.has(selectedOrder.id)}
+                      onClick={async () => {
+                        setOrdersActionError(null);
+                        if (normalizeOrderStatus(selectedOrder.status) !== 'pending') return;
+                        if (!beginOrderDispatch(selectedOrder.id)) return;
+
+                        let dispatchSucceeded = false;
+                        try {
+                          await updateOrderStatus(selectedOrder.id, 'dispatched');
+                          dispatchSucceeded = true;
+
+                          setOrders((prev) => prev.map((order) => (
+                            order.id === selectedOrder.id ? { ...order, status: 'dispatched' } : order
+                          )));
+
+                          try {
+                            const [refreshedOrders, refreshedProducts, refreshedMetrics, refreshedTotals] = await Promise.all([
+                              getOrders(),
+                              getProducts(),
+                              recalculateFinancialMetrics(),
+                              getFinancialDashboardTotals(),
+                            ]);
+                            setOrders(refreshedOrders);
+                            setProducts(refreshedProducts);
+                            setFinancialMetrics(refreshedMetrics);
+                            setFinancialTotals(refreshedTotals);
+                          } catch (refreshError) {
+                            console.error('Dispatch succeeded but refresh failed:', refreshError);
+                          }
+                        } catch (error) {
+                          console.error('Error updating order status:', error);
+                          const message = error instanceof Error
+                            ? error.message
+                            : String((error as any)?.message || (error as any)?.details || (error as any)?.hint || 'Failed to dispatch order. Please try again.');
+                          setOrdersActionError(message);
+                          alert(message);
+                        } finally {
+                          endOrderDispatch(selectedOrder.id);
+                          if (!dispatchSucceeded) {
+                            // Nothing else required: pending orders become clickable again after lock is released.
+                          }
+                        }
+                      }}
+                      className={`w-full px-6 py-3 rounded-2xl text-[11px] font-black uppercase tracking-widest transition-all shadow-xl ${normalizeOrderStatus(selectedOrder.status) === 'pending' && !dispatchingOrderIds.has(selectedOrder.id) && !cancelingOrderIds.has(selectedOrder.id) ? 'bg-orange-600 text-white hover:bg-orange-700 shadow-orange-600/20' : 'bg-gray-200 text-gray-500 cursor-not-allowed shadow-transparent'}`}
+                    >
+                      {dispatchingOrderIds.has(selectedOrder.id)
+                        ? 'Dispatching...'
+                        : normalizeOrderStatus(selectedOrder.status) === 'dispatched'
+                          ? 'Dispatched'
+                          : 'Dispatch Order'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={normalizeOrderStatus(selectedOrder.status) === 'canceled' || cancelingOrderIds.has(selectedOrder.id) || dispatchingOrderIds.has(selectedOrder.id)}
+                      onClick={async () => {
+                        setOrdersActionError(null);
+                        if (normalizeOrderStatus(selectedOrder.status) === 'canceled') return;
+                        if (!beginOrderCancel(selectedOrder.id)) return;
+
+                        try {
+                          await updateOrderStatus(selectedOrder.id, 'canceled');
+                          setOrders((prev) => prev.map((order) => (
+                            order.id === selectedOrder.id ? { ...order, status: 'canceled' } : order
+                          )));
+
+                          try {
+                            const [refreshedOrders, refreshedProducts, refreshedMetrics, refreshedTotals] = await Promise.all([
+                              getOrders(),
+                              getProducts(),
+                              recalculateFinancialMetrics(),
+                              getFinancialDashboardTotals(),
+                            ]);
+                            setOrders(refreshedOrders);
+                            setProducts(refreshedProducts);
+                            setFinancialMetrics(refreshedMetrics);
+                            setFinancialTotals(refreshedTotals);
+                          } catch (refreshError) {
+                            console.error('Cancel succeeded but refresh failed:', refreshError);
+                          }
+                        } catch (error) {
+                          console.error('Error canceling order:', error);
+                          const message = error instanceof Error
+                            ? error.message
+                            : String((error as any)?.message || (error as any)?.details || (error as any)?.hint || 'Failed to cancel order. Please try again.');
+                          setOrdersActionError(message);
+                          alert(message);
+                        } finally {
+                          endOrderCancel(selectedOrder.id);
+                        }
+                      }}
+                      className={`w-full px-6 py-3 rounded-2xl text-[11px] font-black uppercase tracking-widest transition-all shadow-xl border ${normalizeOrderStatus(selectedOrder.status) !== 'canceled' && !cancelingOrderIds.has(selectedOrder.id) && !dispatchingOrderIds.has(selectedOrder.id) ? 'bg-white text-red-600 border-red-200 hover:bg-red-50 shadow-red-600/10' : 'bg-gray-200 text-gray-500 cursor-not-allowed shadow-transparent border-transparent'}`}
+                    >
+                      {cancelingOrderIds.has(selectedOrder.id) ? 'Canceling...' : 'Cancel Order'}
+                    </button>
+                    <button
+                      onClick={async () => {
+                        if (confirm('Erase this distribution record?')) {
+                          try {
+                            await deleteOrder(selectedOrder.id);
+                            const refreshedOrders = await getOrders();
+                            setOrders(refreshedOrders);
+                            setSelectedOrderId(null);
+                          } catch (error) {
+                            console.error('Error deleting order:', error);
+                            setOrdersActionError('Failed to delete order. Please try again.');
+                            alert('Failed to delete order. Please try again.');
+                          }
+                        }
+                      }}
+                      className="w-full py-2 text-gray-600 hover:text-red-500 text-[10px] font-black uppercase tracking-widest transition-all"
+                    >
+                      Destroy Log
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="bg-white border rounded-2xl overflow-hidden">
+              <div className="p-4 border-b bg-gray-50 flex items-center justify-between">
+                <div>
+                  <p className="text-[10px] font-bold uppercase text-gray-500">Orders</p>
+                  <h3 className="text-sm md:text-base font-black uppercase text-gray-900">All Orders</h3>
+                </div>
+                <span className="text-[10px] bg-gray-900 text-white px-3 py-1 rounded-full font-bold uppercase">{orders.length} Orders</span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-[11px] min-w-[800px]">
+                  <thead className="bg-gray-100 uppercase font-black text-gray-500 border-b">
+                    <tr>
+                      <th className="p-3">Order ID</th>
+                      <th className="p-3">Customer</th>
+                      <th className="p-3">Date</th>
+                      <th className="p-3">Status</th>
+                      <th className="p-3">Total</th>
+                      <th className="p-3">Payment</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y">
+                    {orders.map((order) => {
+                      const normalizedStatus = normalizeOrderStatus(order.status);
+                      const statusClasses = normalizedStatus === 'pending'
+                        ? 'bg-orange-100 text-orange-600'
+                        : normalizedStatus === 'dispatched'
+                          ? 'bg-blue-100 text-blue-600'
+                          : normalizedStatus === 'canceled'
+                            ? 'bg-red-100 text-red-700'
+                            : 'bg-green-100 text-green-700';
+                      return (
+                        <tr
+                          key={order.id}
+                          onClick={() => setSelectedOrderId(order.id)}
+                          className="hover:bg-gray-50 transition-colors cursor-pointer"
+                        >
+                          <td className="p-3 font-bold text-gray-700">{order.id}</td>
+                          <td className="p-3 font-semibold text-gray-900">{order.customerName}</td>
+                          <td className="p-3 text-gray-600">{new Date(order.date).toLocaleDateString()}</td>
+                          <td className="p-3">
+                            <span className={`px-2 py-1 rounded text-[10px] font-bold uppercase ${statusClasses}`}>
+                              {normalizedStatus}
+                            </span>
+                          </td>
+                          <td className="p-3 text-gray-700 font-bold">${order.total.toFixed(2)}</td>
+                          <td className="p-3 text-gray-600">{getOrderPaymentStatus(order)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {activeTab === 'theme' && <EditThemePanel />}
+
+      {activeTab === 'tags' && <TagsManagerPanel />}
+
+        </div>
+      </div>
+
+    </div>
+  );
+}
+
+function CheckoutView({ cart, setCart, setCartNotice, setOrders, setProducts, setView, syncOrderToDatabase }: CheckoutViewProps) {
+  const cartTotal = cart.reduce((acc, item) => acc + item.price * item.quantity, 0);
+  const checkoutTotal = cart.length > 0 ? cartTotal + DELIVERY_FEE : 0;
+  const [gov, setGov] = useState('');
+  const [dist, setDist] = useState('');
+  const [vill, setVill] = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setIsProcessing(true);
+    const form = e.currentTarget;
+    const fd = new FormData(form);
+
+    const checkoutItems = [...cart];
+
+    if (checkoutItems.length === 0) {
+      setIsProcessing(false);
+      alert('Your cart is empty.');
+      return;
+    }
+
+    for (const item of checkoutItems) {
+      if (!item.reservationId) {
+        setCart(prev => prev.filter((it) => !(it.Product_ID === item.Product_ID && it.selectedSize === item.selectedSize)));
+        setCartNotice('Some items in your cart have expired.');
+        alert('Some items in your cart have expired');
+        setIsProcessing(false);
+        return;
+      }
+
+      const extension = await extendExpiredReservation(item.reservationId, undefined, 180);
+      if (!extension.ok || !extension.expiresAt) {
+        await releaseCartLineReservation(item.reservationId);
+        setCart(prev => prev.filter((it) => !(it.Product_ID === item.Product_ID && it.selectedSize === item.selectedSize)));
+        setCartNotice('Some items in your cart have expired.');
+        alert('Some items in your cart have expired');
+        setIsProcessing(false);
+        return;
+      }
+
+      item.expiresAt = extension.expiresAt;
+    }
+
+    setCart((prev) => prev.map((item) => {
+      const refreshed = checkoutItems.find((line) => line.Product_ID === item.Product_ID && line.selectedSize === item.selectedSize);
+      return refreshed ? { ...item, expiresAt: refreshed.expiresAt } : item;
+    }));
+
+    const order: Order = {
+      id: `ORD-${Date.now()}`,
+      customerName: fd.get('name') as string,
+      customerEmail: fd.get('email') as string,
+      customerPhone: fd.get('phone') as string,
+      governorate: gov,
+      district: dist,
+      village: vill,
+      addressDetails: fd.get('address') as string,
+      items: checkoutItems.map(i => ({ productId: i.Product_ID, productName: i.productName || i.name, quantity: i.quantity, size: i.selectedSize, price: i.price, reservationId: i.reservationId })),
+      total: checkoutTotal,
+      status: 'pending',
+      date: new Date().toISOString()
+    };
+    
+    try {
+      await syncOrderToDatabase(order);
+      const [refreshedOrders, refreshedProducts] = await Promise.all([
+        getOrders(),
+        getProducts()
+      ]);
+      setOrders(refreshedOrders);
+      setProducts(refreshedProducts);
+      setCart([]);
+      
+      setTimeout(() => {
+        setIsProcessing(false);
+        setView('home');
+        alert('SUCCESS: Your authentic gear has been secured. Our team will contact you shortly.');
+      }, 1200);
+    } catch (error) {
+      console.error('Error processing order:', error);
+      setIsProcessing(false);
+      const message = error instanceof Error ? error.message : 'Failed to process order. Please check your connection and try again.';
+      alert(message);
+    }
+  };
+
+  return (
+      <div className="max-w-3xl mx-auto px-4 py-8 animate-fade-in-up">
+      <div className="text-center mb-8">
+        <h2 className="text-xl md:text-2xl font-black italic tracking-tighter uppercase mb-2">Complete Acquisition</h2>
+        <p className="text-gray-400 font-bold uppercase text-[9px] tracking-[0.2em]">Direct-to-door Logistics Across Lebanon</p>
+      </div>
+      <form onSubmit={handleSubmit} className="bg-white p-6 rounded-3xl border shadow-2xl space-y-6 border-gray-100">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+           <div className="space-y-2">
+              <label className="text-[9px] font-black text-gray-400 uppercase tracking-widest ml-1">Recipient Name</label>
+              <input name="name" required placeholder="Full Name" className="w-full p-3 bg-gray-50 border rounded-2xl focus:ring-2 focus:ring-orange-500 transition-all font-bold text-sm outline-none" />
+           </div>
+           <div className="space-y-2">
+              <label className="text-[9px] font-black text-gray-400 uppercase tracking-widest ml-1">Contact Number</label>
+              <input name="phone" required placeholder="+961" className="w-full p-3 bg-gray-50 border rounded-2xl focus:ring-2 focus:ring-orange-500 transition-all font-bold text-sm outline-none" />
+           </div>
+        </div>
+        <div className="space-y-2">
+           <label className="text-[9px] font-black text-gray-400 uppercase tracking-widest ml-1">Email for Confirmation</label>
+           <input name="email" type="email" required placeholder="email@address.com" className="w-full p-3 bg-gray-50 border rounded-2xl focus:ring-2 focus:ring-orange-500 transition-all font-bold text-sm outline-none" />
+        </div>
+        
+        <div className="space-y-4 p-4 bg-gray-50 rounded-2xl border border-gray-100">
+           <h4 className="font-black text-[10px] uppercase tracking-widest flex items-center gap-2 text-black italic">
+             <Truck size={16} className="text-orange-600" /> Logistics Destination
+           </h4>
+           <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+             <select required value={gov} onChange={e => {setGov(e.target.value); setDist(''); setVill('');}} className="p-3 border rounded-xl bg-white text-[10px] font-black uppercase focus:ring-2 focus:ring-orange-500 transition-all outline-none">
+               <option value="">Governorate</option>
+               {Object.keys(LEBANON_LOCATIONS).map(g => <option key={g} value={g}>{g}</option>)}
+             </select>
+             <select required disabled={!gov} value={dist} onChange={e => {setDist(e.target.value); setVill('');}} className="p-3 border rounded-xl bg-white text-[10px] font-black uppercase disabled:opacity-50 focus:ring-2 focus:ring-orange-500 transition-all outline-none">
+               <option value="">District</option>
+               {gov && Object.keys(LEBANON_LOCATIONS[gov]).map(d => <option key={d} value={d}>{d}</option>)}
+             </select>
+             <select required disabled={!dist} value={vill} onChange={e => setVill(e.target.value)} className="p-3 border rounded-xl bg-white text-[10px] font-black uppercase disabled:opacity-50 focus:ring-2 focus:ring-orange-500 transition-all outline-none">
+               <option value="">Village</option>
+               {gov && dist && LEBANON_LOCATIONS[gov][dist].map(v => <option key={v} value={v}>{v}</option>)}
+             </select>
+           </div>
+           <textarea name="address" required placeholder="Street, Building, Floor... Provide landmarks for faster delivery." className="w-full p-4 bg-white border rounded-xl text-sm font-bold focus:ring-2 focus:ring-orange-500 transition-all outline-none" rows={3}></textarea>
+        </div>
+
+        <div className="pt-6 border-t border-dashed">
+          <div className="space-y-1">
+            <div className="flex justify-between text-[11px] font-bold text-gray-500 uppercase tracking-widest">
+              <span>Items Total</span>
+              <span>${cartTotal.toFixed(2)}</span>
+            </div>
+            <div className="flex justify-between text-[11px] font-bold text-gray-500 uppercase tracking-widest">
+              <span>Delivery</span>
+              <span>${DELIVERY_FEE.toFixed(2)}</span>
+            </div>
+            <div className="flex justify-between pt-2 border-t border-gray-200">
+              <p className="text-[10px] text-gray-400 font-black uppercase tracking-widest">Grand Total</p>
+              <p className="text-2xl font-black text-black italic tracking-tighter">${checkoutTotal.toFixed(2)}</p>
+            </div>
+          </div>
+        </div>
+
+        <button type="submit" disabled={isProcessing} className="w-full bg-orange-600 text-white font-black py-2.5 rounded-xl hover:bg-orange-700 shadow-2xl shadow-orange-600/30 transition-all uppercase tracking-widest text-sm md:text-base flex items-center justify-center gap-2 active:scale-95 disabled:opacity-70">
+          {isProcessing ? 'Verifying Acquisition...' : 'Place Secure Order'}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function CartView({ cart, setView, cartNotice, removeFromCart, getRemainingMs, formatRemaining }: CartViewProps) {
+  const cartTotal = cart.reduce((acc, item) => acc + item.price * item.quantity, 0);
+  const checkoutTotal = cart.length > 0 ? cartTotal + DELIVERY_FEE : 0;
+  const [nowMs, setNowMs] = useState<number>(Date.now());
+
+  useEffect(() => {
+    if (cart.length === 0) return;
+    const interval = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [cart.length]);
+
+  return (
+  <div className="max-w-6xl mx-auto px-4 py-10 animate-fade-in-up">
+    <h2 className="text-2xl font-black mb-8 uppercase italic tracking-tighter text-center md:text-left">Selected Gear</h2>
+    {cartNotice && (
+      <div className="mb-4 rounded-xl border border-orange-200 bg-orange-50 text-orange-700 px-4 py-3 text-xs font-black uppercase tracking-wider">
+        {cartNotice}
+      </div>
+    )}
+    {cart.length === 0 ? (
+      <div className="text-center py-20 bg-white rounded-3xl border-2 border-dashed border-gray-100 shadow-inner">
+        <ShoppingBag size={60} className="text-gray-100 mx-auto mb-6" />
+        <p className="text-gray-300 font-black uppercase tracking-[0.3em] text-xs mb-8 italic">Your distribution bag is currently empty</p>
+        <button onClick={() => setView('shop')} className="bg-black text-white px-6 py-2.5 rounded-full font-black uppercase tracking-[0.2em] hover:bg-orange-600 transition-all shadow-2xl italic text-sm">Explore Collections</button>
+      </div>
+    ) : (
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-10 lg:gap-12">
+        <div className="lg:col-span-2 space-y-8">
+          {cart.map((it, idx) => (
+             <div key={idx} className="flex flex-col sm:flex-row gap-8 p-8 bg-white rounded-[4rem] border shadow-sm hover:shadow-2xl transition-all group border-gray-50">
+                <div className="w-full sm:w-48 h-64 bg-white rounded-[2.5rem] overflow-hidden shadow-inner flex-shrink-0">
+                  <SafeImage src={it.image} className="w-full h-full object-contain p-2 transition-transform duration-700 group-hover:scale-[1.03]" alt={it.name} />
+                </div>
+               <div className="flex-1 flex flex-col justify-between py-4">
+                 <div className="flex justify-between items-start">
+                   <div>
+                     <h4 className="font-black text-2xl uppercase italic tracking-tighter mb-2 text-black">{it.productName || it.name}</h4>
+                     <div className="flex items-center gap-2 mb-4">
+                       <span className="text-[10px] font-black uppercase text-orange-600 tracking-widest px-3 py-1 bg-orange-50 rounded-full">{it.type}</span>
+                       <span className="text-[10px] font-black uppercase text-gray-400 tracking-widest px-3 py-1 bg-gray-50 rounded-full border border-gray-100">{it.category}</span>
+                     </div>
+                   </div>
+                  <button onClick={() => void removeFromCart(it.Product_ID, it.selectedSize)} className="p-3 bg-gray-50 text-gray-200 hover:text-red-500 hover:bg-red-50 rounded-2xl transition-all">
+                      <Trash2 size={24} />
+                   </button>
+                 </div>
+                 <div className="flex flex-wrap items-center gap-4">
+                    <span className="text-[10px] font-black bg-black text-white px-5 py-2 rounded-2xl uppercase tracking-widest italic border border-black shadow-lg">Size: {it.selectedSize}</span>
+                    <span className="text-[10px] font-black bg-white text-gray-900 px-5 py-2 rounded-2xl uppercase tracking-widest italic border-2 border-gray-100">Qty: {it.quantity}</span>
+                   <span className={`text-[10px] font-black px-5 py-2 rounded-2xl uppercase tracking-widest italic border-2 ${getRemainingMs(it, nowMs) > 0 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-red-50 text-red-700 border-red-200'}`}>
+                    {getRemainingMs(it, nowMs) > 0 ? `${formatRemaining(getRemainingMs(it, nowMs))} remaining` : 'Expired'}
+                   </span>
+                 </div>
+                 <div className="flex justify-end pt-6 border-t border-gray-50 mt-8">
+                   <span className="font-black text-4xl text-black italic tracking-tighter">${(it.price * it.quantity).toFixed(2)}</span>
+                 </div>
+               </div>
+             </div>
+          ))}
+        </div>
+        <div className="bg-black text-white p-8 rounded-3xl shadow-3xl h-fit sticky top-24 border-4 border-white/5 overflow-hidden">
+          <div className="absolute top-0 right-0 w-40 h-40 bg-orange-600/10 rounded-full -translate-y-20 translate-x-20 blur-3xl"></div>
+          <h3 className="font-black mb-10 uppercase tracking-[0.4em] text-[11px] text-orange-500 italic relative">Acquisition Totals</h3>
+          <div className="space-y-6 mb-12 relative">
+             <div className="flex justify-between font-bold text-gray-400 uppercase text-[11px] tracking-widest">
+               <span>Retail Value</span>
+               <span className="text-white">${cartTotal.toFixed(2)}</span>
+             </div>
+             <div className="flex justify-between font-bold text-gray-400 uppercase text-[11px] tracking-widest">
+               <span>Delivery</span>
+               <span className="text-white">${DELIVERY_FEE.toFixed(2)}</span>
+             </div>
+             <div className="pt-10 border-t border-white/10 flex justify-between items-end">
+               <div>
+                 <span className="text-[10px] text-gray-500 font-black uppercase block mb-2 italic">Grand Total Acquisition</span>
+                 <span className="text-5xl font-black italic tracking-tighter text-orange-600">${checkoutTotal.toFixed(2)}</span>
+               </div>
+             </div>
+          </div>
+          <button onClick={() => setView('checkout')} className="w-full bg-white text-black font-black py-3.5 rounded-2xl uppercase tracking-widest hover:bg-orange-600 hover:text-white transition-all shadow-2xl text-sm md:text-base italic active:scale-95">
+            Secure Checkout
+          </button>
+          <div className="mt-12 space-y-4 relative">
+            <div className="flex items-center gap-3 text-[10px] text-gray-500 font-black uppercase tracking-[0.3em]"><Check size={16} className="text-orange-500" /> Authenticity Verified</div>
+            <div className="flex items-center gap-3 text-[10px] text-gray-500 font-black uppercase tracking-[0.3em]"><Check size={16} className="text-orange-500" /> Cash Payment Accepted</div>
+          </div>
+        </div>
+      </div>
+    )}
+  </div>
+  );
+}
 export default App;

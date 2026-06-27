@@ -41,6 +41,9 @@ export interface Product {
   colors?: string[];
   /** Legacy comma-separated string; prefer `colors` */
   color?: string;
+  createdAt?: string;
+  /** Tag ids assigned via the admin Tags manager (many-to-many through `product_tags`). */
+  tagIds?: string[];
 }
 
 export interface Order {
@@ -96,3 +99,47 @@ export interface FinancialTotals {
 }
 
 export type View = 'home' | 'shop' | 'product' | 'admin' | 'cart' | 'checkout';
+
+export interface Announcement {
+  id: string;
+  text: string;
+  linkUrl?: string | null;
+  isActive: boolean;
+  sortOrder: number;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface HeroSlide {
+  id: string;
+  title?: string | null;
+  subtitle?: string | null;
+  desktopImageUrl: string;
+  mobileImageUrl?: string | null;
+  buttonText?: string | null;
+  buttonLink?: string | null;
+  isActive: boolean;
+  sortOrder: number;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface HomepageSectionSetting {
+  id: string;
+  sectionKey: string;
+  title: string;
+  subtitle?: string | null;
+  isVisible: boolean;
+  sortOrder: number;
+  /** When set, this section shows every product carrying this tag instead of its built-in sectionKey behavior. */
+  tagId?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface Tag {
+  id: string;
+  name: string;
+  slug: string;
+  createdAt?: string;
+}

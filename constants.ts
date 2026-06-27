@@ -57,6 +57,12 @@ export const SIZE_OPTIONS = {
 
 export const INITIAL_PRODUCTS: Product[] = [];
 
+// Dev-only fallback admin login, used exclusively when Supabase isn't configured (no
+// VITE_SUPABASE_URL/VITE_SUPABASE_ANON_KEY set, e.g. local development without a .env).
+// The deployed site always has Supabase configured, so production admin auth goes through
+// real Supabase Auth (see AdminPanel's login screen in App.tsx) and never reaches this path.
+// These values still ship in the client bundle like any other constant in this file — do not
+// reuse them as real passwords anywhere, and treat them as already public.
 export const ADMIN_CREDENTIALS = [
   {
     name: 'Adam Kanaan (Co-Founder)',
