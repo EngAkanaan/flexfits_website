@@ -2330,112 +2330,13 @@ export async function updateOrderStatus(
       if (transitionError) throw transitionError;
       if (!transitionedOrder) return;
 
-      const { data: itemRows } = await supabase
-        .from('order_items')
-        .select('product_id,size,quantity')
-        .eq('order_id', orderId);
-
-      const { data: openReservationRows } = await supabase
-        .from('stock_reservations')
-        .select('id')
-        .eq('order_id', orderId)
-        .in('status', ['active', 'confirmed'])
-        .limit(1);
-
-      const hasOpenReservationRows = Array.isArray(openReservationRows) && openReservationRows.length > 0;
-      const shouldApplyManualRefund = previousStatus !== 'pending' || hasOpenReservationRows;
-
-      if (!shouldApplyManualRefund) {
-        try {
-          const canceledOrder = await mapOrderRowToOrder(transitionedOrder);
-          await notifyCustomerOrderCanceled({ ...canceledOrder, status: 'canceled' });
-        } catch (cancelMailError) {
-          console.warn('Cancel email failed after order cancellation:', cancelMailError);
-        }
-        return;
-      }
-
-      const refundByProduct = new Map<string, Map<string, number>>();
-      for (const row of itemRows || []) {
-        const productId = String((row as any).product_id || '').trim();
-        const size = String((row as any).size || '').trim().toUpperCase();
-        const qty = Math.max(0, Math.floor(Number((row as any).quantity || 0)));
-        if (!productId || !size || qty <= 0) continue;
-        if (!refundByProduct.has(productId)) refundByProduct.set(productId, new Map<string, number>());
-        const sizeMap = refundByProduct.get(productId)!;
-        sizeMap.set(size, Math.max(0, Number(sizeMap.get(size) || 0)) + qty);
-      }
-
-      const orderProductIds = Array.from(refundByProduct.keys());
-      const { data: productRows, error: productRowsError } = await supabase
-        .from('products')
-        .select('*')
-        .in('Product_ID', orderProductIds);
-
-      if (productRowsError) throw productRowsError;
-
-      const productById = new Map<string, any>();
-      for (const row of productRows || []) {
-        const id = String((row as any).Product_ID || '').trim();
-        if (id) productById.set(id, row);
-      }
-
-      for (const [productId, sizeMap] of refundByProduct.entries()) {
-        const product = productById.get(productId);
-        if (!product) continue;
-
-        const sizeEntries = normalizeSizeStockFromRow(product);
-        if (sizeEntries.length > 0) {
-          const nextSizeStock = sizeEntries.map((entry) => {
-            const token = String(entry.size || '').trim().toUpperCase();
-            const refundQty = Math.max(0, Number(sizeMap.get(token) || 0));
-            if (refundQty <= 0) return entry;
-            const stock = Math.max(0, Math.floor(Number(entry.stock || 0)));
-            const nextSold = Math.max(0, Math.min(stock, Math.floor(Number(entry.sold || 0)) - refundQty));
-            return {
-              ...entry,
-              left: Math.max(0, stock - nextSold),
-              sold: nextSold,
-            };
-          });
-          const nextSummary = getSizeStockSummary(nextSizeStock);
-
-          const { error: stockError } = await supabase
-            .from('products')
-            .update({
-              Stock: nextSummary.totalStock,
-              size_stock: nextSizeStock,
-              Items_Sold: nextSummary.totalSold,
-              pieces: nextSummary.totalLeft,
-              sold: nextSummary.totalSold,
-              Status: resolveNextProductStatus((product as any).Status ?? (product as any).status ?? 'Active', nextSummary.totalLeft),
-            })
-            .eq('Product_ID', productId);
-
-          if (stockError) throw stockError;
-        } else {
-          const baseStock = Math.max(0, Number((product as any).Stock ?? (product as any).stock ?? 0));
-          const baseSold = Math.max(0, Number((product as any).Items_Sold ?? (product as any).items_sold ?? 0));
-          const refundQty = Array.from(sizeMap.values()).reduce((sum, qty) => sum + Math.max(0, Number(qty || 0)), 0);
-          const nextSold = Math.max(0, baseSold - refundQty);
-          const nextLeft = Math.max(0, baseStock - nextSold);
-          const { error: stockError } = await supabase
-            .from('products')
-            .update({
-              Items_Sold: nextSold,
-              Status: resolveNextProductStatus((product as any).Status ?? (product as any).status ?? 'Active', nextLeft),
-            })
-            .eq('Product_ID', productId);
-
-          if (stockError) throw stockError;
-        }
-      }
-
-      await supabase
-        .from('stock_reservations')
-        .update({ status: 'released', released_at: new Date().toISOString() })
-        .eq('order_id', orderId)
-        .in('status', ['active', 'confirmed']);
+      // Stock restoration and releasing any open reservations are both handled by the
+      // apply_order_cancel_stock_restore trigger on `orders` (migration 011), which fires
+      // automatically as part of the status update above -- for every previous status
+      // (pending/dispatched/shipped/delivered) and for both size-stock and flat-stock products.
+      // A second, manual refund used to run here too, on top of the trigger's own restore,
+      // which double-refunded stock on already-dispatched orders. The trigger is the single
+      // source of truth now; do not duplicate its logic here.
 
       try {
         await recalculateFinancialMetrics();
