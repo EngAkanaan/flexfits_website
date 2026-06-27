@@ -83,6 +83,24 @@ function persistOrderStatusForDatabase(value: unknown): string {
   return normalized;
 }
 
+const LOCAL_ORDER_NUMBER_SEQ_KEY = 'flex_order_number_seq';
+
+export async function generateOrderId(): Promise<string> {
+  if (!supabase) {
+    const current = Math.max(100, Number(localStorage.getItem(LOCAL_ORDER_NUMBER_SEQ_KEY) || '100'));
+    const next = current + 1;
+    localStorage.setItem(LOCAL_ORDER_NUMBER_SEQ_KEY, String(next));
+    return `ORD-${next}`;
+  }
+
+  const { data, error } = await supabase.rpc('generate_order_id');
+  if (error || !data) {
+    console.error('generate_order_id RPC failed, falling back to a timestamp-based id:', error);
+    return `ORD-${Date.now()}`;
+  }
+  return String(data).trim();
+}
+
 function normalizeInventoryStatusToken(value: unknown): string {
   const normalized = String(value || '').trim().toLowerCase();
   return normalized;
@@ -2054,8 +2072,11 @@ export async function saveOrder(order: Order): Promise<void> {
   }
 
   try {
-    // Insert order
-    const { data: orderData, error: orderError } = await supabase
+    // Insert order. No .select() here: guests can INSERT a pending order but cannot SELECT
+    // orders (admin-only RLS policy) -- requesting the row back via RETURNING re-checks the
+    // SELECT policy too, which would make a perfectly valid guest insert throw a misleading
+    // "row violates row-level security policy" error even though the insert itself succeeded.
+    const { error: orderError } = await supabase
       .from('orders')
       .insert({
         id: order.id,
@@ -2069,9 +2090,7 @@ export async function saveOrder(order: Order): Promise<void> {
         total: order.total,
         status: persistOrderStatusForDatabase(order.status),
         date: order.date,
-      })
-      .select()
-      .single();
+      });
 
     if (orderError) throw orderError;
 
@@ -2097,10 +2116,11 @@ export async function saveOrder(order: Order): Promise<void> {
 
       console.log('DEBUG: Attempting to insert order_items payload:', JSON.stringify(itemsToInsert, null, 2));
 
-      const { data: itemsData, error: itemsError } = await supabase
+      // Same RETURNING/RLS gotcha as the orders insert above: no .select() -- order_items is
+      // also admin-only to SELECT, so a guest's otherwise-valid insert would fail on RETURNING.
+      const { error: itemsError } = await supabase
         .from('order_items')
-        .insert(itemsToInsert)
-        .select();
+        .insert(itemsToInsert);
 
       if (itemsError) {
         console.error('CRITICAL: Supabase order_items insertion failed.', {
@@ -2113,8 +2133,8 @@ export async function saveOrder(order: Order): Promise<void> {
         });
         throw itemsError;
       }
-      
-      console.log('SUCCESS: Order items inserted successfully:', itemsData);
+
+      console.log('SUCCESS: Order items inserted successfully:', itemsToInsert.length, 'item(s)');
     }
 
     const normalizedOrder = {

@@ -5,7 +5,7 @@ import * as XLSX from 'xlsx';
 import { Category, Product, ProductGender, ProductSizeStock, Order, CartItem, FinancialMetric, FinancialTotals, View, Tag } from './types';
 import { INITIAL_PRODUCTS, ADMIN_CREDENTIALS, ADMIN_USER, ADMIN_PASS, LEBANON_LOCATIONS, SIZE_OPTIONS } from './constants';
 import { getProductRecommendation } from './services/gemini';
-import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals, reserveCartLine, releaseCartLineReservation, cleanupExpiredReservations, extendExpiredReservation, getProductColorTokens, uploadProductImagesToStorage, normalizeOrderStatus, getTags } from './services/database';
+import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals, reserveCartLine, releaseCartLineReservation, cleanupExpiredReservations, extendExpiredReservation, getProductColorTokens, uploadProductImagesToStorage, normalizeOrderStatus, getTags, generateOrderId } from './services/database';
 import { supabase } from './services/supabase';
 import AnnouncementBar from './components/AnnouncementBar';
 import HeroBannerSlider from './components/HeroBannerSlider';
@@ -4769,8 +4769,10 @@ function CheckoutView({ cart, setCart, setCartNotice, setOrders, setProducts, se
       return refreshed ? { ...item, expiresAt: refreshed.expiresAt } : item;
     }));
 
+    const orderId = await generateOrderId();
+
     const order: Order = {
-      id: `ORD-${Date.now()}`,
+      id: orderId,
       customerName: fd.get('name') as string,
       customerEmail: fd.get('email') as string,
       customerPhone: fd.get('phone') as string,
