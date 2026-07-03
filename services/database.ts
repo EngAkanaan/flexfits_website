@@ -421,8 +421,6 @@ function inferGenderFromRow(row: any): ProductGender {
     row.name_of_item,
     row.Type,
     row.type,
-    row.Description,
-    row.description,
   ]
     .map((v) => String(v || '').trim().toLowerCase())
     .filter(Boolean)
@@ -1243,7 +1241,6 @@ function mapProductRowToAppProduct(p: any): Product {
     sold: normalizedSold,
     sizes,
     sizeStock,
-    description: p.Description || p.description || '',
     image: normalizeProductImage(images[0] || p.Pictures || p.pictures || p.picture || p.image),
     images,
     isAuthentic: p.is_authentic ?? true,
@@ -1417,7 +1414,6 @@ export async function saveProduct(product: Product): Promise<void> {
       Status: resolveNextProductStatus(product.status || 'Active', computedPieces),
       Pictures: product.images?.[0] || product.image,
       images: product.images && product.images.length > 0 ? product.images : [product.image].filter(Boolean),
-      Description: product.description,
       colors: colors,
       size_stock: normalizedSizeStock,
       original_price: product.originalPrice ?? null,
@@ -1587,7 +1583,6 @@ export async function saveProduct(product: Product): Promise<void> {
         cost: product.cost,
         initial_stock: product.initialStock,
         sizes: Array.isArray(product.sizes) && product.sizes.length > 0 ? product.sizes : [],
-        description: product.description || '',
         image: product.image || '',
         is_authentic: product.isAuthentic ?? true,
       };
@@ -1601,7 +1596,6 @@ export async function saveProduct(product: Product): Promise<void> {
         Cost: product.cost,
         initial_stock: product.initialStock,
         sizes: Array.isArray(product.sizes) && product.sizes.length > 0 ? product.sizes : [],
-        Description: product.description || '',
         image: product.image || '',
         is_authentic: product.isAuthentic ?? true,
       };

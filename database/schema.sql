@@ -18,7 +18,6 @@ CREATE TABLE products (
   sold INTEGER NOT NULL DEFAULT 0,
   sizes TEXT[] NOT NULL DEFAULT '{}',
   colors TEXT[] NOT NULL DEFAULT '{}',
-  description TEXT NOT NULL,
   image TEXT NOT NULL,
   is_authentic BOOLEAN NOT NULL DEFAULT true,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),

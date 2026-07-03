@@ -514,12 +514,6 @@ function ProductCard({
           </div>
         )}
 
-        {product.description && (
-          <div className="mb-3 bg-gray-50 p-3 rounded-xl border border-gray-100">
-            <p className="text-[11px] text-gray-500 font-medium leading-relaxed italic line-clamp-2">{product.description}</p>
-          </div>
-        )}
-
         <div className="mb-3 flex items-center gap-2">
           <span className="text-[9px] font-black uppercase text-gray-400 tracking-widest">In Stock:</span>
           <span className={`text-[11px] font-black ${isOutOfStock ? 'text-red-500' : isReserved ? 'text-amber-600' : getTotalStock(product) < 10 ? 'text-orange-500' : 'text-green-600'}`}>
@@ -1930,7 +1924,6 @@ const App: React.FC = () => {
                   <div>
                     <p className="text-[10px] font-black uppercase tracking-[0.4em] text-orange-600 mb-2">{activeProduct.category}</p>
                     <h1 className="text-3xl md:text-4xl font-black uppercase italic tracking-tighter text-black leading-none mb-3">{activeProduct.productName || activeProduct.name}</h1>
-                    <p className="text-sm font-semibold text-gray-500 leading-relaxed">{activeProduct.description}</p>
                   </div>
 
                   <div className="flex items-end gap-3">
@@ -3086,9 +3079,6 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
 
         if (!Number.isFinite(computedStock) || computedStock < 0) errors.push('Invalid stock/quantity.');
 
-        const descriptionValue = String(getImportValue(row, ['description', 'details', 'desc'])).trim();
-        if (!descriptionValue) errors.push('Missing description.');
-
         const imageTokens = parseDelimitedList(getImportValue(row, ['images', 'image', 'image_urls', 'imageurls', 'pictures']));
         const normalizedImages = imageTokens.length > 0 ? imageTokens : [BRAND_LOGO_SRC];
 
@@ -3138,7 +3128,6 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
               sold: 0,
               sizes: sizesValue,
               sizeStock: sizeStockPayload,
-              description: descriptionValue,
               image: normalizedImages[0] || BRAND_LOGO_SRC,
               images: normalizedImages,
               isAuthentic: true,
@@ -3196,7 +3185,6 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
       stock: 12,
       sizes: '40, 41, 42',
       size_stock: '40:4 | 41:4 | 42:4',
-      description: 'Authentic court runner with premium finish.',
       images: 'https://example.com/image-1.jpg, https://example.com/image-2.jpg',
       status: 'Active',
       colors: 'black, white',
@@ -3242,7 +3230,6 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
         size_stock: sizeStock.length > 0
           ? sizeStock.map((entry) => `${entry.size}:${entry.stock}`).join(' | ')
           : '',
-        description: product.description,
         images: (getProductImages(product) || []).join(', '),
         status: product.status || '',
         colors: (getProductColorTokens(product) || []).join(', '),
@@ -3478,7 +3465,6 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
       sold: itemsSold,
       sizes: selectedSizes,
       sizeStock: derivedSizeStock,
-      description: fd.get('description') as string,
       image: parsedImages[0] || (fd.get('image') as string) || editMode?.image || '',
       images: parsedImages,
       isAuthentic: true,
@@ -3878,7 +3864,7 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
             <div className="p-4 border-b bg-gray-50/60 space-y-4">
               <div className="text-xs text-gray-600 space-y-1">
                 <p className="text-[10px] font-black uppercase text-gray-500">Required columns</p>
-                <p>SKU, Product Name, Category, Type, Price, Stock, Sizes, Description.</p>
+                <p>SKU, Product Name, Category, Type, Price, Stock, Sizes.</p>
                 <p className="text-[10px] font-black uppercase text-gray-500 mt-2">Optional columns</p>
                 <p>Brand, Cost, Gender, Status, Images, Colors, Size Stock, Original Price, On Sale.</p>
               </div>
@@ -4036,7 +4022,6 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
                   <th className="p-3 whitespace-nowrap">Price</th>
                   <th className="p-3 whitespace-nowrap">Stock</th>
                   <th className="p-3 whitespace-nowrap">Status</th>
-                  <th className="p-3">Description</th>
                   <th className="p-3 text-right whitespace-nowrap">Actions</th>
                 </tr>
               </thead>
@@ -4098,9 +4083,6 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
                           {normalizedStatus}
                         </span>
                       </td>
-                      <td className="p-3 max-w-[320px]">
-                        <p className="text-[10px] text-gray-600 truncate">{p.description || '-'}</p>
-                      </td>
                       <td className="p-3 text-right">
                         <div className="flex justify-end gap-1">
                           <button onClick={() => { setEditMode(p); setUploadedImageFiles([]); setUploadedImagePreviews([]); setImageValidationErrors([]); }} className="p-2 hover:bg-orange-50 text-gray-400 hover:text-orange-600 rounded-lg transition-colors"><Edit2 size={14} /></button>
@@ -4124,7 +4106,7 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
                 })}
                 {pagedInventoryProducts.length === 0 && (
                   <tr>
-                    <td colSpan={12} className="p-6 text-center text-gray-500 font-semibold">
+                    <td colSpan={11} className="p-6 text-center text-gray-500 font-semibold">
                       {inventorySection === 'ComingSoon'
                         ? 'No T-shirt or Hoodie products found yet. Add items with type containing "tshirt", "t-shirt", or "hoodie".'
                         : 'No products in this section.'}
@@ -4266,10 +4248,6 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
             </div>
 
             <div className="space-y-6">
-              <div>
-                <label className="text-[10px] font-black uppercase text-gray-400 ml-1">Asset Description</label>
-                <textarea name="description" defaultValue={editMode?.description} placeholder="Enter full product details and authenticity notes..." rows={4} className="w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold focus:ring-2 focus:ring-orange-500 outline-none" required></textarea>
-              </div>
               <div>
                 <label className="text-[10px] font-black uppercase text-gray-400 ml-1 block mb-2">Sale Pricing</label>
                 <div className="grid grid-cols-2 gap-4">

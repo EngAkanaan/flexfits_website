@@ -30,7 +30,6 @@ export interface Product {
   sold: number;         // Items Sold
   sizes: string[];
   sizeStock?: ProductSizeStock[];
-  description: string;
   image: string;
   images?: string[];
   isAuthentic: boolean;

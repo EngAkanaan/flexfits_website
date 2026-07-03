@@ -1,0 +1,2 @@
+ALTER TABLE products DROP COLUMN IF EXISTS description;
+ALTER TABLE products DROP COLUMN IF EXISTS "Description";
