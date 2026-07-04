@@ -370,6 +370,8 @@ function isValidDataImageUrl(value: string): boolean {
 function isRenderableImageSrc(value: string): boolean {
   if (!value) return false;
   if (/^https?:\/\//i.test(value)) return true;
+  // Locally-created previews for not-yet-uploaded files (URL.createObjectURL).
+  if (/^blob:/i.test(value)) return true;
   // Bounded length keeps this from matching base64 fragments (thousands of chars, no "=" padding
   // in some encodings) that happen to satisfy this character class otherwise.
   if (value.length <= 200 && /^\/[\w./%+-]+$/i.test(value)) return true;
@@ -483,7 +485,7 @@ function ProductCard({
 
       <div className="px-2 pb-2 flex-grow flex flex-col">
         <h4 className="font-black text-lg uppercase italic tracking-tighter group-hover:text-orange-600 transition-colors mb-1 text-black leading-none">{product.productName || product.name}</h4>
-        <p className="text-[9px] text-gray-300 font-black uppercase tracking-[0.3em] mb-2 italic">{product.category}</p>
+        <p className="text-[9px] text-gray-300 font-black uppercase tracking-[0.3em] mb-2 italic">{getProductBrandLabel(product) || 'Brand not specified'}</p>
 
         <div className="mb-2 flex items-center justify-between gap-2">
           <span className="text-[9px] font-black uppercase text-gray-400 tracking-widest">Type</span>
@@ -2332,6 +2334,9 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
     payload?: Product;
     duplicateSku?: boolean;
   };
+  type ImageItem =
+    | { id: string; kind: 'url'; url: string }
+    | { id: string; kind: 'file'; file: File; preview: string };
   type ImportSummary = {
     imported: number;
     updated: number;
@@ -2344,8 +2349,8 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
   const [loginError, setLoginError] = useState('');
   const [activeTab, setActiveTab] = useState<AdminTab>('inventory');
   const [editMode, setEditMode] = useState<Product | null>(null);
-  const [uploadedImageFiles, setUploadedImageFiles] = useState<File[]>([]);
-  const [uploadedImagePreviews, setUploadedImagePreviews] = useState<string[]>([]);
+  const [imageItems, setImageItems] = useState<ImageItem[]>([]);
+  const [draggedImageId, setDraggedImageId] = useState<string | null>(null);
   const [imageValidationErrors, setImageValidationErrors] = useState<string[]>([]);
   const [isUploadingImages, setIsUploadingImages] = useState(false);
   const [formCategory, setFormCategory] = useState<Category>(Category.SHOES);
@@ -2423,8 +2428,8 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
 
   useEffect(() => {
     if (editMode) {
-      setUploadedImageFiles([]);
-      setUploadedImagePreviews([]);
+      const existingImages = getProductImages(editMode) || [];
+      setImageItems(existingImages.map((url, index) => ({ id: `existing-${index}-${url}`, kind: 'url', url })));
       setImageValidationErrors([]);
       setFormCategory(editMode.category);
       setSelectedSizes(editMode.sizes);
@@ -2432,15 +2437,14 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
       setBrandName(editMode.brandName || parsed.brand);
       setProductName(editMode.productName || parsed.product);
       setFormColors((Array.isArray(editMode.colors) && editMode.colors.length > 0 ? editMode.colors : getProductColorTokens(editMode)).join(', '));
-      setFormImagesText((getProductImages(editMode) || []).join(', '));
+      setFormImagesText('');
       setFormSizeStock(buildEditableSizeStock(editMode));
       setFormStock(editMode.initialStock ?? '');
       setFormSold(editMode.sold ?? 0);
       setFormTagIds(editMode.tagIds || []);
       setActiveTab('add');
     } else {
-      setUploadedImageFiles([]);
-      setUploadedImagePreviews([]);
+      setImageItems([]);
       setImageValidationErrors([]);
       setSelectedSizes([]);
       setBrandName('');
@@ -2487,13 +2491,13 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
 
   useEffect(() => {
     return () => {
-      for (const preview of uploadedImagePreviews) {
-        if (preview.startsWith('blob:')) {
-          URL.revokeObjectURL(preview);
+      for (const item of imageItems) {
+        if (item.kind === 'file' && item.preview.startsWith('blob:')) {
+          URL.revokeObjectURL(item.preview);
         }
       }
     };
-  }, [uploadedImagePreviews]);
+  }, [imageItems]);
 
   const displayFinancialMetrics = useMemo<FinancialMetric[]>(() => {
     if (financialMetrics.length > 0) {
@@ -3209,13 +3213,27 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
     downloadBlob(new Blob([output], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), 'inventory-template.xlsx');
   };
 
-  const handleExportInventory = (format: 'csv' | 'xlsx') => {
+  const handleExportInventory = async (format: 'csv' | 'xlsx') => {
+    let exportTags = allTags;
+    if (exportTags.length === 0) {
+      try {
+        exportTags = await getTags();
+      } catch (error) {
+        console.warn('Unable to load tags for inventory export, continuing without tag names:', error);
+        exportTags = [];
+      }
+    }
+    const tagNameById = new Map(exportTags.map((tag) => [tag.id, tag.name]));
+
     const exportProducts = selectedProductIds.size > 0
       ? products.filter((product) => selectedProductIds.has(product.Product_ID))
       : products;
     const rows = exportProducts.map((product) => {
       const totals = getProductStockTotals(product);
       const sizeStock = normalizeSizeStockEntries(product);
+      const tagNames = Array.from(new Set((product.tagIds || [])
+        .map((tagId) => tagNameById.get(tagId))
+        .filter((name): name is string => Boolean(name && name.trim()))));
       return {
         sku: product.Product_ID,
         brand: product.brandName || splitDisplayName(product.name).brand,
@@ -3230,6 +3248,7 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
         size_stock: sizeStock.length > 0
           ? sizeStock.map((entry) => `${entry.size}:${entry.stock}`).join(' | ')
           : '',
+        tags: tagNames.join(', '),
         images: (getProductImages(product) || []).join(', '),
         status: product.status || '',
         colors: (getProductColorTokens(product) || []).join(', '),
@@ -3333,10 +3352,50 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
       return;
     }
 
-    setUploadedImageFiles((prev) => [...prev, ...validFiles]);
-    const objectUrls = validFiles.map((file) => URL.createObjectURL(file));
-    setUploadedImagePreviews((prev) => [...prev, ...objectUrls]);
+    const newItems: ImageItem[] = validFiles.map((file, index) => ({
+      id: `file-${Date.now()}-${index}-${Math.random().toString(36).slice(2)}`,
+      kind: 'file',
+      file,
+      preview: URL.createObjectURL(file),
+    }));
+    setImageItems((prev) => [...prev, ...newItems]);
     e.target.value = '';
+  };
+
+  const addImageUrls = () => {
+    const tokens = parseImageUrlTokens(formImagesText);
+    if (tokens.length === 0) return;
+    setImageItems((prev) => {
+      const existingUrls = new Set(prev.filter((item): item is Extract<ImageItem, { kind: 'url' }> => item.kind === 'url').map((item) => item.url));
+      const additions: ImageItem[] = tokens
+        .filter((url) => !existingUrls.has(url))
+        .map((url, index) => ({ id: `url-${Date.now()}-${index}-${url}`, kind: 'url', url }));
+      return [...prev, ...additions];
+    });
+    setFormImagesText('');
+  };
+
+  const moveImageItem = (draggedId: string, targetId: string) => {
+    if (draggedId === targetId) return;
+    setImageItems((prev) => {
+      const fromIndex = prev.findIndex((item) => item.id === draggedId);
+      const toIndex = prev.findIndex((item) => item.id === targetId);
+      if (fromIndex === -1 || toIndex === -1) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      return next;
+    });
+  };
+
+  const removeImageItem = (id: string) => {
+    setImageItems((prev) => {
+      const target = prev.find((item) => item.id === id);
+      if (target?.kind === 'file' && target.preview.startsWith('blob:')) {
+        URL.revokeObjectURL(target.preview);
+      }
+      return prev.filter((item) => item.id !== id);
+    });
   };
 
   const saveProduct = async (e: React.FormEvent<HTMLFormElement>) => {
@@ -3371,16 +3430,26 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
     );
     console.log('[saveProduct] colorTokens to save:', colorTokens);
 
-    const urlImages = parseImageUrlTokens(formImagesText);
     setImageValidationErrors([]);
 
+    // Fold in any URLs typed but not yet explicitly added to the gallery, preserving gallery order.
+    const pendingTokens = parseImageUrlTokens(formImagesText);
+    const existingUrlSet = new Set(imageItems.filter((item): item is Extract<ImageItem, { kind: 'url' }> => item.kind === 'url').map((item) => item.url));
+    const pendingUrlItems: ImageItem[] = pendingTokens
+      .filter((url) => !existingUrlSet.has(url))
+      .map((url, index) => ({ id: `pending-${index}-${url}`, kind: 'url', url }));
+    const finalImageItems = [...imageItems, ...pendingUrlItems];
+
+    const urlItems = finalImageItems.filter((item): item is Extract<ImageItem, { kind: 'url' }> => item.kind === 'url');
+    const fileItems = finalImageItems.filter((item): item is Extract<ImageItem, { kind: 'file' }> => item.kind === 'file');
+
     const validationResults = await Promise.all(
-      urlImages.map(async (candidate) => ({
-        candidate,
-        isValid: await validateImageUrl(candidate),
+      urlItems.map(async (item) => ({
+        url: item.url,
+        isValid: await validateImageUrl(item.url),
       }))
     );
-    const invalidUrls = validationResults.filter((entry) => !entry.isValid).map((entry) => entry.candidate);
+    const invalidUrls = validationResults.filter((entry) => !entry.isValid).map((entry) => entry.url);
 
     if (invalidUrls.length > 0) {
       setImageValidationErrors(invalidUrls.map((url) => `Invalid or unreachable image URL: ${url}`));
@@ -3388,17 +3457,22 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
       return;
     }
 
-    let uploadedUrls: string[] = [];
-    if (uploadedImageFiles.length > 0) {
+    let uploadedFileUrls: string[] = [];
+    if (fileItems.length > 0) {
       setIsUploadingImages(true);
       try {
-        uploadedUrls = await uploadProductImagesToStorage(editMode?.Product_ID || productId, uploadedImageFiles);
+        uploadedFileUrls = await uploadProductImagesToStorage(editMode?.Product_ID || productId, fileItems.map((item) => item.file));
       } finally {
         setIsUploadingImages(false);
       }
     }
 
-    const parsedImages = Array.from(new Set([...uploadedUrls, ...urlImages]));
+    const fileIdToUrl = new Map(fileItems.map((item, index) => [item.id, uploadedFileUrls[index]]));
+    const orderedImageUrls = finalImageItems
+      .map((item) => (item.kind === 'url' ? item.url : fileIdToUrl.get(item.id)))
+      .filter((url): url is string => Boolean(url && url.trim()));
+
+    const parsedImages = Array.from(new Set(orderedImageUrls));
     if (parsedImages.length === 0) {
       alert('Add at least one valid image (upload or URL).');
       return;
@@ -3414,20 +3488,16 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
       };
     });
 
+    const hasAnySizeStockEntry = normalizedSizeStock.length > 0;
     const explicitSizeStockTotal = normalizedSizeStock.reduce((total, entry) => total + entry.stock, 0);
     const fallbackStock = Number(formStock);
-    const resolvedStock = explicitSizeStockTotal > 0
+    const resolvedStock = hasAnySizeStockEntry
       ? explicitSizeStockTotal
       : Number.isFinite(fallbackStock) && fallbackStock > 0
         ? fallbackStock
         : 0;
 
-    if (resolvedStock <= 0) {
-      alert('Add stock for at least one size before saving this product.');
-      return;
-    }
-
-    const derivedSizeStock = explicitSizeStockTotal > 0
+    const derivedSizeStock = hasAnySizeStockEntry
       ? normalizedSizeStock
       : selectedSizes.map((size, index) => {
           const stockAmount = Math.max(0, Math.floor(resolvedStock / selectedSizes.length) + (index < (resolvedStock % selectedSizes.length) ? 1 : 0));
@@ -3481,8 +3551,7 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
       const refreshedProducts = await getProducts();
       setProducts(refreshedProducts);
       setEditMode(null);
-      setUploadedImageFiles([]);
-      setUploadedImagePreviews([]);
+      setImageItems([]);
       setFormImagesText('');
       setImageValidationErrors([]);
       setFormSizeStock([]);
@@ -4085,7 +4154,7 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
                       </td>
                       <td className="p-3 text-right">
                         <div className="flex justify-end gap-1">
-                          <button onClick={() => { setEditMode(p); setUploadedImageFiles([]); setUploadedImagePreviews([]); setImageValidationErrors([]); }} className="p-2 hover:bg-orange-50 text-gray-400 hover:text-orange-600 rounded-lg transition-colors"><Edit2 size={14} /></button>
+                          <button onClick={() => { setEditMode(p); setImageItems([]); setImageValidationErrors([]); }} className="p-2 hover:bg-orange-50 text-gray-400 hover:text-orange-600 rounded-lg transition-colors"><Edit2 size={14} /></button>
                           <button onClick={async () => {
                             if(confirm('Permanently erase this asset?')) {
                               try {
@@ -4333,56 +4402,64 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
                   <input name="image" placeholder="Primary image URL" defaultValue={editMode?.image} className="flex-[2] p-4 bg-gray-50 border rounded-2xl text-sm font-bold outline-none" />
                   <input type="file" ref={fileRef} hidden accept="image/*" multiple onChange={handleFile} />
                 </div>
-                <textarea
-                  name="images"
-                  value={formImagesText}
-                  onChange={(event) => setFormImagesText(event.target.value)}
-                  placeholder="Additional image URLs separated by commas"
-                  rows={3}
-                  className="mt-2 w-full p-4 bg-gray-50 border rounded-2xl text-sm font-bold focus:ring-2 focus:ring-orange-500 outline-none"
-                />
-                {parseImageUrlTokens(formImagesText).length > 0 && (
-                  <div className="mt-2 grid grid-cols-4 gap-2">
-                    {parseImageUrlTokens(formImagesText).map((url, index) => (
-                      <div key={url + index} className="relative rounded-xl border overflow-hidden bg-gray-50 aspect-square">
-                        <SafeImage src={url} alt={`URL preview ${index + 1}`} className="w-full h-full object-cover" />
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const next = parseImageUrlTokens(formImagesText).filter((_, urlIndex) => urlIndex !== index);
-                            setFormImagesText(next.join(', '));
-                          }}
-                          className="absolute top-1 right-1 w-5 h-5 rounded-full bg-black/70 text-white text-[10px]"
-                          aria-label="Remove URL image"
-                        >
-                          x
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                {uploadedImagePreviews.length > 0 && (
-                  <div className="mt-2 grid grid-cols-4 gap-2">
-                    {uploadedImagePreviews.map((preview, index) => (
-                      <div key={preview + index} className="relative rounded-xl border overflow-hidden bg-gray-50 aspect-square">
-                        <SafeImage src={preview} alt={`Upload preview ${index + 1}`} className="w-full h-full object-cover" />
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setUploadedImageFiles((prev) => prev.filter((_, fileIndex) => fileIndex !== index));
-                            setUploadedImagePreviews((prev) => {
-                              const target = prev[index];
-                              if (target && target.startsWith('blob:')) URL.revokeObjectURL(target);
-                              return prev.filter((_, previewIndex) => previewIndex !== index);
-                            });
-                          }}
-                          className="absolute top-1 right-1 w-5 h-5 rounded-full bg-black/70 text-white text-[10px]"
-                          aria-label="Remove uploaded image"
-                        >
-                          x
-                        </button>
-                      </div>
-                    ))}
+                <div className="mt-2 flex gap-2">
+                  <textarea
+                    value={formImagesText}
+                    onChange={(event) => setFormImagesText(event.target.value)}
+                    placeholder="Paste image URLs separated by commas, then click Add"
+                    rows={2}
+                    className="flex-1 p-4 bg-gray-50 border rounded-2xl text-sm font-bold focus:ring-2 focus:ring-orange-500 outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={addImageUrls}
+                    className="px-4 bg-gray-100 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-gray-200"
+                  >
+                    Add
+                  </button>
+                </div>
+                {imageItems.length > 0 && (
+                  <div className="mt-2">
+                    <p className="text-[9px] font-black uppercase text-gray-400 tracking-widest mb-1.5">Drag to reorder &middot; first image is the main product image</p>
+                    <div className="grid grid-cols-4 gap-2">
+                      {imageItems.map((item, index) => {
+                        const src = item.kind === 'url' ? item.url : item.preview;
+                        const isDragging = draggedImageId === item.id;
+                        return (
+                          <div
+                            key={item.id}
+                            draggable
+                            onDragStart={(event) => {
+                              setDraggedImageId(item.id);
+                              event.dataTransfer.effectAllowed = 'move';
+                              event.dataTransfer.setData('text/plain', item.id);
+                            }}
+                            onDragOver={(event) => event.preventDefault()}
+                            onDrop={(event) => {
+                              event.preventDefault();
+                              const sourceId = draggedImageId || event.dataTransfer.getData('text/plain');
+                              if (sourceId) moveImageItem(sourceId, item.id);
+                            }}
+                            onDragEnd={() => setDraggedImageId(null)}
+                            className={`relative rounded-xl border-2 overflow-hidden bg-gray-50 aspect-square cursor-grab active:cursor-grabbing transition-opacity ${isDragging ? 'opacity-40' : 'opacity-100'} ${index === 0 ? 'border-orange-500' : 'border-transparent'}`}
+                          >
+                            <SafeImage src={src} alt={`Product image ${index + 1}`} className="w-full h-full object-cover pointer-events-none" />
+                            {index === 0 && (
+                              <span className="absolute top-1 left-1 px-1.5 py-0.5 rounded-full bg-orange-600 text-white text-[8px] font-black uppercase tracking-wider">Main</span>
+                            )}
+                            <span className="absolute bottom-1 left-1 w-5 h-5 rounded-full bg-black/60 text-white text-[9px] font-black flex items-center justify-center">{index + 1}</span>
+                            <button
+                              type="button"
+                              onClick={() => removeImageItem(item.id)}
+                              className="absolute top-1 right-1 w-5 h-5 rounded-full bg-black/70 text-white text-[10px]"
+                              aria-label={`Remove image ${index + 1}`}
+                            >
+                              x
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
                 )}
                 {imageValidationErrors.length > 0 && (
@@ -4398,7 +4475,7 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
               </div>
               <div className="flex gap-4 pt-4">
                 <button type="submit" className="flex-1 bg-orange-600 text-white py-3 rounded-xl font-black uppercase tracking-widest hover:bg-orange-700 hover:scale-[1.02] transition-all shadow-xl shadow-orange-600/20 text-sm">{editMode ? 'Commit Changes' : 'Publish Asset'}</button>
-                {editMode && <button type="button" onClick={() => {setEditMode(null); setUploadedImageFiles([]); setUploadedImagePreviews([]); setImageValidationErrors([]); setFormImagesText(''); setFormSizeStock([]); setBrandName(''); setProductName(''); setActiveTab('inventory');}} className="px-8 bg-gray-100 rounded-3xl font-black uppercase text-[10px] tracking-widest">Cancel</button>}
+                {editMode && <button type="button" onClick={() => {setEditMode(null); setImageItems([]); setImageValidationErrors([]); setFormImagesText(''); setFormSizeStock([]); setBrandName(''); setProductName(''); setActiveTab('inventory');}} className="px-8 bg-gray-100 rounded-3xl font-black uppercase text-[10px] tracking-widest">Cancel</button>}
               </div>
             </div>
           </form>
