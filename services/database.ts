@@ -2,7 +2,7 @@
 // This will replace localStorage with real database calls
 
 import { supabase } from './supabase';
-import { Product, ProductGender, ProductSizeStock, Order, FinancialMetric, FinancialTotals, StockReservation, Announcement, HeroSlide, HomepageSectionSetting, Tag } from '../types';
+import { Product, ProductGender, ProductSizeStock, Order, DeliverySettings, FinancialMetric, FinancialTotals, StockReservation, Announcement, HeroSlide, HomepageSectionSetting, Tag } from '../types';
 
 const ADMIN_NOTIFICATION_EMAIL = 'flexfitslebanon@gmail.com';
 const EMAIL_WEBHOOK_URL = String(import.meta.env.VITE_EMAIL_WEBHOOK_URL || '').trim();
@@ -2018,6 +2018,7 @@ export async function getOrders(): Promise<Order[]> {
             price: parseFloat(item.price),
           })),
           total: parseFloat(order.total),
+          deliveryFee: order.delivery_fee != null ? Math.max(0, Number(order.delivery_fee)) : undefined,
           status: normalizeOrderStatus(order.status),
           date: order.date,
         };
@@ -2082,6 +2083,7 @@ export async function saveOrder(order: Order): Promise<void> {
         village: order.village,
         address_details: order.addressDetails,
         total: order.total,
+        delivery_fee: Math.max(0, Number(order.deliveryFee ?? 0)),
         status: persistOrderStatusForDatabase(order.status),
         date: order.date,
       });
@@ -2279,6 +2281,7 @@ export async function updateOrderStatus(
           reservationId: itemRow.reservation_id ? String(itemRow.reservation_id) : undefined,
         })),
         total: Math.max(0, Number(row.total || 0)),
+        deliveryFee: row.delivery_fee != null ? Math.max(0, Number(row.delivery_fee)) : undefined,
         status: normalizeOrderStatus(row.status),
         date: String(row.date || new Date().toISOString()),
       };
@@ -2380,6 +2383,184 @@ export async function deleteOrder(orderId: string): Promise<void> {
   } catch (error) {
     console.error('Error deleting order:', error);
     throw error;
+  }
+}
+
+// ==================== DELIVERY SETTINGS & ADMIN ORDER EDITING ====================
+
+const DELIVERY_SETTINGS_STORAGE_KEY = 'flex_delivery_settings';
+
+export const DEFAULT_DELIVERY_SETTINGS: DeliverySettings = {
+  deliveryFee: 5,
+  freeDeliveryThreshold: null,
+};
+
+function normalizeDeliverySettings(row: any): DeliverySettings {
+  const fee = Number(row?.deliveryFee ?? row?.delivery_fee);
+  const thresholdRaw = row?.freeDeliveryThreshold ?? row?.free_delivery_threshold;
+  const threshold = thresholdRaw === null || thresholdRaw === undefined || thresholdRaw === '' ? null : Number(thresholdRaw);
+  return {
+    deliveryFee: Number.isFinite(fee) && fee >= 0 ? fee : DEFAULT_DELIVERY_SETTINGS.deliveryFee,
+    freeDeliveryThreshold: threshold !== null && Number.isFinite(threshold) && threshold >= 0 ? threshold : null,
+  };
+}
+
+/** Delivery charge for a given items subtotal under the current settings (0 when the free-delivery threshold is met). */
+export function computeDeliveryFee(itemsSubtotal: number, settings: DeliverySettings): number {
+  const subtotal = Math.max(0, Number(itemsSubtotal || 0));
+  if (settings.freeDeliveryThreshold !== null && subtotal >= settings.freeDeliveryThreshold) return 0;
+  return Math.max(0, Number(settings.deliveryFee || 0));
+}
+
+export async function getDeliverySettings(): Promise<DeliverySettings> {
+  if (!supabase) {
+    try {
+      const raw = localStorage.getItem(DELIVERY_SETTINGS_STORAGE_KEY);
+      return raw ? normalizeDeliverySettings(JSON.parse(raw)) : { ...DEFAULT_DELIVERY_SETTINGS };
+    } catch {
+      return { ...DEFAULT_DELIVERY_SETTINGS };
+    }
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('store_settings')
+      .select('delivery_fee, free_delivery_threshold')
+      .eq('id', 'global')
+      .maybeSingle();
+
+    if (error) throw error;
+
+    const settings = data ? normalizeDeliverySettings(data) : { ...DEFAULT_DELIVERY_SETTINGS };
+    try {
+      localStorage.setItem(DELIVERY_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+    } catch { /* Ignore localStorage failures silently. */ }
+    return settings;
+  } catch (error) {
+    console.error('Error fetching delivery settings:', error);
+    try {
+      const raw = localStorage.getItem(DELIVERY_SETTINGS_STORAGE_KEY);
+      if (raw) return normalizeDeliverySettings(JSON.parse(raw));
+    } catch { /* fall through to defaults */ }
+    return { ...DEFAULT_DELIVERY_SETTINGS };
+  }
+}
+
+export async function saveDeliverySettings(settings: DeliverySettings): Promise<DeliverySettings> {
+  const normalized = normalizeDeliverySettings(settings);
+
+  if (!supabase) {
+    localStorage.setItem(DELIVERY_SETTINGS_STORAGE_KEY, JSON.stringify(normalized));
+    return normalized;
+  }
+
+  const { error } = await supabase
+    .from('store_settings')
+    .upsert({
+      id: 'global',
+      delivery_fee: normalized.deliveryFee,
+      free_delivery_threshold: normalized.freeDeliveryThreshold,
+    }, { onConflict: 'id' });
+
+  if (error) {
+    console.error('Error saving delivery settings:', error);
+    throw new Error(String(error.message || 'Failed to save delivery settings.'));
+  }
+
+  try {
+    localStorage.setItem(DELIVERY_SETTINGS_STORAGE_KEY, JSON.stringify(normalized));
+  } catch { /* Ignore localStorage failures silently. */ }
+  return normalized;
+}
+
+/** Remove one product+size line from a pending order; restores stock, releases reservations, and recomputes the total. */
+export async function adminRemoveOrderItem(orderId: string, productId: string, size: string): Promise<void> {
+  const normalizedProductId = String(productId || '').trim();
+  const normalizedSize = String(size || '').trim();
+
+  if (!supabase) {
+    const saved = localStorage.getItem('flex_orders');
+    const orders: Order[] = saved ? JSON.parse(saved) : [];
+    const orderIndex = orders.findIndex((o) => o.id === orderId);
+    if (orderIndex < 0) throw new Error(`Order ${orderId} was not found.`);
+    const order = orders[orderIndex];
+    if (normalizeOrderStatus(order.status) !== 'pending') throw new Error('Only pending orders can be edited.');
+
+    const items = normalizeOrderItems(order.items || []);
+    const matchesLine = (item: Order['items'][number]) =>
+      item.productId === normalizedProductId && item.size.toUpperCase() === normalizedSize.toUpperCase();
+    const removed = items.filter(matchesLine);
+    const remaining = items.filter((item) => !matchesLine(item));
+    if (removed.length === 0) throw new Error('This item is no longer part of the order.');
+    if (remaining.length === 0) throw new Error('An order must keep at least one item. Cancel the order instead.');
+
+    // Put the removed units back into sellable local stock (checkout committed them).
+    const savedProducts = localStorage.getItem('flex_products');
+    const products: Product[] = savedProducts ? JSON.parse(savedProducts) : [];
+    const removedQty = removed.reduce((acc, item) => acc + item.quantity, 0);
+    const productIndex = products.findIndex((candidate) => String(candidate.Product_ID || '').trim() === normalizedProductId);
+    if (productIndex >= 0) {
+      products[productIndex] = applyLocalProductStockDelta(products[productIndex], normalizedSize, removedQty);
+      localStorage.setItem('flex_products', JSON.stringify(products));
+    }
+
+    const removedReservationIds = new Set(
+      removed.map((item) => String(item.reservationId || '').trim()).filter(Boolean)
+    );
+    if (removedReservationIds.size > 0) {
+      writeLocalReservations(readLocalReservations().map((row) => (
+        removedReservationIds.has(row.id) && (row.status === 'active' || row.status === 'confirmed')
+          ? { ...row, status: 'released' as const }
+          : row
+      )));
+    }
+
+    const previousSubtotal = items.reduce((acc, item) => acc + item.quantity * item.price, 0);
+    const deliveryFee = Math.max(0, Number(order.deliveryFee ?? Math.max(0, Number(order.total || 0) - previousSubtotal)));
+    const itemsSubtotal = remaining.reduce((acc, item) => acc + item.quantity * item.price, 0);
+    orders[orderIndex] = { ...order, items: remaining, deliveryFee, total: itemsSubtotal + deliveryFee };
+    localStorage.setItem('flex_orders', JSON.stringify(orders));
+    return;
+  }
+
+  const { error } = await supabase.rpc('admin_remove_order_item', {
+    p_order_id: orderId,
+    p_product_id: normalizedProductId,
+    p_size: normalizedSize,
+  });
+
+  if (error) {
+    console.error('Error removing order item:', error);
+    throw new Error(String(error.message || 'Failed to remove the item from this order.'));
+  }
+}
+
+/** Change a pending order's delivery fee (0 = free/hand delivery) and recompute its total. */
+export async function adminSetOrderDeliveryFee(orderId: string, deliveryFee: number): Promise<void> {
+  const fee = Math.max(0, Number(deliveryFee || 0));
+
+  if (!supabase) {
+    const saved = localStorage.getItem('flex_orders');
+    const orders: Order[] = saved ? JSON.parse(saved) : [];
+    const orderIndex = orders.findIndex((o) => o.id === orderId);
+    if (orderIndex < 0) throw new Error(`Order ${orderId} was not found.`);
+    const order = orders[orderIndex];
+    if (normalizeOrderStatus(order.status) !== 'pending') throw new Error('Only pending orders can be edited.');
+
+    const itemsSubtotal = normalizeOrderItems(order.items || []).reduce((acc, item) => acc + item.quantity * item.price, 0);
+    orders[orderIndex] = { ...order, deliveryFee: fee, total: itemsSubtotal + fee };
+    localStorage.setItem('flex_orders', JSON.stringify(orders));
+    return;
+  }
+
+  const { error } = await supabase.rpc('admin_set_order_delivery_fee', {
+    p_order_id: orderId,
+    p_delivery_fee: fee,
+  });
+
+  if (error) {
+    console.error('Error updating order delivery fee:', error);
+    throw new Error(String(error.message || 'Failed to update the delivery fee for this order.'));
   }
 }
 

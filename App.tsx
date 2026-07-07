@@ -2,10 +2,10 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback, useDeferredValue } from 'react';
 import { ShoppingBag, User, Search, Filter, Trash2, Plus, LogOut, ChevronRight, CheckCircle, Package, BarChart3, Menu, X, Star, ExternalLink, Edit2, Upload, Download, Phone, MapPin, Truck, Check, Mail, List, Layers, Info, Palette, MessageCircle, Tag as TagIcon } from 'lucide-react';
 import * as XLSX from 'xlsx';
-import { Category, Product, ProductGender, ProductSizeStock, Order, CartItem, FinancialMetric, FinancialTotals, View, Tag } from './types';
+import { Category, Product, ProductGender, ProductSizeStock, Order, CartItem, DeliverySettings, FinancialMetric, FinancialTotals, View, Tag } from './types';
 import { INITIAL_PRODUCTS, ADMIN_CREDENTIALS, ADMIN_USER, ADMIN_PASS, LEBANON_LOCATIONS, SIZE_OPTIONS } from './constants';
 import { getProductRecommendation } from './services/gemini';
-import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals, reserveCartLine, releaseCartLineReservation, cleanupExpiredReservations, extendExpiredReservation, getProductColorTokens, uploadProductImagesToStorage, normalizeOrderStatus, getTags, generateOrderId } from './services/database';
+import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals, reserveCartLine, releaseCartLineReservation, cleanupExpiredReservations, extendExpiredReservation, getProductColorTokens, uploadProductImagesToStorage, normalizeOrderStatus, getTags, generateOrderId, getDeliverySettings, saveDeliverySettings, computeDeliveryFee, DEFAULT_DELIVERY_SETTINGS, adminRemoveOrderItem, adminSetOrderDeliveryFee } from './services/database';
 import { supabase } from './services/supabase';
 import AnnouncementBar from './components/AnnouncementBar';
 import HeroBannerSlider from './components/HeroBannerSlider';
@@ -14,7 +14,6 @@ import EditThemePanel from './components/EditThemePanel';
 import TagsManagerPanel from './components/TagsManagerPanel';
 
 const BRAND_LOGO_SRC = '/flex-logo.JPG';
-const DELIVERY_FEE = 5;
 const GENDER_OPTIONS: ProductGender[] = ['Men', 'Women', 'Unisex'];
 const NUMERIC_SIZE_FILTER_OPTIONS = Array.from({ length: 16 }, (_, i) => String(35 + i));
 const CLOTHING_SIZE_FILTER_OPTIONS = ['S', 'M', 'L', 'XL'];
@@ -607,6 +606,7 @@ const App: React.FC = () => {
   const [selectedProductId, setSelectedProductId] = useState<string | null>(initialRoute.productId);
   const [products, setProducts] = useState<Product[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
+  const [deliverySettings, setDeliverySettings] = useState<DeliverySettings>(DEFAULT_DELIVERY_SETTINGS);
   const [cart, setCart] = useState<CartItem[]>(() => getInitialCartState());
   const [isAdmin, setIsAdmin] = useState(() => {
     // When Supabase is configured, real admin state comes from a Supabase Auth session
@@ -667,12 +667,14 @@ const App: React.FC = () => {
 
     liveRefreshInFlightRef.current = true;
     try {
-      const [loadedProducts, loadedOrders] = await Promise.all([
+      const [loadedProducts, loadedOrders, loadedDeliverySettings] = await Promise.all([
         getProducts(),
         getOrders(),
+        getDeliverySettings(),
       ]);
       setProducts(loadedProducts);
       setOrders(loadedOrders);
+      setDeliverySettings(loadedDeliverySettings);
     } catch (error) {
       console.error('Error refreshing live data:', error);
     } finally {
@@ -689,11 +691,13 @@ const App: React.FC = () => {
     const loadData = async () => {
       setIsLoading(true);
       try {
-        const [loadedProducts, loadedOrders] = await Promise.all([
+        const [loadedProducts, loadedOrders, loadedDeliverySettings] = await Promise.all([
           getProducts(),
-          getOrders()
+          getOrders(),
+          getDeliverySettings()
         ]);
-        
+        setDeliverySettings(loadedDeliverySettings);
+
         // If no products in database, initialize with default products
         if (loadedProducts.length === 0) {
           // Save initial products to database
@@ -735,6 +739,9 @@ const App: React.FC = () => {
         void refreshLiveState();
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'order_items' }, () => {
+        void refreshLiveState();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'store_settings' }, () => {
         void refreshLiveState();
       })
       .subscribe((status) => {
@@ -1087,7 +1094,7 @@ const App: React.FC = () => {
   }, [view, filteredProducts]);
 
   const cartTotal = cart.reduce((acc, item) => acc + item.price * item.quantity, 0);
-  const checkoutTotal = cart.length > 0 ? cartTotal + DELIVERY_FEE : 0;
+  const checkoutTotal = cart.length > 0 ? cartTotal + computeDeliveryFee(cartTotal, deliverySettings) : 0;
 
   const addToCart = async (product: Product, size: string, quantityToAdd: number = 1): Promise<boolean> => {
     const requestedQty = Math.max(1, Math.floor(Number(quantityToAdd || 1)));
@@ -2223,6 +2230,8 @@ const App: React.FC = () => {
           setProducts={setProducts}
           setOrders={setOrders}
           syncProductToDatabase={syncProductToDatabase}
+          deliverySettings={deliverySettings}
+          setDeliverySettings={setDeliverySettings}
         />}
         {view === 'cart' && <CartView
           cart={cart}
@@ -2231,6 +2240,7 @@ const App: React.FC = () => {
           removeFromCart={removeFromCart}
           getRemainingMs={getRemainingMs}
           formatRemaining={formatRemaining}
+          deliverySettings={deliverySettings}
         />}
         {view === 'checkout' && <CheckoutView
           cart={cart}
@@ -2240,6 +2250,7 @@ const App: React.FC = () => {
           setProducts={setProducts}
           setView={setView}
           syncOrderToDatabase={syncOrderToDatabase}
+          deliverySettings={deliverySettings}
         />}
       </main>
       <Footer />
@@ -2291,6 +2302,8 @@ interface AdminPanelProps {
   setProducts: React.Dispatch<React.SetStateAction<Product[]>>;
   setOrders: React.Dispatch<React.SetStateAction<Order[]>>;
   syncProductToDatabase: (product: Product) => Promise<void>;
+  deliverySettings: DeliverySettings;
+  setDeliverySettings: React.Dispatch<React.SetStateAction<DeliverySettings>>;
 }
 
 interface CheckoutViewProps {
@@ -2301,6 +2314,7 @@ interface CheckoutViewProps {
   setProducts: React.Dispatch<React.SetStateAction<Product[]>>;
   setView: React.Dispatch<React.SetStateAction<View>>;
   syncOrderToDatabase: (order: Order) => Promise<void>;
+  deliverySettings: DeliverySettings;
 }
 
 interface CartViewProps {
@@ -2310,9 +2324,10 @@ interface CartViewProps {
   removeFromCart: (productId: string, size: string) => Promise<void>;
   getRemainingMs: (item: CartItem, nowMs: number) => number;
   formatRemaining: (ms: number) => string;
+  deliverySettings: DeliverySettings;
 }
 
-function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProducts, setOrders, syncProductToDatabase }: AdminPanelProps) {
+function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProducts, setOrders, syncProductToDatabase, deliverySettings, setDeliverySettings }: AdminPanelProps) {
   type InventorySection = 'All' | Category | 'ComingSoon';
   type AdminTab = 'orders' | 'add' | 'inventory' | 'financials' | 'theme' | 'tags';
   type BulkRowDraft = {
@@ -2379,6 +2394,15 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
   const importFileRef = useRef<HTMLInputElement>(null);
   const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
   const [ordersActionError, setOrdersActionError] = useState<string | null>(null);
+  const [isDeliverySettingsOpen, setIsDeliverySettingsOpen] = useState(false);
+  const [deliveryFeeDraft, setDeliveryFeeDraft] = useState('5');
+  const [freeDeliveryMode, setFreeDeliveryMode] = useState<'off' | 'threshold' | 'always'>('off');
+  const [freeDeliveryThresholdDraft, setFreeDeliveryThresholdDraft] = useState('80');
+  const [isSavingDeliverySettings, setIsSavingDeliverySettings] = useState(false);
+  const [isEditingOrder, setIsEditingOrder] = useState(false);
+  const [removingItemKey, setRemovingItemKey] = useState<string | null>(null);
+  const [orderDeliveryFeeDraft, setOrderDeliveryFeeDraft] = useState('');
+  const [isSavingOrderDelivery, setIsSavingOrderDelivery] = useState(false);
   const [importPreviewRows, setImportPreviewRows] = useState<ImportPreviewRow[]>([]);
   const [importErrors, setImportErrors] = useState<string[]>([]);
   const [importSummary, setImportSummary] = useState<ImportSummary | null>(null);
@@ -2793,10 +2817,116 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
     [orders, selectedOrderId]
   );
 
+  const selectedOrderItemsSubtotal = useMemo(
+    () => (selectedOrder ? selectedOrder.items.reduce((acc, item) => acc + Math.max(0, Number(item.quantity || 0)) * Math.max(0, Number(item.price || 0)), 0) : 0),
+    [selectedOrder]
+  );
+  // Orders saved before the delivery_fee column existed derive their fee from total - items.
+  const selectedOrderDeliveryFee = selectedOrder
+    ? Math.max(0, selectedOrder.deliveryFee ?? (Number(selectedOrder.total || 0) - selectedOrderItemsSubtotal))
+    : 0;
+
+  useEffect(() => {
+    setIsEditingOrder(false);
+    setRemovingItemKey(null);
+  }, [selectedOrderId]);
+
+  const refreshOrdersAfterEdit = async () => {
+    const [refreshedOrders, refreshedProducts] = await Promise.all([getOrders(), getProducts()]);
+    setOrders(refreshedOrders);
+    setProducts(refreshedProducts);
+  };
+
+  const handleRemoveOrderItem = async (item: Order['items'][number]) => {
+    if (!selectedOrder) return;
+    if (!confirm(`Remove ${item.productName} (size ${item.size}) from this order? The stock will be restored.`)) return;
+
+    setOrdersActionError(null);
+    setRemovingItemKey(`${item.productId}::${item.size}`);
+    try {
+      await adminRemoveOrderItem(selectedOrder.id, item.productId, item.size);
+      await refreshOrdersAfterEdit();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to remove the item from this order.';
+      setOrdersActionError(message);
+    } finally {
+      setRemovingItemKey(null);
+    }
+  };
+
+  const handleSetOrderDeliveryFee = async (fee: number) => {
+    if (!selectedOrder) return;
+    if (!Number.isFinite(fee) || fee < 0) {
+      setOrdersActionError('Delivery fee must be 0 or more.');
+      return;
+    }
+
+    setOrdersActionError(null);
+    setIsSavingOrderDelivery(true);
+    try {
+      await adminSetOrderDeliveryFee(selectedOrder.id, fee);
+      await refreshOrdersAfterEdit();
+      setOrderDeliveryFeeDraft(String(fee));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to update the delivery fee.';
+      setOrdersActionError(message);
+    } finally {
+      setIsSavingOrderDelivery(false);
+    }
+  };
+
+  const openDeliverySettings = () => {
+    setDeliveryFeeDraft(String(deliverySettings.deliveryFee));
+    if (deliverySettings.freeDeliveryThreshold === null) {
+      setFreeDeliveryMode('off');
+    } else if (deliverySettings.freeDeliveryThreshold === 0) {
+      setFreeDeliveryMode('always');
+    } else {
+      setFreeDeliveryMode('threshold');
+      setFreeDeliveryThresholdDraft(String(deliverySettings.freeDeliveryThreshold));
+    }
+    setIsDeliverySettingsOpen(true);
+  };
+
+  const handleSaveDeliverySettings = async () => {
+    setOrdersActionError(null);
+
+    const fee = Number(deliveryFeeDraft);
+    if (!Number.isFinite(fee) || fee < 0) {
+      setOrdersActionError('Delivery fee must be 0 or more.');
+      return;
+    }
+
+    let threshold: number | null = null;
+    if (freeDeliveryMode === 'always') threshold = 0;
+    if (freeDeliveryMode === 'threshold') {
+      const parsed = Number(freeDeliveryThresholdDraft);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        setOrdersActionError('The free delivery amount must be more than $0.');
+        return;
+      }
+      threshold = parsed;
+    }
+
+    setIsSavingDeliverySettings(true);
+    try {
+      const savedSettings = await saveDeliverySettings({ deliveryFee: fee, freeDeliveryThreshold: threshold });
+      setDeliverySettings(savedSettings);
+      setIsDeliverySettingsOpen(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to save delivery settings.';
+      setOrdersActionError(message);
+    } finally {
+      setIsSavingDeliverySettings(false);
+    }
+  };
+
   useEffect(() => {
     if (activeTab !== 'orders') {
       setSelectedOrderId(null);
       setOrdersActionError(null);
+      setIsDeliverySettingsOpen(false);
+      setIsEditingOrder(false);
     }
     if (activeTab !== 'inventory') {
       setIsImportPanelOpen(false);
@@ -4490,6 +4620,87 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
             </div>
           )}
 
+          <div className="bg-white border rounded-2xl p-4 md:p-5">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+              <div>
+                <p className="text-[10px] font-bold uppercase text-gray-500">Delivery Pricing</p>
+                <p className="text-sm font-black uppercase text-gray-900">
+                  {deliverySettings.freeDeliveryThreshold === 0
+                    ? 'Free delivery on all orders'
+                    : deliverySettings.freeDeliveryThreshold !== null
+                      ? `$${deliverySettings.deliveryFee.toFixed(2)} fee · Free at $${deliverySettings.freeDeliveryThreshold.toFixed(2)}+`
+                      : `$${deliverySettings.deliveryFee.toFixed(2)} fee · No free delivery offer`}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => (isDeliverySettingsOpen ? setIsDeliverySettingsOpen(false) : openDeliverySettings())}
+                className="px-4 py-2 rounded-lg bg-gray-900 text-white text-[11px] font-black uppercase tracking-widest hover:bg-orange-600 transition-all flex items-center gap-2 self-start sm:self-auto"
+              >
+                <Truck size={14} /> {isDeliverySettingsOpen ? 'Close' : 'Delivery Settings'}
+              </button>
+            </div>
+
+            {isDeliverySettingsOpen && (
+              <div className="mt-4 pt-4 border-t border-dashed grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="text-[9px] font-black text-gray-400 uppercase tracking-widest">Delivery Fee ($)</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.5"
+                    value={deliveryFeeDraft}
+                    onChange={(e) => setDeliveryFeeDraft(e.target.value)}
+                    className="w-full p-3 bg-gray-50 border rounded-xl font-bold text-sm outline-none focus:ring-2 focus:ring-orange-500"
+                  />
+                  <p className="text-[10px] text-gray-400 font-bold">Charged at checkout unless the order qualifies for free delivery.</p>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[9px] font-black text-gray-400 uppercase tracking-widest">Free Delivery Offer</label>
+                  <div className="flex flex-wrap gap-2">
+                    {([
+                      { key: 'off', label: 'Off' },
+                      { key: 'threshold', label: 'Orders Above...' },
+                      { key: 'always', label: 'Always Free' },
+                    ] as const).map((option) => (
+                      <button
+                        key={option.key}
+                        type="button"
+                        onClick={() => setFreeDeliveryMode(option.key)}
+                        className={`px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest border transition-all ${freeDeliveryMode === option.key ? 'bg-orange-600 text-white border-orange-600' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'}`}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                  {freeDeliveryMode === 'threshold' && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] text-gray-500 font-black uppercase whitespace-nowrap">Free when items total is at least $</span>
+                      <input
+                        type="number"
+                        min="1"
+                        step="1"
+                        value={freeDeliveryThresholdDraft}
+                        onChange={(e) => setFreeDeliveryThresholdDraft(e.target.value)}
+                        className="w-28 p-2.5 bg-gray-50 border rounded-xl font-bold text-sm outline-none focus:ring-2 focus:ring-orange-500"
+                      />
+                    </div>
+                  )}
+                </div>
+                <div className="md:col-span-2 flex justify-end">
+                  <button
+                    type="button"
+                    disabled={isSavingDeliverySettings}
+                    onClick={() => void handleSaveDeliverySettings()}
+                    className="px-6 py-3 rounded-2xl bg-orange-600 text-white text-[11px] font-black uppercase tracking-widest hover:bg-orange-700 transition-all shadow-xl shadow-orange-600/20 disabled:opacity-60"
+                  >
+                    {isSavingDeliverySettings ? 'Saving...' : 'Save Delivery Settings'}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
           {isLoading ? (
             <div className="text-center py-16 bg-white rounded-2xl border border-dashed text-gray-400 font-black uppercase tracking-[0.2em] text-sm">
               Loading orders...
@@ -4505,13 +4716,28 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
                   <p className="text-[10px] font-bold uppercase text-gray-500">Order Details</p>
                   <h3 className="text-lg font-black uppercase text-gray-900">{selectedOrder.customerName}</h3>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setSelectedOrderId(null)}
-                  className="px-4 py-2 rounded-lg border border-gray-200 text-gray-700 text-[11px] font-black uppercase hover:bg-gray-50"
-                >
-                  Back to Orders
-                </button>
+                <div className="flex items-center gap-2">
+                  {normalizeOrderStatus(selectedOrder.status) === 'pending' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setOrdersActionError(null);
+                        setOrderDeliveryFeeDraft(String(selectedOrderDeliveryFee));
+                        setIsEditingOrder((prev) => !prev);
+                      }}
+                      className={`px-4 py-2 rounded-lg text-[11px] font-black uppercase flex items-center gap-2 transition-all ${isEditingOrder ? 'bg-gray-900 text-white hover:bg-gray-700' : 'bg-orange-600 text-white hover:bg-orange-700'}`}
+                    >
+                      <Edit2 size={12} /> {isEditingOrder ? 'Done Editing' : 'Edit Order'}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setSelectedOrderId(null)}
+                    className="px-4 py-2 rounded-lg border border-gray-200 text-gray-700 text-[11px] font-black uppercase hover:bg-gray-50"
+                  >
+                    Back to Orders
+                  </button>
+                </div>
               </div>
 
               <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-6">
@@ -4563,6 +4789,7 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
                             <th className="p-3">Size</th>
                             <th className="p-3">Qty</th>
                             <th className="p-3">Price</th>
+                            {isEditingOrder && normalizeOrderStatus(selectedOrder.status) === 'pending' && <th className="p-3 text-right">Remove</th>}
                           </tr>
                         </thead>
                         <tbody className="divide-y">
@@ -4573,6 +4800,19 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
                               <td className="p-3 text-gray-600">{item.size}</td>
                               <td className="p-3 text-gray-600">{item.quantity}</td>
                               <td className="p-3 text-gray-600">${Number(item.price || 0).toFixed(2)}</td>
+                              {isEditingOrder && normalizeOrderStatus(selectedOrder.status) === 'pending' && (
+                                <td className="p-3 text-right">
+                                  <button
+                                    type="button"
+                                    disabled={selectedOrder.items.length <= 1 || removingItemKey !== null}
+                                    title={selectedOrder.items.length <= 1 ? 'An order must keep at least one item. Cancel the order instead.' : 'Remove this item and restore its stock'}
+                                    onClick={() => void handleRemoveOrderItem(item)}
+                                    className={`p-2 rounded-lg transition-all ${selectedOrder.items.length <= 1 || removingItemKey !== null ? 'bg-gray-100 text-gray-300 cursor-not-allowed' : 'bg-red-50 text-red-600 hover:bg-red-600 hover:text-white'}`}
+                                  >
+                                    {removingItemKey === `${item.productId}::${item.size}` ? <span className="text-[9px] font-black uppercase px-1">...</span> : <Trash2 size={14} />}
+                                  </button>
+                                </td>
+                              )}
                             </tr>
                           ))}
                         </tbody>
@@ -4582,10 +4822,71 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
                 </div>
 
                 <div className="space-y-4">
-                  <div className="bg-black text-white p-4 rounded-2xl">
-                    <p className="text-[9px] text-orange-500 font-black uppercase tracking-widest mb-1 italic">Settlement Total</p>
-                    <p className="text-2xl font-black italic tracking-tighter text-white">${selectedOrder.total.toFixed(2)}</p>
+                  <div className="bg-black text-white p-4 rounded-2xl space-y-2">
+                    <div className="flex justify-between text-[10px] font-bold text-gray-400 uppercase tracking-widest">
+                      <span>Items</span>
+                      <span className="text-white">${selectedOrderItemsSubtotal.toFixed(2)}</span>
+                    </div>
+                    <div className="flex justify-between text-[10px] font-bold text-gray-400 uppercase tracking-widest">
+                      <span>Delivery</span>
+                      <span className={selectedOrderDeliveryFee === 0 ? 'text-emerald-400 font-black' : 'text-white'}>
+                        {selectedOrderDeliveryFee === 0 ? 'FREE' : `$${selectedOrderDeliveryFee.toFixed(2)}`}
+                      </span>
+                    </div>
+                    <div className="pt-2 border-t border-white/10">
+                      <p className="text-[9px] text-orange-500 font-black uppercase tracking-widest mb-1 italic">Settlement Total</p>
+                      <p className="text-2xl font-black italic tracking-tighter text-white">${selectedOrder.total.toFixed(2)}</p>
+                    </div>
                   </div>
+                  {isEditingOrder && normalizeOrderStatus(selectedOrder.status) === 'pending' && (
+                    <div className="bg-white border rounded-2xl p-4 space-y-3">
+                      <p className="text-[10px] font-bold uppercase text-gray-500">Edit Delivery</p>
+                      <div className="grid grid-cols-1 gap-2">
+                        <button
+                          type="button"
+                          disabled={isSavingOrderDelivery || selectedOrderDeliveryFee === 0}
+                          onClick={() => void handleSetOrderDeliveryFee(0)}
+                          className={`px-4 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest border transition-all ${selectedOrderDeliveryFee === 0 ? 'bg-emerald-50 text-emerald-600 border-emerald-200 cursor-not-allowed' : 'bg-white text-gray-700 border-gray-200 hover:bg-emerald-50 hover:text-emerald-600 hover:border-emerald-200'}`}
+                        >
+                          No Delivery / Hand Over ($0)
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isSavingOrderDelivery || selectedOrderDeliveryFee === deliverySettings.deliveryFee}
+                          onClick={() => void handleSetOrderDeliveryFee(deliverySettings.deliveryFee)}
+                          className={`px-4 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest border transition-all ${selectedOrderDeliveryFee === deliverySettings.deliveryFee ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed' : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50'}`}
+                        >
+                          Standard Delivery (${deliverySettings.deliveryFee.toFixed(2)})
+                        </button>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.5"
+                            value={orderDeliveryFeeDraft}
+                            onChange={(e) => setOrderDeliveryFeeDraft(e.target.value)}
+                            className="flex-1 min-w-0 p-2.5 bg-gray-50 border rounded-xl font-bold text-sm outline-none focus:ring-2 focus:ring-orange-500"
+                            placeholder="Custom fee"
+                          />
+                          <button
+                            type="button"
+                            disabled={isSavingOrderDelivery}
+                            onClick={() => {
+                              if (orderDeliveryFeeDraft.trim() === '') {
+                                setOrdersActionError('Enter a delivery fee amount first.');
+                                return;
+                              }
+                              void handleSetOrderDeliveryFee(Number(orderDeliveryFeeDraft));
+                            }}
+                            className="px-4 py-2.5 rounded-xl bg-gray-900 text-white text-[10px] font-black uppercase tracking-widest hover:bg-orange-600 transition-all disabled:opacity-60"
+                          >
+                            {isSavingOrderDelivery ? '...' : 'Apply'}
+                          </button>
+                        </div>
+                      </div>
+                      <p className="text-[10px] text-gray-400 font-bold">The order total updates automatically.</p>
+                    </div>
+                  )}
                   <div className="flex flex-col gap-2">
                     <button
                       type="button"
@@ -4775,9 +5076,10 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
   );
 }
 
-function CheckoutView({ cart, setCart, setCartNotice, setOrders, setProducts, setView, syncOrderToDatabase }: CheckoutViewProps) {
+function CheckoutView({ cart, setCart, setCartNotice, setOrders, setProducts, setView, syncOrderToDatabase, deliverySettings }: CheckoutViewProps) {
   const cartTotal = cart.reduce((acc, item) => acc + item.price * item.quantity, 0);
-  const checkoutTotal = cart.length > 0 ? cartTotal + DELIVERY_FEE : 0;
+  const deliveryFee = cart.length > 0 ? computeDeliveryFee(cartTotal, deliverySettings) : 0;
+  const checkoutTotal = cart.length > 0 ? cartTotal + deliveryFee : 0;
   const [gov, setGov] = useState('');
   const [dist, setDist] = useState('');
   const [vill, setVill] = useState('');
@@ -4837,6 +5139,7 @@ function CheckoutView({ cart, setCart, setCartNotice, setOrders, setProducts, se
       addressDetails: fd.get('address') as string,
       items: checkoutItems.map(i => ({ productId: i.Product_ID, productName: i.productName || i.name, quantity: i.quantity, size: i.selectedSize, price: i.price, reservationId: i.reservationId })),
       total: checkoutTotal,
+      deliveryFee,
       status: 'pending',
       date: new Date().toISOString()
     };
@@ -4915,8 +5218,13 @@ function CheckoutView({ cart, setCart, setCartNotice, setOrders, setProducts, se
             </div>
             <div className="flex justify-between text-[11px] font-bold text-gray-500 uppercase tracking-widest">
               <span>Delivery</span>
-              <span>${DELIVERY_FEE.toFixed(2)}</span>
+              <span>{deliveryFee === 0 ? <span className="text-emerald-600 font-black">Free</span> : `$${deliveryFee.toFixed(2)}`}</span>
             </div>
+            {deliveryFee > 0 && deliverySettings.freeDeliveryThreshold !== null && cartTotal < deliverySettings.freeDeliveryThreshold && (
+              <div className="text-[10px] font-bold text-emerald-600 uppercase tracking-widest text-right">
+                Add ${(deliverySettings.freeDeliveryThreshold - cartTotal).toFixed(2)} more for free delivery
+              </div>
+            )}
             <div className="flex justify-between pt-2 border-t border-gray-200">
               <p className="text-[10px] text-gray-400 font-black uppercase tracking-widest">Grand Total</p>
               <p className="text-2xl font-black text-black italic tracking-tighter">${checkoutTotal.toFixed(2)}</p>
@@ -4932,9 +5240,10 @@ function CheckoutView({ cart, setCart, setCartNotice, setOrders, setProducts, se
   );
 }
 
-function CartView({ cart, setView, cartNotice, removeFromCart, getRemainingMs, formatRemaining }: CartViewProps) {
+function CartView({ cart, setView, cartNotice, removeFromCart, getRemainingMs, formatRemaining, deliverySettings }: CartViewProps) {
   const cartTotal = cart.reduce((acc, item) => acc + item.price * item.quantity, 0);
-  const checkoutTotal = cart.length > 0 ? cartTotal + DELIVERY_FEE : 0;
+  const deliveryFee = cart.length > 0 ? computeDeliveryFee(cartTotal, deliverySettings) : 0;
+  const checkoutTotal = cart.length > 0 ? cartTotal + deliveryFee : 0;
   const [nowMs, setNowMs] = useState<number>(Date.now());
 
   useEffect(() => {
@@ -5004,8 +5313,13 @@ function CartView({ cart, setView, cartNotice, removeFromCart, getRemainingMs, f
              </div>
              <div className="flex justify-between font-bold text-gray-400 uppercase text-[11px] tracking-widest">
                <span>Delivery</span>
-               <span className="text-white">${DELIVERY_FEE.toFixed(2)}</span>
+               <span className={deliveryFee === 0 ? 'text-emerald-400 font-black' : 'text-white'}>{deliveryFee === 0 ? 'FREE' : `$${deliveryFee.toFixed(2)}`}</span>
              </div>
+             {deliveryFee > 0 && deliverySettings.freeDeliveryThreshold !== null && cartTotal < deliverySettings.freeDeliveryThreshold && (
+               <div className="text-[10px] font-bold text-emerald-400 uppercase tracking-widest text-right">
+                 Add ${(deliverySettings.freeDeliveryThreshold - cartTotal).toFixed(2)} more for free delivery
+               </div>
+             )}
              <div className="pt-10 border-t border-white/10 flex justify-between items-end">
                <div>
                  <span className="text-[10px] text-gray-500 font-black uppercase block mb-2 italic">Grand Total Acquisition</span>

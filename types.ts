@@ -56,8 +56,18 @@ export interface Order {
   addressDetails: string;
   items: { productId: string; productName: string; quantity: number; size: string; price: number; reservationId?: string }[];
   total: number;
+  /** Delivery charge included in total; 0 = free/hand delivery. Absent on orders saved before the fee became editable. */
+  deliveryFee?: number;
   status: 'pending' | 'dispatched' | 'delivered' | 'canceled';
   date: string;
+}
+
+/** Store-wide delivery pricing, editable from the admin panel (store_settings table). */
+export interface DeliverySettings {
+  /** Standard delivery charge applied at checkout. */
+  deliveryFee: number;
+  /** Items subtotal at/above which delivery is free. null = promo off, 0 = always free. */
+  freeDeliveryThreshold: number | null;
 }
 
 export interface CartItem extends Product {
