@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useMemo, useRef, useCallback, useDeferredValue } from 'react';
-import { ShoppingBag, User, Search, Filter, Trash2, Plus, LogOut, ChevronRight, CheckCircle, Package, BarChart3, Menu, X, Star, ExternalLink, Edit2, Upload, Download, Phone, MapPin, Truck, Check, Mail, List, Layers, Info, Palette, MessageCircle, Tag as TagIcon } from 'lucide-react';
+import { ShoppingBag, User, Search, Filter, Trash2, Plus, LogOut, ChevronRight, ArrowLeft, CheckCircle, Package, BarChart3, Menu, X, Star, ExternalLink, Edit2, Upload, Download, Phone, MapPin, Truck, Check, Mail, List, Layers, Info, Palette, MessageCircle, Tag as TagIcon } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { Category, Product, ProductGender, ProductSizeStock, Order, CartItem, DeliverySettings, FinancialMetric, FinancialTotals, View, Tag } from './types';
 import { INITIAL_PRODUCTS, ADMIN_CREDENTIALS, ADMIN_USER, ADMIN_PASS, LEBANON_LOCATIONS, SIZE_OPTIONS } from './constants';
@@ -1892,6 +1892,13 @@ const App: React.FC = () => {
         
         {view === 'product' && (
           <div className="max-w-7xl mx-auto px-4 py-10 md:py-14 animate-fade-in-up">
+            <button
+              type="button"
+              onClick={() => { setView(productPageReturnView); setSelectedProductId(null); window.scrollTo(0, 0); }}
+              className="sticky top-20 md:top-24 z-30 inline-flex items-center gap-2 mb-6 px-4 py-2.5 rounded-full bg-white border border-gray-200 shadow-lg font-black uppercase tracking-widest text-[10px] text-gray-700 hover:border-black hover:text-black hover:-translate-x-0.5 transition-all"
+            >
+              <ArrowLeft size={14} /> Back
+            </button>
             {isLoading && !activeProduct ? (
               <div className="bg-white rounded-3xl border border-gray-100 p-10 text-center shadow-xl">
                 <h2 className="text-xl font-black uppercase italic tracking-tighter text-black mb-2">Loading product</h2>
@@ -2062,7 +2069,6 @@ const App: React.FC = () => {
                   )}
 
                   <div className="flex gap-3">
-                    <button type="button" onClick={() => { setView(productPageReturnView); setSelectedProductId(null); window.scrollTo(0, 0); }} className="px-5 py-3 rounded-full border border-gray-200 font-black uppercase tracking-widest text-[10px] text-gray-600 hover:border-black hover:text-black transition-colors">Back</button>
                     <button type="button" disabled={!productDetailSelectedSize || getSizeStock(activeProduct, productDetailSelectedSize) <= 0 || !isProductPurchasableForCustomer(activeProduct)} onClick={async () => {
                       if (!productDetailSelectedSize) return;
                       const addedQuantity = productDetailQuantity;
