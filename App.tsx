@@ -1114,7 +1114,7 @@ const App: React.FC = () => {
       return false;
     }
     if (liveAvailabilityState === 'reserved') {
-      alert('This product is currently reserved by another customer.');
+      alert('This product is currently reserved.');
       return false;
     }
     if (liveAvailabilityState !== 'available') {
@@ -1131,7 +1131,7 @@ const App: React.FC = () => {
     if (liveSizeStock <= 0) {
       const sizeCommittedAvailable = getCommittedAvailableForSize(liveProduct, size);
       if (sizeCommittedAvailable > 0) {
-        alert('This product is currently reserved by another customer.');
+        alert('This product is currently reserved.');
         return false;
       }
       alert('That size is currently out of stock!');
@@ -1993,7 +1993,7 @@ const App: React.FC = () => {
                       if (availabilityState === 'reserved') {
                         return (
                           <p className="mt-3 text-[10px] font-black uppercase tracking-[0.18em] text-amber-600">
-                            This product is currently reserved by another customer.
+                            This product is currently reserved.
                           </p>
                         );
                       }
