@@ -842,6 +842,12 @@ const App: React.FC = () => {
   }, [cartNotice]);
 
   useEffect(() => {
+    if (productDetailAddedNotice.trim() === '') return;
+    const timeout = window.setTimeout(() => setProductDetailAddedNotice(''), 2600);
+    return () => window.clearTimeout(timeout);
+  }, [productDetailAddedNotice]);
+
+  useEffect(() => {
     if (products.length === 0 || cart.length === 0) return;
 
     const productById = new Map(products.map((product) => [product.Product_ID, product]));
@@ -1038,12 +1044,15 @@ const App: React.FC = () => {
   const [productDetailSelectedSize, setProductDetailSelectedSize] = useState('');
   const [productDetailSelectedImageIndex, setProductDetailSelectedImageIndex] = useState(0);
   const [productDetailQuantity, setProductDetailQuantity] = useState(1);
+  const [productDetailAddedNotice, setProductDetailAddedNotice] = useState('');
+  const [productPageReturnView, setProductPageReturnView] = useState<View>('home');
   const productGalleryManualPauseUntilRef = useRef<number>(0);
 
   useEffect(() => {
     setProductDetailSelectedSize('');
     setProductDetailSelectedImageIndex(0);
     setProductDetailQuantity(1);
+    setProductDetailAddedNotice('');
     productGalleryManualPauseUntilRef.current = 0;
   }, [selectedProductId]);
 
@@ -1215,6 +1224,11 @@ const App: React.FC = () => {
   };
 
   const openProductPage = (product: Product) => {
+    // Remember where the shopper came from (home, shop, ...) so the product page's Back
+    // button returns them there instead of always landing on the shop grid. Opening a
+    // product from within another product page (e.g. a "related" list) keeps the original
+    // origin rather than overwriting it with 'product'.
+    setProductPageReturnView((prevReturnView) => (view === 'product' ? prevReturnView : view));
     setSelectedProductId(product.Product_ID);
     setView('product');
     window.scrollTo(0, 0);
@@ -1887,7 +1901,7 @@ const App: React.FC = () => {
               <div className="bg-white rounded-3xl border border-dashed border-gray-200 p-10 text-center">
                 <h2 className="text-xl font-black uppercase italic tracking-tighter text-black mb-2">Product not found</h2>
                 <p className="text-gray-500 font-semibold text-sm mb-6">The product may have been removed or the link is invalid.</p>
-                <button onClick={() => { setView('shop'); window.scrollTo(0, 0); }} className="bg-black text-white px-6 py-3 rounded-full font-black uppercase tracking-widest text-xs">Back to Shop</button>
+                <button onClick={() => { setView(productPageReturnView); setSelectedProductId(null); window.scrollTo(0, 0); }} className="bg-black text-white px-6 py-3 rounded-full font-black uppercase tracking-widest text-xs">Back to Shop</button>
               </div>
             ) : (
               <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_0.9fr] gap-8 lg:gap-12">
@@ -2041,12 +2055,21 @@ const App: React.FC = () => {
                     </div>
                   </div>
 
+                  {productDetailAddedNotice && (
+                    <div className="flex items-center gap-2 px-4 py-3 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs font-black uppercase tracking-wider animate-fade-in-up">
+                      <Check size={16} /> {productDetailAddedNotice}
+                    </div>
+                  )}
+
                   <div className="flex gap-3">
-                    <button type="button" onClick={() => { setView('shop'); setSelectedProductId(null); window.scrollTo(0, 0); }} className="px-5 py-3 rounded-full border border-gray-200 font-black uppercase tracking-widest text-[10px] text-gray-600 hover:border-black hover:text-black transition-colors">Back</button>
+                    <button type="button" onClick={() => { setView(productPageReturnView); setSelectedProductId(null); window.scrollTo(0, 0); }} className="px-5 py-3 rounded-full border border-gray-200 font-black uppercase tracking-widest text-[10px] text-gray-600 hover:border-black hover:text-black transition-colors">Back</button>
                     <button type="button" disabled={!productDetailSelectedSize || getSizeStock(activeProduct, productDetailSelectedSize) <= 0 || !isProductPurchasableForCustomer(activeProduct)} onClick={async () => {
                       if (!productDetailSelectedSize) return;
+                      const addedQuantity = productDetailQuantity;
                       const added = await addToCart(activeProduct, productDetailSelectedSize, productDetailQuantity);
-                      if (added) setView('cart');
+                      if (added) {
+                        setProductDetailAddedNotice(`Added ${addedQuantity} × Size ${productDetailSelectedSize} to your bag`);
+                      }
                     }} className="flex-1 bg-orange-600 text-white font-black uppercase tracking-widest text-[10px] rounded-full px-5 py-3 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-orange-700 transition-colors">
                       Add {productDetailSelectedSize ? productDetailQuantity : ''} to Cart
                     </button>
