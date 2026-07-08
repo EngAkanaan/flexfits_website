@@ -842,12 +842,6 @@ const App: React.FC = () => {
   }, [cartNotice]);
 
   useEffect(() => {
-    if (productDetailAddedNotice.trim() === '') return;
-    const timeout = window.setTimeout(() => setProductDetailAddedNotice(''), 2600);
-    return () => window.clearTimeout(timeout);
-  }, [productDetailAddedNotice]);
-
-  useEffect(() => {
     if (products.length === 0 || cart.length === 0) return;
 
     const productById = new Map(products.map((product) => [product.Product_ID, product]));
@@ -1055,6 +1049,12 @@ const App: React.FC = () => {
     setProductDetailAddedNotice('');
     productGalleryManualPauseUntilRef.current = 0;
   }, [selectedProductId]);
+
+  useEffect(() => {
+    if (productDetailAddedNotice.trim() === '') return;
+    const timeout = window.setTimeout(() => setProductDetailAddedNotice(''), 2600);
+    return () => window.clearTimeout(timeout);
+  }, [productDetailAddedNotice]);
 
   useEffect(() => {
     if (view !== 'product' || !activeProduct || activeProductImages.length <= 1) return;
