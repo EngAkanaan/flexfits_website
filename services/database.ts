@@ -2086,6 +2086,9 @@ export async function saveOrder(order: Order): Promise<void> {
         delivery_fee: Math.max(0, Number(order.deliveryFee ?? 0)),
         status: persistOrderStatusForDatabase(order.status),
         date: order.date,
+        // Binds the order to this checkout's reservation session so only the shopper who
+        // created it can trigger cleanup_failed_checkout_order for it (see migration 023).
+        reservation_session_id: getReservationSessionId(),
       });
 
     if (orderError) throw orderError;
@@ -2150,7 +2153,10 @@ export async function saveOrder(order: Order): Promise<void> {
         // Orders are admin-only to DELETE directly once RLS is locked down (see migration 016),
         // so the rollback for a failed checkout goes through a narrow SECURITY DEFINER RPC that
         // only ever deletes a still-pending order by its own id.
-        const { error: cleanupError } = await supabase.rpc('cleanup_failed_checkout_order', { p_order_id: normalizedOrder.id });
+        const { error: cleanupError } = await supabase.rpc('cleanup_failed_checkout_order', {
+          p_order_id: normalizedOrder.id,
+          p_session_id: getReservationSessionId(),
+        });
         if (cleanupError) {
           console.warn('Unable to clean up failed checkout order:', cleanupError);
         }
