@@ -5,8 +5,6 @@ import { supabase } from './supabase';
 import { Product, ProductGender, ProductSizeStock, Order, DeliverySettings, FinancialMetric, FinancialTotals, StockReservation, Announcement, HeroSlide, HomepageSectionSetting, Tag } from '../types';
 
 const ADMIN_NOTIFICATION_EMAIL = 'flexfitslebanon@gmail.com';
-const EMAIL_WEBHOOK_URL = String(import.meta.env.VITE_EMAIL_WEBHOOK_URL || '').trim();
-const EMAIL_WEBHOOK_SECRET = String(import.meta.env.VITE_EMAIL_WEBHOOK_SECRET || '').trim();
 const SITE_URL = String(
   import.meta.env.VITE_SITE_URL ||
   (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000')
@@ -172,7 +170,10 @@ function applyLocalProductStockDelta(product: Product, size: string, quantityDel
 }
 
 function normalizeLocalProductStockFromReservations(products: Product[], reservations: Array<{ productId: string; size: string; quantity: number }>): Product[] {
-  const nextProducts = products.map((product) => ({ ...product, sizeStock: Array.isArray(product.sizeStock) ? product.sizeStock.map((entry) => ({ ...entry })) : product.sizeStock }));
+  const nextProducts: Product[] = products.map((product) => ({
+    ...product,
+    sizeStock: Array.isArray(product.sizeStock) ? product.sizeStock.map((entry) => ({ ...entry })) : product.sizeStock,
+  }));
   for (const reservation of reservations) {
     const productIndex = nextProducts.findIndex((item) => String(item.Product_ID || '').trim() === String(reservation.productId || '').trim());
     if (productIndex < 0) continue;
@@ -193,11 +194,6 @@ function escapeHtml(value: string): string {
 function redactSensitiveText(value: string): string {
   if (!value) return '';
   let safe = String(value);
-
-  if (EMAIL_WEBHOOK_SECRET) {
-    safe = safe.split(EMAIL_WEBHOOK_SECRET).join('[redacted]');
-  }
-
   safe = safe.replace(/(secret=)[^&\s]*/gi, '$1[redacted]');
   safe = safe.replace(/("secret"\s*:\s*")[^"]*(")/gi, '$1[redacted]$2');
   return safe;
@@ -426,8 +422,8 @@ function inferGenderFromRow(row: any): ProductGender {
     .filter(Boolean)
     .join(' ');
 
-  if (/(\bwomen\b|\bwoman\b|\bfemale\b|\bladies\b)/i.test(hintText)) return 'Women';
-  if (/(\bmen\b|\bman\b|\bmale\b|\bgents\b)/i.test(hintText)) return 'Men';
+  if (/\b(women|woman|female|ladies)\b/i.test(hintText)) return 'Women';
+  if (/\b(men|man|male|gents)\b/i.test(hintText)) return 'Men';
   if (/\bunisex\b/i.test(hintText)) return 'Unisex';
   return 'Unisex';
 }
@@ -535,7 +531,7 @@ async function getItemsWithProductImages(orderItems: Array<{ productId: string; 
 }
 
 async function sendEmailEvent(payload: {
-  event: 'order_created_admin' | 'order_received_customer' | 'order_dispatched_customer';
+  event: 'order_created_admin' | 'order_received_customer' | 'order_dispatched_customer' | 'order_canceled_customer';
   toEmail: string;
   subject: string;
   html: string;
@@ -544,61 +540,30 @@ async function sendEmailEvent(payload: {
 }): Promise<void> {
   const attemptId = `mail-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-  if (!EMAIL_WEBHOOK_URL) {
-    pushEmailLog({
-      id: attemptId,
-      ts: new Date().toISOString(),
-      event: payload.event,
-      toEmail: payload.toEmail,
-      subject: payload.subject,
-      orderId: payload.order.id,
-      status: 'failed',
-      stage: 'primary',
-      detail: 'Webhook URL is missing (VITE_EMAIL_WEBHOOK_URL).',
-    });
-    return;
-  }
-
-  const requestPayload = {
-    secret: EMAIL_WEBHOOK_SECRET,
-    event: payload.event,
-    toEmail: payload.toEmail,
-    subject: payload.subject,
-    html: payload.html,
-    siteUrl: SITE_URL,
-    adminEmail: ADMIN_NOTIFICATION_EMAIL,
-    order: payload.order,
-    items: payload.items,
-  };
-
-  const formBody = new URLSearchParams({
-    secret: String(requestPayload.secret || ''),
-    event: String(requestPayload.event || ''),
-    toEmail: String(requestPayload.toEmail || ''),
-    subject: String(requestPayload.subject || ''),
-    html: String(requestPayload.html || ''),
-    siteUrl: String(requestPayload.siteUrl || ''),
-    adminEmail: String(requestPayload.adminEmail || ''),
-    order: JSON.stringify(requestPayload.order || {}),
-    items: JSON.stringify(requestPayload.items || []),
-  });
-
   try {
-    const response = await fetch(EMAIL_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-      body: formBody.toString(),
-    });
-
-    const bodyText = await response.text();
-
-    if (!response.ok) {
-      throw new Error(`Form webhook responded ${response.status}: ${redactSensitiveText(bodyText).slice(0, 240)}`);
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (supabase && (payload.event === 'order_dispatched_customer' || payload.event === 'order_canceled_customer')) {
+      const { data } = await supabase.auth.getSession();
+      if (data.session?.access_token) {
+        headers.Authorization = `Bearer ${data.session.access_token}`;
+      }
     }
 
-    const classified = classifyWebhookResponse(bodyText);
-    if (!classified.success) {
-      throw new Error(classified.detail);
+    const response = await fetch('/api/send-order-email', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        event: payload.event,
+        orderId: payload.order.id,
+        checkoutSessionId:
+          payload.event === 'order_created_admin' || payload.event === 'order_received_customer'
+            ? getReservationSessionId()
+            : undefined,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Email relay responded ${response.status}`);
     }
 
     pushEmailLog({
@@ -610,70 +575,33 @@ async function sendEmailEvent(payload: {
       orderId: payload.order.id,
       status: 'success',
       stage: 'primary',
-      detail: classified.detail,
+      detail: 'Server email relay succeeded.',
     });
   } catch (error) {
-    const formError = redactSensitiveText(error instanceof Error ? error.message : String(error));
+    const relayError = redactSensitiveText(error instanceof Error ? error.message : String(error));
+    pushEmailLog({
+      id: attemptId,
+      ts: new Date().toISOString(),
+      event: payload.event,
+      toEmail: payload.toEmail,
+      subject: payload.subject,
+      orderId: payload.order.id,
+      status: 'failed',
+      stage: 'primary',
+      detail: relayError || 'Server email relay failed.',
+    });
+  }
+}
 
-    try {
-      if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-        const beaconPayload = JSON.stringify(requestPayload);
-        const beaconBlob = new Blob([beaconPayload], { type: 'text/plain;charset=utf-8' });
-        const queued = navigator.sendBeacon(EMAIL_WEBHOOK_URL, beaconBlob);
+export async function getCurrentUserIsAdmin(): Promise<boolean> {
+  if (!supabase) return false;
 
-        if (queued) {
-          pushEmailLog({
-            id: attemptId,
-            ts: new Date().toISOString(),
-            event: payload.event,
-            toEmail: payload.toEmail,
-            subject: payload.subject,
-            orderId: payload.order.id,
-            status: 'fallback-unknown',
-            stage: 'fallback',
-            detail: `Form request failed (${formError}); sendBeacon fallback queued (delivery cannot be verified by browser).`,
-          });
-          return;
-        }
-      }
-    } catch {
-      // Ignore beacon errors and continue to final fetch fallback.
-    }
-
-    try {
-      // no-cors is opaque; request may still succeed when strict CORS blocks readable responses.
-      await fetch(EMAIL_WEBHOOK_URL, {
-        method: 'POST',
-        mode: 'no-cors',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify(requestPayload),
-      });
-
-      pushEmailLog({
-        id: attemptId,
-        ts: new Date().toISOString(),
-        event: payload.event,
-        toEmail: payload.toEmail,
-        subject: payload.subject,
-        orderId: payload.order.id,
-        status: 'fallback-unknown',
-        stage: 'fallback',
-        detail: `Form request failed (${formError}); no-cors fallback sent (delivery cannot be verified by browser).`,
-      });
-    } catch (fallbackError) {
-      const noCorsError = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
-      pushEmailLog({
-        id: attemptId,
-        ts: new Date().toISOString(),
-        event: payload.event,
-        toEmail: payload.toEmail,
-        subject: payload.subject,
-        orderId: payload.order.id,
-        status: 'failed',
-        stage: 'fallback',
-        detail: `Form request failed (${formError}); no-cors fallback failed (${noCorsError}).`,
-      });
-    }
+  try {
+    const { data, error } = await supabase.rpc('is_admin');
+    if (error) return false;
+    return !!data;
+  } catch {
+    return false;
   }
 }
 
@@ -771,13 +699,32 @@ async function notifyCustomerOrderReceived(order: Order): Promise<void> {
 }
 
 function randomSessionToken(): string {
-  return `sess-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const cryptoApi = globalThis.crypto;
+  if (typeof cryptoApi?.randomUUID === 'function') {
+    return `sess-${cryptoApi.randomUUID()}`;
+  }
+
+  if (typeof cryptoApi?.getRandomValues === 'function') {
+    const bytes = new Uint8Array(24);
+    cryptoApi.getRandomValues(bytes);
+    return `sess-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+  }
+
+  return `sess-${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
 }
 
 export function getReservationSessionId(): string {
   try {
     const existing = String(localStorage.getItem(RESERVATION_SESSION_STORAGE_KEY) || '').trim();
-    if (existing) return existing;
+    if (existing.length >= 32) return existing;
+
+    // Session IDs generated before migration 024 were too short for its RLS policy and had
+    // weaker entropy. Their reservations cannot be transferred safely to a new token, so clear
+    // the associated cart once and let the shopper reserve those products again.
+    if (existing) {
+      localStorage.removeItem('flex_cart');
+    }
+
     const created = randomSessionToken();
     localStorage.setItem(RESERVATION_SESSION_STORAGE_KEY, created);
     return created;
@@ -840,11 +787,9 @@ export async function getSessionActiveReservations(sessionId: string = getReserv
 
   await cleanupExpiredReservations();
   const { data, error } = await supabase
-    .from('stock_reservations')
-    .select('*')
-    .eq('session_id', sessionId)
-    .eq('status', 'active')
-    .gt('expires_at', new Date().toISOString());
+    .rpc('get_session_active_reservations', {
+      p_session_id: sessionId,
+    });
 
   if (error) throw error;
 
@@ -1257,10 +1202,7 @@ async function subtractActiveReservationsFromProducts(products: Product[]): Prom
   if (!supabase || products.length === 0) return;
   try {
     const { data: reservationRows } = await supabase
-      .from('stock_reservations')
-      .select('product_id,size,quantity')
-      .eq('status', 'active')
-      .gt('expires_at', new Date().toISOString());
+      .rpc('get_active_stock_reservation_totals');
 
     const reservedByProductAndSize = new Map<string, number>();
     for (const row of reservationRows || []) {
@@ -2206,7 +2148,7 @@ export async function updateOrderStatus(
       if (normalizedStatus === 'canceled') {
         const savedProducts = localStorage.getItem('flex_products');
         const products: Product[] = savedProducts ? JSON.parse(savedProducts) : [];
-        const restoredProducts = products.map((product) => ({
+        const restoredProducts: Product[] = products.map((product) => ({
           ...product,
           sizeStock: Array.isArray(product.sizeStock) ? product.sizeStock.map((entry) => ({ ...entry })) : product.sizeStock,
         }));

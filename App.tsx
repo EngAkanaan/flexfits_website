@@ -3,9 +3,9 @@ import React, { useState, useEffect, useMemo, useRef, useCallback, useDeferredVa
 import { ShoppingBag, User, Search, Filter, Trash2, Plus, LogOut, ChevronRight, ArrowLeft, CheckCircle, Package, BarChart3, Menu, X, Star, ExternalLink, Edit2, Upload, Download, Phone, MapPin, Truck, Check, Mail, List, Layers, Info, Palette, MessageCircle, Tag as TagIcon } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { Category, Product, ProductGender, ProductSizeStock, Order, CartItem, DeliverySettings, FinancialMetric, FinancialTotals, View, Tag } from './types';
-import { INITIAL_PRODUCTS, ADMIN_CREDENTIALS, ADMIN_USER, ADMIN_PASS, LEBANON_LOCATIONS, SIZE_OPTIONS } from './constants';
+import { INITIAL_PRODUCTS, LEBANON_LOCATIONS, SIZE_OPTIONS } from './constants';
 import { getProductRecommendation } from './services/gemini';
-import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals, reserveCartLine, releaseCartLineReservation, cleanupExpiredReservations, extendExpiredReservation, getProductColorTokens, uploadProductImagesToStorage, normalizeOrderStatus, getTags, generateOrderId, getDeliverySettings, saveDeliverySettings, computeDeliveryFee, DEFAULT_DELIVERY_SETTINGS, adminRemoveOrderItem, adminSetOrderDeliveryFee } from './services/database';
+import { getProducts, saveProduct, deleteProduct, getOrders, saveOrder, updateOrderStatus, deleteOrder, recalculateFinancialMetrics, getFinancialDashboardTotals, reserveCartLine, releaseCartLineReservation, cleanupExpiredReservations, extendExpiredReservation, getProductColorTokens, uploadProductImagesToStorage, normalizeOrderStatus, getTags, generateOrderId, getDeliverySettings, saveDeliverySettings, computeDeliveryFee, DEFAULT_DELIVERY_SETTINGS, adminRemoveOrderItem, adminSetOrderDeliveryFee, getCurrentUserIsAdmin, getReservationSessionId } from './services/database';
 import { supabase } from './services/supabase';
 import AnnouncementBar from './components/AnnouncementBar';
 import HeroBannerSlider from './components/HeroBannerSlider';
@@ -18,7 +18,6 @@ const GENDER_OPTIONS: ProductGender[] = ['Men', 'Women', 'Unisex'];
 const NUMERIC_SIZE_FILTER_OPTIONS = Array.from({ length: 16 }, (_, i) => String(35 + i));
 const CLOTHING_SIZE_FILTER_OPTIONS = ['S', 'M', 'L', 'XL'];
 const CART_STORAGE_KEY = 'flex_cart';
-const ADMIN_AUTH_STORAGE_KEY = 'flex_admin_auth';
 
 function ColorTagInput({
   value,
@@ -109,6 +108,8 @@ function ColorTagInput({
 
 function getInitialCartState(): CartItem[] {
   try {
+    // Migrates pre-security-remediation session tokens before reading their now-invalid cart.
+    getReservationSessionId();
     const saved = localStorage.getItem(CART_STORAGE_KEY);
     if (!saved) return [];
     const parsed = JSON.parse(saved);
@@ -608,17 +609,7 @@ const App: React.FC = () => {
   const [orders, setOrders] = useState<Order[]>([]);
   const [deliverySettings, setDeliverySettings] = useState<DeliverySettings>(DEFAULT_DELIVERY_SETTINGS);
   const [cart, setCart] = useState<CartItem[]>(() => getInitialCartState());
-  const [isAdmin, setIsAdmin] = useState(() => {
-    // When Supabase is configured, real admin state comes from a Supabase Auth session
-    // (resolved asynchronously below) rather than this synchronous localStorage flag, which
-    // only backs the dev-only fallback login used when Supabase isn't configured at all.
-    if (supabase) return false;
-    try {
-      return localStorage.getItem(ADMIN_AUTH_STORAGE_KEY) === '1';
-    } catch {
-      return false;
-    }
-  });
+  const [isAdmin, setIsAdmin] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const deferredSearchQuery = useDeferredValue(searchQuery);
   const [filterCategory, setFilterCategory] = useState<Category | 'All'>('All');
@@ -755,19 +746,27 @@ const App: React.FC = () => {
     };
   }, [refreshLiveState]);
 
-  // Admin status is derived from a real Supabase Auth session (not just a client-side flag) so
-  // that RLS policies can actually trust it. Dev-only fallback (no Supabase configured) keeps
-  // using the hardcoded-credential flow inside AdminPanel's login screen below.
   useEffect(() => {
     if (!supabase) return;
     const client = supabase;
 
-    client.auth.getSession().then(({ data }) => {
-      setIsAdmin(!!data.session);
-    });
+    const syncAdminState = async () => {
+      const { data } = await client.auth.getSession();
+      if (!data.session) {
+        setIsAdmin(false);
+        return;
+      }
+      setIsAdmin(await getCurrentUserIsAdmin());
+    };
+
+    void syncAdminState();
 
     const { data: authListener } = client.auth.onAuthStateChange((_event, session) => {
-      setIsAdmin(!!session);
+      if (!session) {
+        setIsAdmin(false);
+        return;
+      }
+      void getCurrentUserIsAdmin().then(setIsAdmin).catch(() => setIsAdmin(false));
     });
 
     return () => {
@@ -819,21 +818,6 @@ const App: React.FC = () => {
       // Ignore storage issues to avoid interrupting cart flow.
     }
   }, [cart]);
-
-  useEffect(() => {
-    // Only the dev-only fallback (no Supabase configured) needs this; with Supabase configured,
-    // supabase-js already persists its own session, and isAdmin tracks that session directly.
-    if (supabase) return;
-    try {
-      if (isAdmin) {
-        localStorage.setItem(ADMIN_AUTH_STORAGE_KEY, '1');
-      } else {
-        localStorage.removeItem(ADMIN_AUTH_STORAGE_KEY);
-      }
-    } catch {
-      // Ignore storage errors to avoid interrupting admin flow.
-    }
-  }, [isAdmin]);
 
   useEffect(() => {
     if (cartNotice.trim() === '') return;
@@ -2983,21 +2967,25 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
       setLoginError('');
       setIsLoggingIn(true);
       try {
-        if (supabase) {
-          const { error } = await supabase.auth.signInWithPassword({ email: user.trim(), password: pass });
-          if (error) {
-            setLoginError('Access denied: incorrect email or password.');
-            return;
-          }
-          setIsAdmin(true);
-        } else {
-          // Dev-only fallback: used solely when Supabase isn't configured (local dev without
-          // env vars). The deployed site always has Supabase configured, so this branch never
-          // runs in production.
-          const isValidLogin = ADMIN_CREDENTIALS.some((credential) => credential.username === user && credential.password === pass);
-          if (isValidLogin) setIsAdmin(true);
-          else setLoginError('Access denied: incorrect credentials.');
+        if (!supabase) {
+          setLoginError('Admin login requires Supabase configuration.');
+          return;
         }
+
+        const { error } = await supabase.auth.signInWithPassword({ email: user.trim(), password: pass });
+        if (error) {
+          setLoginError('Access denied: incorrect email or password.');
+          return;
+        }
+
+        const isCurrentUserAdmin = await getCurrentUserIsAdmin();
+        if (!isCurrentUserAdmin) {
+          await supabase.auth.signOut();
+          setLoginError('Access denied: not authorized for admin access.');
+          return;
+        }
+
+        setIsAdmin(true);
       } finally {
         setIsLoggingIn(false);
       }
