@@ -2,6 +2,26 @@
 
 React/Vite storefront and Supabase-backed admin dashboard for products, checkout, stock reservations, orders, theme content, and financial reporting.
 
+## Features
+
+- Product catalog with search and filters
+- Cart and checkout with stock reservation
+- Admin inventory and order management
+- Dispatch approval with automatic stock updates
+- Financial metrics dashboard
+- Email notifications for admin and customers
+
+## Project Structure
+
+```
+database/        SQL schema, migrations, and security scripts
+api/             Vercel serverless functions (Gemini, order email)
+public/          Static assets
+services/        Data access and external service integrations
+App.tsx          Main application UI and flows
+types.ts         Shared TypeScript models
+```
+
 ## Local setup
 
 Requirements: Node.js 18+ and a Supabase project.
