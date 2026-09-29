@@ -25,36 +25,6 @@ Modern e-commerce storefront and admin dashboard for managing products, orders, 
 
 - Node.js 18+
 
-### Setup
-
-1. Clone the repository.
-2. Install dependencies:
-
-```bash
-npm install
-```
-
-3. Create `.env.local`:
-
-```env
-VITE_SUPABASE_URL=...
-VITE_SUPABASE_ANON_KEY=...
-VITE_EMAIL_WEBHOOK_URL=...
-VITE_EMAIL_WEBHOOK_SECRET=...
-VITE_SITE_URL=http://localhost:3000
-GEMINI_API_KEY=...
-```
-
-4. Apply the database schema in Supabase SQL Editor:
-
-- `database/schema.sql`
-
-5. Start development server:
-
-```bash
-npm run dev
-```
-
 ## Usage
 
 - Open the storefront to browse products and place orders.
