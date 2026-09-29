@@ -649,6 +649,12 @@ const App: React.FC = () => {
     lastTouchY: 0,
   });
   const [isLoading, setIsLoading] = useState(true);
+  const [isPasswordRecovery, setIsPasswordRecovery] = useState(false);
+  const [recoveryPassword, setRecoveryPassword] = useState('');
+  const [recoveryPasswordConfirm, setRecoveryPasswordConfirm] = useState('');
+  const [recoveryError, setRecoveryError] = useState('');
+  const [recoverySubmitting, setRecoverySubmitting] = useState(false);
+  const [recoverySuccess, setRecoverySuccess] = useState(false);
 
   const refreshLiveState = useCallback(async () => {
     if (liveRefreshInFlightRef.current) {
@@ -658,10 +664,10 @@ const App: React.FC = () => {
 
     liveRefreshInFlightRef.current = true;
     try {
-      const [loadedProducts, loadedOrders, loadedDeliverySettings] = await Promise.all([
+      const [loadedProducts, loadedDeliverySettings, loadedOrders] = await Promise.all([
         getProducts(),
-        getOrders(),
         getDeliverySettings(),
+        isAdmin ? getOrders() : Promise.resolve([] as Order[]),
       ]);
       setProducts(loadedProducts);
       setOrders(loadedOrders);
@@ -675,16 +681,15 @@ const App: React.FC = () => {
         void refreshLiveState();
       }
     }
-  }, []);
+  }, [isAdmin]);
   
   // Load data from database on mount
   useEffect(() => {
     const loadData = async () => {
       setIsLoading(true);
       try {
-        const [loadedProducts, loadedOrders, loadedDeliverySettings] = await Promise.all([
+        const [loadedProducts, loadedDeliverySettings] = await Promise.all([
           getProducts(),
-          getOrders(),
           getDeliverySettings()
         ]);
         setDeliverySettings(loadedDeliverySettings);
@@ -698,7 +703,7 @@ const App: React.FC = () => {
           setProducts(loadedProducts);
         }
         
-        setOrders(loadedOrders);
+        setOrders([]);
       } catch (error) {
         console.error('Error loading data:', error);
         // Fallback to localStorage if database fails
@@ -761,7 +766,11 @@ const App: React.FC = () => {
 
     void syncAdminState();
 
-    const { data: authListener } = client.auth.onAuthStateChange((_event, session) => {
+    const { data: authListener } = client.auth.onAuthStateChange((event, session) => {
+      if (event === 'PASSWORD_RECOVERY') {
+        setIsPasswordRecovery(true);
+        return;
+      }
       if (!session) {
         setIsAdmin(false);
         return;
@@ -778,6 +787,38 @@ const App: React.FC = () => {
     if (!isAdmin) return;
     void refreshLiveState();
   }, [isAdmin, refreshLiveState]);
+
+  const handleSetNewPassword = async () => {
+    setRecoveryError('');
+    if (recoveryPassword.length < 12) {
+      setRecoveryError('Password must be at least 12 characters.');
+      return;
+    }
+    if (recoveryPassword !== recoveryPasswordConfirm) {
+      setRecoveryError('Passwords do not match.');
+      return;
+    }
+    if (!supabase) {
+      setRecoveryError('Supabase is not configured.');
+      return;
+    }
+    setRecoverySubmitting(true);
+    try {
+      const { error } = await supabase.auth.updateUser({ password: recoveryPassword });
+      if (error) {
+        setRecoveryError(error.message || 'Failed to update password.');
+        return;
+      }
+      await supabase.auth.signOut();
+      setRecoveryPassword('');
+      setRecoveryPasswordConfirm('');
+      setRecoverySuccess(true);
+      setIsAdmin(false);
+      window.history.replaceState(null, '', window.location.pathname);
+    } finally {
+      setRecoverySubmitting(false);
+    }
+  };
 
   useEffect(() => {
     const syncFromVisibility = () => {
@@ -1782,6 +1823,40 @@ const App: React.FC = () => {
     );
   }
 
+  if (isPasswordRecovery) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
+        <div className="bg-white p-8 rounded-3xl shadow-xl w-full max-w-md border">
+          <h2 className="text-xl font-black mb-2 text-center uppercase tracking-widest">Set New Password</h2>
+          <p className="text-xs text-gray-500 text-center mb-6">Choose a new password for the admin account.</p>
+          {recoverySuccess ? (
+            <>
+              <div className="mb-6 bg-green-50 border border-green-200 text-green-700 px-4 py-2.5 rounded-xl text-[11px] font-bold uppercase tracking-wide text-center">
+                Password updated. Please log in with your new password.
+              </div>
+              <button onClick={() => { setIsPasswordRecovery(false); setRecoverySuccess(false); setView('admin'); }} className="w-full bg-black text-white py-4 rounded-xl font-bold hover:bg-orange-600 transition-all uppercase tracking-widest">
+                Go to Login
+              </button>
+            </>
+          ) : (
+            <>
+              {recoveryError && (
+                <div className="mb-4 bg-red-50 border border-red-200 text-red-700 px-4 py-2.5 rounded-xl text-[11px] font-bold uppercase tracking-wide">
+                  {recoveryError}
+                </div>
+              )}
+              <input type="password" placeholder="New Password" autoComplete="new-password" className="w-full mb-4 p-3 bg-gray-50 rounded-xl border focus:ring-2 focus:ring-orange-500 transition-all outline-none" value={recoveryPassword} onChange={e => setRecoveryPassword(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void handleSetNewPassword(); }} />
+              <input type="password" placeholder="Confirm New Password" autoComplete="new-password" className="w-full mb-6 p-3 bg-gray-50 rounded-xl border focus:ring-2 focus:ring-orange-500 transition-all outline-none" value={recoveryPasswordConfirm} onChange={e => setRecoveryPasswordConfirm(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void handleSetNewPassword(); }} />
+              <button disabled={recoverySubmitting} onClick={() => void handleSetNewPassword()} className="w-full bg-black text-white py-4 rounded-xl font-bold hover:bg-orange-600 transition-all uppercase tracking-widest disabled:opacity-50">
+                {recoverySubmitting ? 'Saving...' : 'Save New Password'}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-gray-50 selection:bg-orange-500 selection:text-white">
       {view !== 'admin' && <AnnouncementBar />}
@@ -2259,7 +2334,6 @@ const App: React.FC = () => {
           cart={cart}
           setCart={setCart}
           setCartNotice={setCartNotice}
-          setOrders={setOrders}
           setProducts={setProducts}
           setView={setView}
           syncOrderToDatabase={syncOrderToDatabase}
@@ -2323,7 +2397,6 @@ interface CheckoutViewProps {
   cart: CartItem[];
   setCart: React.Dispatch<React.SetStateAction<CartItem[]>>;
   setCartNotice: React.Dispatch<React.SetStateAction<string>>;
-  setOrders: React.Dispatch<React.SetStateAction<Order[]>>;
   setProducts: React.Dispatch<React.SetStateAction<Product[]>>;
   setView: React.Dispatch<React.SetStateAction<View>>;
   syncOrderToDatabase: (order: Order) => Promise<void>;
@@ -5093,7 +5166,7 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
   );
 }
 
-function CheckoutView({ cart, setCart, setCartNotice, setOrders, setProducts, setView, syncOrderToDatabase, deliverySettings }: CheckoutViewProps) {
+function CheckoutView({ cart, setCart, setCartNotice, setProducts, setView, syncOrderToDatabase, deliverySettings }: CheckoutViewProps) {
   const cartTotal = cart.reduce((acc, item) => acc + item.price * item.quantity, 0);
   const deliveryFee = cart.length > 0 ? computeDeliveryFee(cartTotal, deliverySettings) : 0;
   const checkoutTotal = cart.length > 0 ? cartTotal + deliveryFee : 0;
@@ -5163,11 +5236,7 @@ function CheckoutView({ cart, setCart, setCartNotice, setOrders, setProducts, se
     
     try {
       await syncOrderToDatabase(order);
-      const [refreshedOrders, refreshedProducts] = await Promise.all([
-        getOrders(),
-        getProducts()
-      ]);
-      setOrders(refreshedOrders);
+      const refreshedProducts = await getProducts();
       setProducts(refreshedProducts);
       setCart([]);
       

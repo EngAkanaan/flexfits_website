@@ -1,22 +1,25 @@
+export async function getProductRecommendation(prompt: string): Promise<string> {
+  const normalizedPrompt = String(prompt || '').trim().slice(0, 1200);
+  if (!normalizedPrompt) return 'Tell us what you are looking for and we will help you choose.';
 
-import { GoogleGenAI } from "@google/genai";
-
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-
-export async function getProductRecommendation(prompt: string) {
-  if (!process.env.API_KEY) return "AI recommendations currently unavailable.";
-  
   try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
-      contents: `You are an AI assistant for "FLEX Fits", a premium retail brand specializing in 100% authentic footwear and apparel. 
-      The customer wants to know: ${prompt}. 
-      Give a short, professional, and sophisticated recommendation about our products (Shoes, Tshirts, Socks, Hoodies). 
-      Strongly emphasize that everything we sell is real, authentic, and never a copy. Keep it under 60 words.`
+    const response = await fetch('/api/gemini', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        operation: 'recommendation',
+        prompt: normalizedPrompt,
+      }),
     });
-    return response.text;
-  } catch (error) {
-    console.error("Gemini Error:", error);
-    return "Something went wrong. Feel free to browse our authentic collections!";
+
+    if (!response.ok) {
+      return 'AI recommendations currently unavailable.';
+    }
+
+    const result = await response.json() as { ok?: boolean; text?: unknown };
+    const text = typeof result.text === 'string' ? result.text.trim() : '';
+    return text || 'Something went wrong. Feel free to browse our authentic collections!';
+  } catch {
+    return 'Something went wrong. Feel free to browse our authentic collections!';
   }
 }
