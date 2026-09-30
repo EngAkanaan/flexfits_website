@@ -2448,6 +2448,8 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
   const [pass, setPass] = useState('');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [loginError, setLoginError] = useState('');
+  const [isSendingResetEmail, setIsSendingResetEmail] = useState(false);
+  const [resetEmailSent, setResetEmailSent] = useState(false);
   const [activeTab, setActiveTab] = useState<AdminTab>('inventory');
   const [editMode, setEditMode] = useState<Product | null>(null);
   const [imageItems, setImageItems] = useState<ImageItem[]>([]);
@@ -3064,6 +3066,27 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
       }
     };
 
+    const handleForgotPassword = async () => {
+      setLoginError('');
+      setResetEmailSent(false);
+      const email = user.trim();
+      if (!email) {
+        setLoginError('Enter your admin email above, then click "Forgot password?" again.');
+        return;
+      }
+      if (!supabase) {
+        setLoginError('Admin login requires Supabase configuration.');
+        return;
+      }
+      setIsSendingResetEmail(true);
+      try {
+        await supabase.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin });
+        setResetEmailSent(true);
+      } finally {
+        setIsSendingResetEmail(false);
+      }
+    };
+
     return (
       <div className="min-h-[60vh] flex items-center justify-center p-4">
         <div className="bg-white p-8 rounded-3xl shadow-xl w-full max-w-md border">
@@ -3073,8 +3096,16 @@ function AdminPanel({ products, orders, isAdmin, isLoading, setIsAdmin, setProdu
               {loginError}
             </div>
           )}
+          {resetEmailSent && (
+            <div className="mb-4 bg-green-50 border border-green-200 text-green-700 px-4 py-2.5 rounded-xl text-[11px] font-bold uppercase tracking-wide">
+              If that email has admin access, a reset link was sent. Check the inbox.
+            </div>
+          )}
           <input type="email" placeholder="Admin Email" className="w-full mb-4 p-3 bg-gray-50 rounded-xl border focus:ring-2 focus:ring-orange-500 transition-all outline-none" value={user} onChange={e => setUser(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void handleLogin(); }} />
-          <input type="password" placeholder="Password" className="w-full mb-6 p-3 bg-gray-50 rounded-xl border focus:ring-2 focus:ring-orange-500 transition-all outline-none" value={pass} onChange={e => setPass(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void handleLogin(); }} />
+          <input type="password" placeholder="Password" className="w-full mb-3 p-3 bg-gray-50 rounded-xl border focus:ring-2 focus:ring-orange-500 transition-all outline-none" value={pass} onChange={e => setPass(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void handleLogin(); }} />
+          <button disabled={isSendingResetEmail} onClick={() => void handleForgotPassword()} className="w-full mb-6 text-right text-[11px] font-bold uppercase tracking-wide text-gray-500 hover:text-orange-600 transition-all disabled:opacity-50">
+            {isSendingResetEmail ? 'Sending reset link...' : 'Forgot password?'}
+          </button>
           <button disabled={isLoggingIn} onClick={() => void handleLogin()} className="w-full bg-black text-white py-4 rounded-xl font-bold hover:bg-orange-600 transition-all uppercase tracking-widest disabled:opacity-50">
             {isLoggingIn ? 'Logging in...' : 'Login'}
           </button>
